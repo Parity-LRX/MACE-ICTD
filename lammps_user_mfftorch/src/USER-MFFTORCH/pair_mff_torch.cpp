@@ -1,0 +1,880 @@
+#include "pair_mff_torch.h"
+
+#include "atom.h"
+#include "comm.h"
+#include "domain.h"
+#include "error.h"
+#include "force.h"
+#include "input.h"
+#include "memory.h"
+#include "neigh_list.h"
+#include "neigh_request.h"
+#include "neighbor.h"
+#include "update.h"
+#include "utils.h"
+#include "variable.h"
+
+#include "mff_periodic_table.h"
+#include "mff_reciprocal_solver.h"
+#include "mff_tree_fmm_solver.h"
+#include "mff_torch_engine.h"
+
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <vector>
+
+using namespace LAMMPS_NS;
+
+namespace {
+
+std::string normalize_variable_name(const std::string &name) {
+  if (name.rfind("v_", 0) == 0) return name.substr(2);
+  return name;
+}
+
+struct CellGeom {
+  double cell[3][3];
+  double inv[3][3];
+  int pbc[3];
+};
+
+CellGeom build_cell_geom(const LAMMPS_NS::Domain *domain) {
+  CellGeom g{};
+  g.cell[0][0] = domain->xprd;
+  g.cell[0][1] = 0.0;
+  g.cell[0][2] = 0.0;
+  g.cell[1][0] = domain->xy;
+  g.cell[1][1] = domain->yprd;
+  g.cell[1][2] = 0.0;
+  g.cell[2][0] = domain->xz;
+  g.cell[2][1] = domain->yz;
+  g.cell[2][2] = domain->zprd;
+  g.pbc[0] = domain->xperiodic;
+  g.pbc[1] = domain->yperiodic;
+  g.pbc[2] = domain->zperiodic;
+
+  const double a = g.cell[0][0], b = g.cell[0][1], c = g.cell[0][2];
+  const double d = g.cell[1][0], e = g.cell[1][1], f = g.cell[1][2];
+  const double h = g.cell[2][0], i = g.cell[2][1], j = g.cell[2][2];
+  const double det = a * (e * j - f * i) - b * (d * j - f * h) + c * (d * i - e * h);
+  if (std::abs(det) < 1e-12) {
+    throw std::runtime_error("mff/torch encountered a singular cell matrix");
+  }
+  const double inv_det = 1.0 / det;
+  g.inv[0][0] = (e * j - f * i) * inv_det;
+  g.inv[0][1] = (c * i - b * j) * inv_det;
+  g.inv[0][2] = (b * f - c * e) * inv_det;
+  g.inv[1][0] = (f * h - d * j) * inv_det;
+  g.inv[1][1] = (a * j - c * h) * inv_det;
+  g.inv[1][2] = (c * d - a * f) * inv_det;
+  g.inv[2][0] = (d * i - e * h) * inv_det;
+  g.inv[2][1] = (b * h - a * i) * inv_det;
+  g.inv[2][2] = (a * e - b * d) * inv_det;
+  return g;
+}
+
+inline int nearest_int(double x) {
+  return (x >= 0.0) ? static_cast<int>(x + 0.5) : static_cast<int>(x - 0.5);
+}
+
+mfftorch::ReciprocalInputs make_reciprocal_inputs(
+    MPI_Comm world,
+    const torch::Tensor& local_pos,
+    const torch::Tensor& local_source,
+    const torch::Tensor& cell,
+    const CellGeom& geom,
+    bool need_energy,
+    const torch::Device& preferred_device) {
+  mfftorch::ReciprocalInputs inputs;
+  int world_rank = 0;
+  int world_size = 1;
+  MPI_Comm_rank(world, &world_rank);
+  MPI_Comm_size(world, &world_size);
+  int64_t local_n = local_pos.defined() ? local_pos.size(0) : 0;
+  int64_t global_offset = 0;
+  MPI_Exscan(&local_n, &global_offset, 1, MPI_LONG_LONG, MPI_SUM, world);
+  if (world_rank == 0) global_offset = 0;
+  inputs.world = world;
+  inputs.local_pos = local_pos;
+  inputs.local_source = local_source;
+  inputs.local_global_ids =
+      torch::arange(global_offset, global_offset + local_n, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  inputs.cell = cell;
+  inputs.pbc = {geom.pbc[0], geom.pbc[1], geom.pbc[2]};
+  inputs.need_energy = need_energy;
+  inputs.preferred_device = preferred_device;
+  inputs.world_rank = world_rank;
+  inputs.world_size = world_size;
+  return inputs;
+}
+
+}  // namespace
+
+PairMFFTorch::PairMFFTorch(LAMMPS *lmp) : Pair(lmp) {
+  restartinfo = 0;
+  one_coeff = 1;
+  manybody_flag = 1;
+}
+
+PairMFFTorch::~PairMFFTorch() {
+  if (allocated) {
+    memory->destroy(setflag);
+    memory->destroy(cutsq);
+  }
+}
+
+void PairMFFTorch::allocate() {
+  allocated = 1;
+  int n = atom->ntypes;
+
+  memory->create(setflag, n + 1, n + 1, "pair:setflag");
+  memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
+  for (int i = 1; i <= n; i++) {
+    for (int j = 1; j <= n; j++) {
+      setflag[i][j] = 0;
+      cutsq[i][j] = 0.0;
+    }
+  }
+}
+
+void PairMFFTorch::settings(int narg, char **arg) {
+  if (narg < 1) error->all(FLERR, "Illegal pair_style mff/torch command");
+  cut_global_ = utils::numeric(FLERR, arg[0], false, lmp);
+  if (cut_global_ <= 0.0) error->all(FLERR, "pair_style mff/torch cutoff must be > 0");
+  cutsq_global_ = cut_global_ * cut_global_;
+
+  use_external_field_ = false;
+  use_electric_field_ = false;
+  use_magnetic_field_ = false;
+  use_rank2_external_field_ = false;
+  external_field_symmetric_rank2_ = false;
+  use_fidelity_input_ = false;
+  fidelity_is_variable_ = false;
+  fidelity_var_name_.clear();
+  fidelity_constant_ = 0;
+  electric_field_var_names_.clear();
+  magnetic_field_var_names_.clear();
+  rank2_external_field_var_names_.clear();
+  cached_external_field_values_.clear();
+  external_tensor_cache_ = torch::Tensor();
+
+  for (int i = 1; i < narg; ++i) {
+    const std::string opt(arg[i]);
+    if (opt == "cpu" || opt == "cuda") {
+      device_str_ = opt;
+      continue;
+    }
+    if (opt == "field") {
+      if (i + 3 >= narg) {
+        error->all(FLERR, "pair_style mff/torch field expects three equal-style variables: v_Ex v_Ey v_Ez");
+      }
+      use_external_field_ = true;
+      use_electric_field_ = true;
+      electric_field_var_names_ = {
+          normalize_variable_name(arg[i + 1]),
+          normalize_variable_name(arg[i + 2]),
+          normalize_variable_name(arg[i + 3]),
+      };
+      i += 3;
+      continue;
+    }
+    if (opt == "mfield") {
+      if (i + 3 >= narg) {
+        error->all(FLERR, "pair_style mff/torch mfield expects three equal-style variables: v_Bx v_By v_Bz");
+      }
+      use_external_field_ = true;
+      use_magnetic_field_ = true;
+      magnetic_field_var_names_ = {
+          normalize_variable_name(arg[i + 1]),
+          normalize_variable_name(arg[i + 2]),
+          normalize_variable_name(arg[i + 3]),
+      };
+      i += 3;
+      continue;
+    }
+    if (opt == "field9") {
+      if (i + 9 >= narg) {
+        error->all(FLERR,
+                   "pair_style mff/torch field9 expects nine equal-style variables "
+                   "(row-major: xx xy xz yx yy yz zx zy zz)");
+      }
+      use_external_field_ = true;
+      use_rank2_external_field_ = true;
+      external_field_symmetric_rank2_ = false;
+      rank2_external_field_var_names_.clear();
+      for (int k = 1; k <= 9; ++k) rank2_external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
+      i += 9;
+      continue;
+    }
+    if (opt == "field6") {
+      if (i + 6 >= narg) {
+        error->all(FLERR,
+                   "pair_style mff/torch field6 expects six equal-style variables "
+                   "(symmetric order: xx yy zz xy xz yz)");
+      }
+      use_external_field_ = true;
+      use_rank2_external_field_ = true;
+      external_field_symmetric_rank2_ = true;
+      rank2_external_field_var_names_.clear();
+      for (int k = 1; k <= 6; ++k) rank2_external_field_var_names_.push_back(normalize_variable_name(arg[i + k]));
+      i += 6;
+      continue;
+    }
+    if (opt == "fidelity") {
+      if (i + 1 >= narg) {
+        error->all(FLERR, "pair_style mff/torch fidelity expects an integer or equal-style variable");
+      }
+      use_fidelity_input_ = true;
+      std::string value(arg[i + 1]);
+      if (value.rfind("v_", 0) == 0) {
+        fidelity_is_variable_ = true;
+        fidelity_var_name_ = normalize_variable_name(value);
+      } else {
+        fidelity_is_variable_ = false;
+        fidelity_constant_ = static_cast<int64_t>(std::stoll(value));
+      }
+      i += 1;
+      continue;
+    }
+    error->all(FLERR, ("Unknown pair_style mff/torch option: " + opt).c_str());
+  }
+
+  if (use_rank2_external_field_ && (use_electric_field_ || use_magnetic_field_)) {
+    error->all(FLERR, "pair_style mff/torch does not yet support combining field6/field9 with field/mfield");
+  }
+  if (use_electric_field_ && use_magnetic_field_) {
+    cached_external_field_values_.assign(6, 0.0f);
+  } else if (use_rank2_external_field_) {
+    cached_external_field_values_.assign(external_field_symmetric_rank2_ ? 6 : 9, 0.0f);
+  } else if (use_electric_field_ || use_magnetic_field_) {
+    cached_external_field_values_.assign(3, 0.0f);
+  }
+}
+
+void PairMFFTorch::coeff(int narg, char **arg) {
+  if (!allocated) allocate();
+  if (narg < 3) error->all(FLERR, "Illegal pair_coeff command for mff/torch");
+
+  // Expect: pair_coeff * * core.pt <elem1> <elem2> ... (ntypes entries)
+  // arg[0], arg[1] are * *
+  core_pt_path_ = std::string(arg[2]);
+
+  const int ntypes = atom->ntypes;
+  if (narg != 3 + ntypes) error->all(FLERR, "pair_coeff mff/torch expects one element symbol per atom type");
+
+  type2Z_.assign(ntypes + 1, 0);
+  for (int itype = 1; itype <= ntypes; itype++) {
+    const std::string sym(arg[2 + itype]);
+    if (sym == "NULL" || sym == "null") {
+      type2Z_[itype] = 0;
+      continue;
+    }
+    int Z = mfftorch::symbol_to_Z(sym);
+    if (Z <= 0) error->all(FLERR, ("Unknown element symbol in pair_coeff mff/torch: " + sym).c_str());
+    type2Z_[itype] = static_cast<int64_t>(Z);
+  }
+
+  for (int i = 1; i <= ntypes; i++) {
+    for (int j = i; j <= ntypes; j++) {
+      setflag[i][j] = 1;
+      cutsq[i][j] = cutsq_global_;
+      setflag[j][i] = 1;
+      cutsq[j][i] = cutsq_global_;
+    }
+  }
+
+  if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
+  engine_loaded_ = false;  // lazy load at init_style/compute
+}
+
+void PairMFFTorch::init_style() {
+  if (core_pt_path_.empty()) error->all(FLERR, "pair_coeff for mff/torch must specify core.pt path");
+
+  // A num_interaction-layer message-passing model needs each LOCAL atom's full K-hop environment.
+  // Two ways to supply it without per-layer communication:
+  //   * SINGLE RANK (nprocs==1, fold_mode_): fold each periodic-ghost neighbour back to its LOCAL
+  //     owner (atom->map) + an integer cell shift, so the model graph is just the nlocal local nodes
+  //     with PBC-shift edges (the exact training topology). A 1x-cutoff ghost halo is enough (we only
+  //     need to SEE the neighbour to fold it), and every ghost's owner is local so its features are
+  //     complete. This makes the model run on nlocal instead of the mp_depth_*cutoff halo (~12x fewer
+  //     nodes on a small periodic cell) -> ~12x less memory/compute, so much larger systems fit.
+  //   * MULTI RANK (nprocs>1, refined-A): folding breaks because a boundary ghost's owner is on
+  //     another rank. Instead request a GHOST neighbor list so ghosts are also graph centers, and
+  //     extend the halo to mp_depth_*cutoff so every local atom's K-hop neighbours are present as
+  //     ghosts. Correct under MPI domain decomposition; keep only the LOCAL energies/forces.
+  fold_mode_ = (comm->nprocs == 1);
+  if (fold_mode_) {
+    if (atom->map_style == Atom::MAP_NONE)
+      error->all(FLERR, "pair_style mff/torch (single-rank) needs an atom map to fold periodic ghosts "
+                        "to local atoms; add 'atom_modify map yes' (or array/hash) to your input.");
+    neighbor->add_request(this, NeighConst::REQ_FULL);  // 1x halo: default ghost cutoff is enough
+  } else {
+    neighbor->add_request(this, NeighConst::REQ_FULL | NeighConst::REQ_GHOST);
+    const double halo = static_cast<double>(mp_depth_) * cut_global_;
+    if (comm->cutghostuser < halo) comm->cutghostuser = halo;
+  }
+
+  try {
+    if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
+    if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
+    if (!tree_fmm_solver_) tree_fmm_solver_ = std::make_unique<mfftorch::MFFTreeFmmSolver>();
+    engine_->load_core(core_pt_path_, device_str_);
+    if (reciprocal_solver_) {
+      auto cfg = reciprocal_solver_->config();
+      // Use the exported (training) mesh size so the deployed reciprocal grid matches training.
+      // Previously the engine never read long_range_mesh_size from the export, so the solver was
+      // stuck at its default/env mesh (16) regardless of the trained grid.
+      cfg.mesh_size = static_cast<int>(engine_->long_range_mesh_size());
+      cfg.max_multipole_l = static_cast<int>(engine_->long_range_max_multipole_l());
+      cfg.source_channels = static_cast<int>(engine_->reciprocal_source_channels());
+      cfg.slab_padding_factor = static_cast<int>(engine_->reciprocal_source_slab_padding_factor());
+      cfg.green_mode = (engine_->long_range_green_mode() == "learned_poisson")
+                           ? mfftorch::ReciprocalGreenMode::LearnedPoisson
+                           : mfftorch::ReciprocalGreenMode::Poisson;
+      reciprocal_solver_->set_config(cfg);
+    }
+    if (tree_fmm_solver_) {
+      mfftorch::TreeFmmConfig cfg;
+      cfg.theta = engine_->long_range_theta();
+      cfg.leaf_size = static_cast<int>(engine_->long_range_leaf_size());
+      cfg.multipole_order = static_cast<int>(engine_->long_range_multipole_order());
+      cfg.neutralize = engine_->long_range_neutralize();
+      cfg.screening = engine_->long_range_screening();
+      cfg.softening = engine_->long_range_softening();
+      cfg.energy_scale = engine_->long_range_energy_scale();
+      cfg.boundary = engine_->long_range_boundary();
+      cfg.energy_partition = engine_->long_range_energy_partition();
+      tree_fmm_solver_->set_config(cfg);
+    }
+    validate_external_field_configuration();
+    engine_loaded_ = true;
+    engine_->warmup(32, 256);
+  } catch (const std::exception &e) {
+    error->all(FLERR, (std::string("Failed to load TorchScript core: ") + e.what()).c_str());
+  }
+}
+
+double PairMFFTorch::init_one(int i, int j) {
+  return cut_global_;
+}
+
+void PairMFFTorch::validate_external_field_configuration() {
+  if (!engine_) return;
+
+  if (use_external_field_) {
+    if (!engine_->accepts_external_tensor()) {
+      error->all(FLERR,
+                 "pair_style mff/torch field/mfield was specified, but core.pt does not accept external_tensor");
+    }
+    const bool expects_field_1o = engine_->external_tensor_has_field_1o() || engine_->external_tensor_irrep() == "1o";
+    const bool expects_field_1e = engine_->external_tensor_has_field_1e() || engine_->external_tensor_irrep() == "1e";
+    if (use_rank2_external_field_) {
+      if (expects_field_1o || expects_field_1e) {
+        error->all(FLERR, "core.pt expects rank-1 external fields; use field and/or mfield instead of field6/field9");
+      }
+      const int expected_nvars = external_field_symmetric_rank2_ ? 6 : 9;
+      if (static_cast<int>(rank2_external_field_var_names_.size()) != expected_nvars) {
+        error->all(FLERR, "mff/torch external field variable count does not match the selected field mode");
+      }
+    } else {
+      if (expects_field_1o && !expects_field_1e && !use_electric_field_) {
+        error->all(FLERR, "core.pt expects electric-field-style external_tensor; use pair_style mff/torch ... field v_Ex v_Ey v_Ez");
+      }
+      if (expects_field_1e && !expects_field_1o && !use_magnetic_field_) {
+        error->all(FLERR, "core.pt expects magnetic-field-style external_tensor; use pair_style mff/torch ... mfield v_Bx v_By v_Bz");
+      }
+      if (use_electric_field_ && !expects_field_1o && expects_field_1e) {
+        error->all(FLERR, "core.pt expects magnetic-field-style external_tensor only; remove field and use mfield");
+      }
+      if (use_magnetic_field_ && !expects_field_1e && expects_field_1o) {
+        error->all(FLERR, "core.pt expects electric-field-style external_tensor only; remove mfield and use field");
+      }
+    }
+
+    auto validate_names = [&](const std::vector<std::string>& names) {
+      for (const auto& name : names) {
+        if (name.empty()) error->all(FLERR, "pair_style mff/torch external field variable name is empty");
+        const int ivar = input->variable->find(name.c_str());
+        if (ivar < 0) {
+          error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + name).c_str());
+        }
+        if (!input->variable->equalstyle(ivar)) {
+          error->all(FLERR, ("mff/torch field variables must be equal-style scalars: " + name).c_str());
+        }
+      }
+    };
+    validate_names(electric_field_var_names_);
+    validate_names(magnetic_field_var_names_);
+    validate_names(rank2_external_field_var_names_);
+  } else if (engine_->accepts_external_tensor()) {
+    error->all(FLERR,
+               "core.pt requires external_tensor, but pair_style mff/torch was not given field/mfield/field6/field9");
+  }
+
+  if (engine_->requires_runtime_fidelity()) {
+    if (!use_fidelity_input_) {
+      error->all(FLERR, "core.pt requires runtime fidelity_ids; add pair_style mff/torch ... fidelity <int|v_name>");
+    }
+  } else if (use_fidelity_input_ && !engine_->takes_fidelity_arg()) {
+    error->all(FLERR, "pair_style mff/torch fidelity was specified, but core.pt does not accept fidelity_ids");
+  }
+  if (use_fidelity_input_ && fidelity_is_variable_) {
+    if (fidelity_var_name_.empty()) error->all(FLERR, "pair_style mff/torch fidelity variable name is empty");
+    const int ivar = input->variable->find(fidelity_var_name_.c_str());
+    if (ivar < 0) {
+      error->all(FLERR, ("Unknown LAMMPS variable for mff/torch fidelity: " + fidelity_var_name_).c_str());
+    }
+    if (!input->variable->equalstyle(ivar)) {
+      error->all(FLERR, ("mff/torch fidelity variable must be an equal-style scalar: " + fidelity_var_name_).c_str());
+    }
+  }
+  if (use_fidelity_input_ && !fidelity_is_variable_ && engine_->num_fidelity_levels() > 0) {
+    if (fidelity_constant_ < 0 || fidelity_constant_ >= engine_->num_fidelity_levels()) {
+      error->all(
+          FLERR,
+          ("pair_style mff/torch fidelity is out of range [0, " + std::to_string(engine_->num_fidelity_levels() - 1) +
+           "]: " + std::to_string(fidelity_constant_))
+              .c_str());
+    }
+  }
+}
+
+torch::Tensor PairMFFTorch::current_external_tensor(const torch::Device& device) {
+  if (!use_external_field_) return torch::Tensor();
+
+  std::vector<float> values;
+  auto append_values = [&](const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+      const int ivar = input->variable->find(name.c_str());
+      if (ivar < 0) {
+        error->all(FLERR, ("Unknown LAMMPS variable for mff/torch field: " + name).c_str());
+      }
+      values.push_back(static_cast<float>(input->variable->compute_equal(ivar)));
+    }
+  };
+  if (use_rank2_external_field_) {
+    append_values(rank2_external_field_var_names_);
+  } else {
+    if (use_electric_field_) append_values(electric_field_var_names_);
+    if (use_magnetic_field_) append_values(magnetic_field_var_names_);
+  }
+
+  const bool cache_hit =
+      external_tensor_cache_.defined() &&
+      external_tensor_cache_.device() == device &&
+      cached_external_field_values_ == values;
+  if (cache_hit) return external_tensor_cache_;
+
+  cached_external_field_values_ = values;
+  torch::Tensor cpu;
+  if (!use_rank2_external_field_) {
+    cpu = torch::tensor(values, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+  } else if (external_field_symmetric_rank2_) {
+    cpu = torch::tensor(
+              {
+                  values[0], values[3], values[4],
+                  values[3], values[1], values[5],
+                  values[4], values[5], values[2],
+              },
+              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+              .reshape({3, 3});
+  } else {
+    cpu = torch::tensor(values, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU))
+              .reshape({3, 3});
+  }
+  external_tensor_cache_ = (device.is_cpu()) ? cpu : cpu.to(device);
+  return external_tensor_cache_;
+}
+
+torch::Tensor PairMFFTorch::current_fidelity_tensor(const torch::Device& device) {
+  if (!use_fidelity_input_) return torch::Tensor();
+
+  int64_t fidelity_value = fidelity_constant_;
+  if (fidelity_is_variable_) {
+    const int ivar = input->variable->find(fidelity_var_name_.c_str());
+    if (ivar < 0) {
+      error->all(FLERR, ("Unknown LAMMPS variable for mff/torch fidelity: " + fidelity_var_name_).c_str());
+    }
+    fidelity_value = static_cast<int64_t>(std::llround(input->variable->compute_equal(ivar)));
+  }
+  if (engine_ && engine_->num_fidelity_levels() > 0) {
+    if (fidelity_value < 0 || fidelity_value >= engine_->num_fidelity_levels()) {
+      error->all(
+          FLERR,
+          ("mff/torch fidelity value is out of range [0, " + std::to_string(engine_->num_fidelity_levels() - 1) +
+           "]: " + std::to_string(fidelity_value))
+              .c_str());
+    }
+  }
+  auto cpu = torch::tensor({fidelity_value}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  return device.is_cpu() ? cpu : cpu.to(device);
+}
+
+void PairMFFTorch::reset_physical_outputs() {
+  global_phys_cpu_ = torch::Tensor();
+  atom_phys_cpu_ = torch::Tensor();
+  global_phys_mask_cpu_ = torch::Tensor();
+  atom_phys_mask_cpu_ = torch::Tensor();
+  cached_phys_timestep_ = update ? static_cast<int64_t>(update->ntimestep) : -1;
+}
+
+void PairMFFTorch::cache_physical_outputs(const mfftorch::MFFOutputs& out, int nlocal) {
+  cached_phys_timestep_ = update ? static_cast<int64_t>(update->ntimestep) : -1;
+  if (!physical_cache_requested_) {
+    global_phys_cpu_ = torch::Tensor();
+    atom_phys_cpu_ = torch::Tensor();
+    global_phys_mask_cpu_ = torch::Tensor();
+    atom_phys_mask_cpu_ = torch::Tensor();
+    return;
+  }
+
+  if (out.global_phys.defined()) {
+    global_phys_cpu_ = out.global_phys.to(torch::kCPU, torch::kFloat64).contiguous();
+  } else {
+    global_phys_cpu_ = torch::Tensor();
+  }
+  if (out.atom_phys.defined()) {
+    auto atom_phys = out.atom_phys.to(torch::kCPU, torch::kFloat64).contiguous();
+    if (atom_phys.dim() >= 2 && atom_phys.size(0) >= nlocal) {
+      atom_phys_cpu_ = atom_phys.narrow(0, 0, nlocal).clone();
+    } else {
+      atom_phys_cpu_ = atom_phys.clone();
+    }
+  } else {
+    atom_phys_cpu_ = torch::Tensor();
+  }
+  global_phys_mask_cpu_ = out.global_phys_mask.defined()
+                              ? out.global_phys_mask.to(torch::kCPU, torch::kFloat64).contiguous()
+                              : torch::Tensor();
+  atom_phys_mask_cpu_ = out.atom_phys_mask.defined()
+                            ? out.atom_phys_mask.to(torch::kCPU, torch::kFloat64).contiguous()
+                            : torch::Tensor();
+}
+
+void PairMFFTorch::compute(int eflag, int vflag) {
+  ev_init(eflag, vflag);
+  reset_physical_outputs();
+
+  if (!engine_loaded_) init_style();
+
+  const int nlocal = atom->nlocal;
+  const int nghost = atom->nghost;
+  const int ntotal = nlocal + nghost;
+  // Number of NODES the model sees: fold_mode_ collapses every ghost onto its local owner, so the
+  // graph is just the nlocal local atoms; refined-A keeps the ghosts as nodes (ntotal).
+  const int n_model = fold_mode_ ? nlocal : ntotal;
+
+  // Neighbor list
+  int inum = list->inum;
+  int *ilist = list->ilist;
+  int *numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
+
+  double **x = atom->x;
+  double **f = atom->f;
+  int *type = atom->type;
+
+  // Build type->Z mapped A (CPU then move to engine device).
+  // Reuse persistent buffers to avoid heap allocation every step.
+  buf_A_cpu_.resize(static_cast<size_t>(n_model));
+  buf_pos_cpu_.resize(static_cast<size_t>(n_model) * 3);
+  for (int i = 0; i < n_model; i++) {
+    const int itype = type[i];
+    buf_A_cpu_[i] = (itype >= 0 && itype < static_cast<int>(type2Z_.size())) ? type2Z_[itype] : 0;
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 0] = static_cast<float>(x[i][0]);
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 1] = static_cast<float>(x[i][1]);
+    buf_pos_cpu_[static_cast<size_t>(i) * 3 + 2] = static_cast<float>(x[i][2]);
+  }
+
+  const CellGeom geom = build_cell_geom(domain);
+  float cell_cpu[9] = {
+      static_cast<float>(geom.cell[0][0]), static_cast<float>(geom.cell[0][1]), static_cast<float>(geom.cell[0][2]),
+      static_cast<float>(geom.cell[1][0]), static_cast<float>(geom.cell[1][1]), static_cast<float>(geom.cell[1][2]),
+      static_cast<float>(geom.cell[2][0]), static_cast<float>(geom.cell[2][1]), static_cast<float>(geom.cell[2][2]),
+  };
+  auto cell_t = torch::from_blob(cell_cpu, {1, 3, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)).clone();
+  if (nlocal == 0) {
+    const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
+    const bool use_tree_fmm =
+        tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+    const bool use_reciprocal =
+        reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
+    if (use_tree_fmm || use_reciprocal) {
+      auto empty_pos = torch::zeros({0, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+      auto empty_source = torch::zeros(
+          {0, engine_->reciprocal_source_channels()},
+          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+      try {
+        auto reciprocal_inputs = make_reciprocal_inputs(
+            world,
+            empty_pos,
+            empty_source,
+            cell_t,
+            geom,
+            static_cast<bool>(eflag),
+            torch::Device(torch::kCPU));
+        if (use_tree_fmm) {
+          (void)tree_fmm_solver_->compute(reciprocal_inputs);
+        } else {
+          (void)reciprocal_solver_->compute(reciprocal_inputs);
+        }
+      } catch (const std::exception &e) {
+        error->all(FLERR, (std::string("mff/torch runtime long-range solver failed on empty rank: ") + e.what()).c_str());
+      }
+    }
+    return;
+  }
+
+  // Count edges (upper bound) and build edges + lattice shifts (reuse persistent buffers).
+  if (fold_mode_) {
+    // FOLD (single rank): edges from every local center i to its neighbours, each neighbour folded to
+    // its LOCAL owner jl + integer cell offset g (x[j]=x[jl]+g@cell). Edge (src=jl, dst=i, shift=-g) ->
+    // edge_vec = x[i]-x[jl]-g@cell = x[i]-x[j] (correct), and the model aggregates the neighbour's
+    // features INTO local center i. All indices are < nlocal, so the model runs on the nlocal local
+    // nodes only (no ghost nodes). Validated to give PotEng == DFT; forces land on local owners.
+    int64_t Emax = 0;
+    for (int ii = 0; ii < inum; ii++) Emax += numneigh[ilist[ii]];
+    buf_edge_src_cpu_.clear();
+    buf_edge_dst_cpu_.clear();
+    buf_edge_shifts_cpu_.clear();
+    buf_edge_src_cpu_.reserve(static_cast<size_t>(Emax));
+    buf_edge_dst_cpu_.reserve(static_cast<size_t>(Emax));
+    buf_edge_shifts_cpu_.reserve(static_cast<size_t>(Emax) * 3);
+    for (int ii = 0; ii < inum; ii++) {
+      int i = ilist[ii];
+      int jnum = numneigh[i];
+      int *jlist = firstneigh[i];
+      for (int jj = 0; jj < jnum; jj++) {
+        int j = jlist[jj] & NEIGHMASK;
+        const double rawx = x[j][0] - x[i][0];
+        const double rawy = x[j][1] - x[i][1];
+        const double rawz = x[j][2] - x[i][2];
+        const double fracx = rawx * geom.inv[0][0] + rawy * geom.inv[1][0] + rawz * geom.inv[2][0];
+        const double fracy = rawx * geom.inv[0][1] + rawy * geom.inv[1][1] + rawz * geom.inv[2][1];
+        const double fracz = rawx * geom.inv[0][2] + rawy * geom.inv[1][2] + rawz * geom.inv[2][2];
+        const int sx = geom.pbc[0] ? -nearest_int(fracx) : 0;
+        const int sy = geom.pbc[1] ? -nearest_int(fracy) : 0;
+        const int sz = geom.pbc[2] ? -nearest_int(fracz) : 0;
+        const double delx = rawx + sx * geom.cell[0][0] + sy * geom.cell[1][0] + sz * geom.cell[2][0];
+        const double dely = rawy + sx * geom.cell[0][1] + sy * geom.cell[1][1] + sz * geom.cell[2][1];
+        const double delz = rawz + sx * geom.cell[0][2] + sy * geom.cell[1][2] + sz * geom.cell[2][2];
+        if (delx * delx + dely * dely + delz * delz > cutsq_global_) continue;
+        const int jl = atom->map(atom->tag[j]);
+        const double dxl = x[j][0] - x[jl][0];
+        const double dyl = x[j][1] - x[jl][1];
+        const double dzl = x[j][2] - x[jl][2];
+        const int gx = nearest_int(dxl * geom.inv[0][0] + dyl * geom.inv[1][0] + dzl * geom.inv[2][0]);
+        const int gy = nearest_int(dxl * geom.inv[0][1] + dyl * geom.inv[1][1] + dzl * geom.inv[2][1]);
+        const int gz = nearest_int(dxl * geom.inv[0][2] + dyl * geom.inv[1][2] + dzl * geom.inv[2][2]);
+        buf_edge_src_cpu_.push_back(static_cast<int64_t>(jl));
+        buf_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
+        buf_edge_shifts_cpu_.push_back(static_cast<float>(-gx));
+        buf_edge_shifts_cpu_.push_back(static_cast<float>(-gy));
+        buf_edge_shifts_cpu_.push_back(static_cast<float>(-gz));
+      }
+    }
+  } else {
+  // --- Pick CENTERS: local atoms + ghosts within (mp_depth_-1) hops of a local atom. Only centers
+  // get incoming edges (a center must AGGREGATE to produce a correct deeper-layer feature); ghosts
+  // beyond that are SRC-only NODES -- their layer-0 embedding is all a center needs from them. This
+  // keeps each local atom's full K-hop environment exact while avoiding the edge blow-up (and OOM)
+  // of making EVERY 2x-cutoff halo ghost a center. (REQ_GHOST: ilist is inum local then gnum ghost.)
+  std::vector<char> is_center(static_cast<size_t>(ntotal), 0);
+  std::vector<int> frontier;
+  frontier.reserve(static_cast<size_t>(inum));
+  for (int ii = 0; ii < inum; ii++) { is_center[ilist[ii]] = 1; frontier.push_back(ilist[ii]); }
+  for (int hop = 1; hop < mp_depth_; hop++) {
+    std::vector<int> next;
+    for (int ci : frontier) {
+      const int jn = numneigh[ci];
+      const int *jl = firstneigh[ci];
+      for (int jj = 0; jj < jn; jj++) {
+        const int j = jl[jj] & NEIGHMASK;
+        const double dx = x[j][0] - x[ci][0], dy = x[j][1] - x[ci][1], dz = x[j][2] - x[ci][2];
+        if (dx * dx + dy * dy + dz * dz > cutsq_global_) continue;  // ghosts carry the image -> direct dist
+        if (!is_center[j]) { is_center[j] = 1; next.push_back(j); }
+      }
+    }
+    frontier.swap(next);
+  }
+
+  // Count edges (upper bound), ONLY for centers (non-center ghosts stay src-only nodes).
+  const int ncenters = inum + list->gnum;
+  int64_t Emax = 0;
+  for (int ii = 0; ii < ncenters; ii++) {
+    const int i = ilist[ii];
+    if (is_center[i]) Emax += numneigh[i];
+  }
+  buf_edge_src_cpu_.clear();
+  buf_edge_dst_cpu_.clear();
+  buf_edge_shifts_cpu_.clear();
+  buf_edge_src_cpu_.reserve(static_cast<size_t>(Emax));
+  buf_edge_dst_cpu_.reserve(static_cast<size_t>(Emax));
+  buf_edge_shifts_cpu_.reserve(static_cast<size_t>(Emax) * 3);
+
+  for (int ii = 0; ii < ncenters; ii++) {
+    int i = ilist[ii];
+    if (!is_center[i]) continue;   // only centers get incoming edges; non-center ghosts are src-only
+    int jnum = numneigh[i];
+    int *jlist = firstneigh[i];
+    for (int jj = 0; jj < jnum; jj++) {
+      int j = jlist[jj] & NEIGHMASK;
+      const double rawx = x[j][0] - x[i][0];
+      const double rawy = x[j][1] - x[i][1];
+      const double rawz = x[j][2] - x[i][2];
+      const double fracx = rawx * geom.inv[0][0] + rawy * geom.inv[1][0] + rawz * geom.inv[2][0];
+      const double fracy = rawx * geom.inv[0][1] + rawy * geom.inv[1][1] + rawz * geom.inv[2][1];
+      const double fracz = rawx * geom.inv[0][2] + rawy * geom.inv[1][2] + rawz * geom.inv[2][2];
+      const int sx = geom.pbc[0] ? -nearest_int(fracx) : 0;
+      const int sy = geom.pbc[1] ? -nearest_int(fracy) : 0;
+      const int sz = geom.pbc[2] ? -nearest_int(fracz) : 0;
+      const double shiftx = sx * geom.cell[0][0] + sy * geom.cell[1][0] + sz * geom.cell[2][0];
+      const double shifty = sx * geom.cell[0][1] + sy * geom.cell[1][1] + sz * geom.cell[2][1];
+      const double shiftz = sx * geom.cell[0][2] + sy * geom.cell[1][2] + sz * geom.cell[2][2];
+      const double delx = rawx + shiftx;
+      const double dely = rawy + shifty;
+      const double delz = rawz + shiftz;
+      const double rsq = delx * delx + dely * dely + delz * delz;
+      if (rsq > cutsq_global_) continue;
+
+      // Edge: neighbor j -> center i (the model puts edge features on edge_src and scatters into
+      // edge_dst, so the CENTER must be the dst). j keeps its (possibly ghost) index -- ghosts are
+      // real graph nodes here, with their own edges, so their features are correct. edge_vec =
+      // x[i]-x[j]+shift@cell; the ghost already carries the periodic image (min-image sx==0 in the
+      // halo), so shift = -(sx,sy,sz) is the robust value (0 for ghost edges). This is the convention
+      // the model was trained with (center aggregates neighbours) and is correct under MPI domain
+      // decomposition because j's features come from j-as-a-center, not from a cross-rank owner.
+      buf_edge_src_cpu_.push_back(static_cast<int64_t>(j));
+      buf_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sx));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sy));
+      buf_edge_shifts_cpu_.push_back(static_cast<float>(-sz));
+    }
+  }
+  }  // end else (refined-A multi-rank path)
+
+  const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
+  if (E <= 1) return;
+
+  // Reuse persistent torch tensors; only reallocate when sizes change.
+  if (cached_compute_ntotal_ != static_cast<int64_t>(n_model)) {
+    cached_pos_t_ = torch::empty({n_model, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    cached_A_t_ = torch::empty({n_model}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_compute_ntotal_ = static_cast<int64_t>(n_model);
+  }
+  if (cached_compute_nedges_ != E) {
+    cached_edge_src_t_ = torch::empty({E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_edge_dst_t_ = torch::empty({E}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    cached_edge_shifts_t_ = torch::empty({E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    cached_compute_nedges_ = E;
+  }
+  std::memcpy(cached_pos_t_.data_ptr<float>(), buf_pos_cpu_.data(),
+              static_cast<size_t>(n_model) * 3 * sizeof(float));
+  std::memcpy(cached_A_t_.data_ptr<int64_t>(), buf_A_cpu_.data(),
+              static_cast<size_t>(n_model) * sizeof(int64_t));
+  std::memcpy(cached_edge_src_t_.data_ptr<int64_t>(), buf_edge_src_cpu_.data(),
+              static_cast<size_t>(E) * sizeof(int64_t));
+  std::memcpy(cached_edge_dst_t_.data_ptr<int64_t>(), buf_edge_dst_cpu_.data(),
+              static_cast<size_t>(E) * sizeof(int64_t));
+  std::memcpy(cached_edge_shifts_t_.data_ptr<float>(), buf_edge_shifts_cpu_.data(),
+              static_cast<size_t>(E) * 3 * sizeof(float));
+  auto external_tensor_t = current_external_tensor(torch::kCPU);
+  auto fidelity_ids_t = current_fidelity_tensor(torch::kCPU);
+
+  const bool want_atom_virial = static_cast<bool>(vflag_atom);
+  mfftorch::MFFOutputs out;
+  try {
+    out = engine_->compute(nlocal, n_model, cached_pos_t_, cached_A_t_,
+                           cached_edge_src_t_, cached_edge_dst_t_, cached_edge_shifts_t_,
+                           cell_t, external_tensor_t, fidelity_ids_t,
+                           static_cast<bool>(eflag), want_atom_virial);
+  } catch (const std::exception &e) {
+    error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
+  }
+  cache_physical_outputs(out, nlocal);
+
+  mfftorch::ReciprocalOutputs reciprocal_out;
+  const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
+  const bool use_tree_fmm =
+      tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+  const bool use_reciprocal =
+      reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
+  const bool use_runtime_long_range = use_tree_fmm || use_reciprocal;
+  if (use_tree_fmm || use_reciprocal) {
+    try {
+      const auto reciprocal_device = engine_->device();
+      auto local_source = out.reciprocal_source.defined()
+                              ? out.reciprocal_source.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous()
+                              : torch::zeros(
+                                    {nlocal, engine_->reciprocal_source_channels()},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(reciprocal_device));
+      if (use_tree_fmm && engine_->long_range_source_kind() != "latent_charge") {
+        throw std::runtime_error("tree_fmm runtime currently requires long_range_source_kind=latent_charge");
+      }
+      auto reciprocal_inputs = make_reciprocal_inputs(
+          world,
+          cached_pos_t_.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous(),
+          local_source,
+          cell_t.to(reciprocal_device, torch::kFloat32).contiguous(),
+          geom,
+          static_cast<bool>(eflag),
+          reciprocal_device);
+      reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
+                                    : reciprocal_solver_->compute(reciprocal_inputs);
+    } catch (const std::exception &e) {
+      error->all(FLERR, (std::string("mff/torch runtime long-range solver failed: ") + e.what()).c_str());
+    }
+  }
+
+  if (eflag) eng_vdwl += out.energy;
+  if (use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
+
+  // When virial is needed, ghost forces must be in f[] for virial_fdotr_compute()
+  // to produce correct results (it sums over nall = nlocal + nghost). In fold mode the model has no
+  // ghost nodes (cross-boundary forces already landed on local owners), so we only write nlocal rows.
+  const int nwrite = fold_mode_ ? nlocal : ((force->newton_pair || vflag_fdotr) ? ntotal : nlocal);
+  auto forces_cpu = out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
+  const double *fp = forces_cpu.data_ptr<double>();
+  for (int i = 0; i < nwrite; i++) {
+    f[i][0] += fp[i * 3 + 0];
+    f[i][1] += fp[i * 3 + 1];
+    f[i][2] += fp[i * 3 + 2];
+  }
+  if (use_runtime_long_range && reciprocal_out.forces_local.defined()) {
+    auto reciprocal_forces_cpu = reciprocal_out.forces_local.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *rfp = reciprocal_forces_cpu.data_ptr<double>();
+    for (int i = 0; i < nlocal; i++) {
+      f[i][0] += rfp[i * 3 + 0];
+      f[i][1] += rfp[i * 3 + 1];
+      f[i][2] += rfp[i * 3 + 2];
+    }
+  }
+
+  if (eflag_atom && eatom && out.atom_energy.defined()) {
+    auto ae_cpu = out.atom_energy.to(torch::kCPU, torch::kFloat64).contiguous().view({n_model});
+    const double *ep = ae_cpu.data_ptr<double>();
+    for (int i = 0; i < nlocal; i++) eatom[i] += ep[i];
+  }
+  if (eflag_atom && eatom && use_runtime_long_range && reciprocal_out.atom_energy_local.defined()) {
+    auto ae_recip = reciprocal_out.atom_energy_local.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *ep = ae_recip.data_ptr<double>();
+    for (int i = 0; i < nlocal; i++) eatom[i] += ep[i];
+  }
+
+  if (vflag_atom && vatom && out.atom_virial.defined()) {
+    auto vir_cpu = out.atom_virial.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *vp = vir_cpu.data_ptr<double>();
+    const int nvir = fold_mode_ ? nlocal : (force->newton_pair ? ntotal : nlocal);
+    for (int i = 0; i < nvir; i++) {
+      vatom[i][0] += vp[i * 6 + 0];
+      vatom[i][1] += vp[i * 6 + 1];
+      vatom[i][2] += vp[i * 6 + 2];
+      vatom[i][3] += vp[i * 6 + 3];
+      vatom[i][4] += vp[i * 6 + 4];
+      vatom[i][5] += vp[i * 6 + 5];
+    }
+  }
+
+  if (vflag_fdotr) virial_fdotr_compute();
+}
