@@ -75,6 +75,11 @@ _USE_SPARSE_TP = os.environ.get("ICTD_USE_SPARSE_TP", "1") == "1"
 _USE_TRITON_CHANNELWISE_TP = os.environ.get("ICTD_USE_TRITON_CHANNELWISE_TP", "0") == "1"
 # Experimental pure PyTorch batching for channelwise per-path mixing by same-kdim buckets.
 _USE_BUCKETED_CHANNELWISE_MIX = os.environ.get("ICTD_USE_BUCKETED_CHANNELWISE_MIX", "0") == "1"
+# MACE interactions commonly multiply scalar node features (l=0) by edge
+# harmonics and preserve exactly one path per output l. In that case the final
+# path-preserving index_add is pure placement, so a direct placement path removes
+# small scatter/cat overhead. Set to 0 to keep the older bitwise-stable graph.
+_USE_SCALAR_PATH_TP = os.environ.get("ICTD_USE_SCALAR_PATH_TP", "1") == "1"
 
 
 def _resolve_internal_compute_dtype(internal_compute_dtype: torch.dtype | None) -> torch.dtype:
@@ -2472,30 +2477,99 @@ class EdgeWeightedPathPreservingTensorProduct(EdgeWeightedPathTensorProduct):
         self.path_l3 = path_l3
         self.path_offset = path_offset
         self.path_counts_by_l = counts
+        self._use_scalar_direct_fast_path = (
+            _USE_SCALAR_PATH_TP and self._can_use_scalar_direct_fast_path()
+        )
 
-    def forward(
+    def _can_use_scalar_direct_fast_path(self) -> bool:
+        if any(int(self.path_counts_by_l.get(l, 0)) > 1 for l in range(self.lmax + 1)):
+            return False
+        for group in self._groups:
+            if int(group["l1"]) != 0 or len(group["segments"]) != 1:
+                return False
+            p_idx, l3, s, e = group["segments"][0]
+            p_idx = int(p_idx)
+            l3 = int(l3)
+            if int(self.path_offset[p_idx]) != 0:
+                return False
+            if int(e) - int(s) != 2 * l3 + 1:
+                return False
+        return True
+
+    def _forward_scalar_direct(
         self,
         x1: Dict[int, torch.Tensor],
         x2: Dict[int, torch.Tensor],
-        gates: torch.Tensor | None = None,
+        gates: torch.Tensor | None,
+        *,
+        batch_shape: torch.Size,
+        device: torch.device,
+        dtype: torch.dtype,
+        compute_dtype: torch.dtype,
     ) -> Dict[int, torch.Tensor]:
-        sample = next(iter(x1.values()))
-        batch_shape = sample.shape[:-2]
-        device = sample.device
-        dtype = sample.dtype
-        compute_dtype = self.internal_compute_dtype
+        if any(int(l) != 0 for l in x1.keys()):
+            return self._forward_index_add(
+                x1,
+                x2,
+                gates,
+                batch_shape=batch_shape,
+                device=device,
+                dtype=dtype,
+                compute_dtype=compute_dtype,
+            )
 
-        if gates is not None:
-            if gates.device != device or gates.dtype != dtype:
-                gates = gates.to(device=device, dtype=dtype)
-            if gates.shape[-1] == self.num_paths * self.channels:
-                gates = gates.view(*gates.shape[:-1], self.num_paths, self.channels)
-            elif gates.shape[-2:] != (self.num_paths, self.channels):
-                raise ValueError(
-                    f"Expected gates shape (..., {self.num_paths * self.channels}) or "
-                    f"(..., {self.num_paths}, {self.channels}), got {tuple(gates.shape)}"
-                )
+        out: Dict[int, torch.Tensor] = {
+            l: torch.zeros(
+                *batch_shape,
+                self.channels * int(self.path_counts_by_l.get(l, 0)),
+                2 * l + 1,
+                device=device,
+                dtype=dtype,
+            )
+            for l in range(self.lmax + 1)
+        }
+        a = x1.get(0)
+        if a is None:
+            return out
 
+        a_comp = a.to(dtype=compute_dtype) if a.dtype != compute_dtype else a
+        proj_list = self._get_proj_group_list(device=device, dtype=dtype)
+        w = self.weight.to(device=device, dtype=compute_dtype)
+
+        for g_idx, group in enumerate(self._groups):
+            l2 = int(group["l2"])
+            b = x2.get(l2)
+            if b is None:
+                continue
+
+            b_comp = b.to(dtype=compute_dtype) if b.dtype != compute_dtype else b
+            pair = (a_comp.unsqueeze(-1) * b_comp.unsqueeze(-2)).reshape(
+                *batch_shape, self.channels, 2 * l2 + 1
+            )
+            y = torch.matmul(pair, proj_list[g_idx])
+
+            p_idx, l3, s, e = group["segments"][0]
+            p_idx = int(p_idx)
+            l3 = int(l3)
+            seg = y[..., int(s) : int(e)]
+            seg = seg * w[p_idx].view(*([1] * len(batch_shape)), self.channels, 1)
+            if gates is not None:
+                seg = seg * gates[..., p_idx, :].unsqueeze(-1)
+            out[l3] = seg.to(dtype=dtype) if seg.dtype != dtype else seg
+
+        return out
+
+    def _forward_index_add(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+        gates: torch.Tensor | None,
+        *,
+        batch_shape: torch.Size,
+        device: torch.device,
+        dtype: torch.dtype,
+        compute_dtype: torch.dtype,
+    ) -> Dict[int, torch.Tensor]:
         # Out-of-place assembly: collect each path's contribution and the channel indices
         # it occupies, then index_add them into a fresh zero tensor per l. This replaces
         # the in-place slice write `out[l3][..., c0:c1, :] = out[l3][..., c0:c1, :] + seg`,
@@ -2551,6 +2625,49 @@ class EdgeWeightedPathPreservingTensorProduct(EdgeWeightedPathTensorProduct):
             out[l] = base
 
         return out
+
+    def forward(
+        self,
+        x1: Dict[int, torch.Tensor],
+        x2: Dict[int, torch.Tensor],
+        gates: torch.Tensor | None = None,
+    ) -> Dict[int, torch.Tensor]:
+        sample = next(iter(x1.values()))
+        batch_shape = sample.shape[:-2]
+        device = sample.device
+        dtype = sample.dtype
+        compute_dtype = self.internal_compute_dtype
+
+        if gates is not None:
+            if gates.device != device or gates.dtype != dtype:
+                gates = gates.to(device=device, dtype=dtype)
+            if gates.shape[-1] == self.num_paths * self.channels:
+                gates = gates.view(*gates.shape[:-1], self.num_paths, self.channels)
+            elif gates.shape[-2:] != (self.num_paths, self.channels):
+                raise ValueError(
+                    f"Expected gates shape (..., {self.num_paths * self.channels}) or "
+                    f"(..., {self.num_paths}, {self.channels}), got {tuple(gates.shape)}"
+                )
+
+        if self._use_scalar_direct_fast_path:
+            return self._forward_scalar_direct(
+                x1,
+                x2,
+                gates,
+                batch_shape=batch_shape,
+                device=device,
+                dtype=dtype,
+                compute_dtype=compute_dtype,
+            )
+        return self._forward_index_add(
+            x1,
+            x2,
+            gates,
+            batch_shape=batch_shape,
+            device=device,
+            dtype=dtype,
+            compute_dtype=compute_dtype,
+        )
 
 
 def _normalize_irrep_key(l: int, parity: int) -> Tuple[int, int]:
