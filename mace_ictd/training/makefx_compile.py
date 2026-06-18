@@ -247,8 +247,11 @@ def trace_and_compile_force(
     # attribute by default, so a hasattr-guarded set would never fire.  Only
     # disables guards -- numerics are unchanged -- and the choice is baked into the
     # trace, so the attribute is restored right after.
+    raw_model = model.module if hasattr(model, "module") else model
     prev_skip = getattr(model, "skip_input_validation", None)
+    prev_raw_skip = getattr(raw_model, "skip_input_validation", None)
     model.skip_input_validation = True
+    raw_model.skip_input_validation = True
 
     try:
         if compute_fn is None:
@@ -285,6 +288,14 @@ def trace_and_compile_force(
                 model.skip_input_validation = False
         else:
             model.skip_input_validation = prev_skip
+        if raw_model is not model:
+            if prev_raw_skip is None:
+                try:
+                    delattr(raw_model, "skip_input_validation")
+                except Exception:
+                    raw_model.skip_input_validation = False
+            else:
+                raw_model.skip_input_validation = prev_raw_skip
 
     if not do_compile:
         return traced

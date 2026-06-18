@@ -266,6 +266,77 @@ hyperparameters. For strict comparison against a native MACE run, match the data
 split, seed, loss weights, optimizer, scheduler, batch construction, dtype, and
 ScaleShift/E0 settings.
 
+### 5.1 Multi-GPU Training
+
+MACE-ICTD training supports PyTorch `DistributedDataParallel` through the training
+CLI. The default `--ddp auto` enables DDP when the process environment has
+`WORLD_SIZE>1`, so a normal `torchrun` launch is enough:
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  -m mace_ictd.cli.train \
+  --data-dir DATA \
+  --train-prefix train \
+  --val-prefix val \
+  --product-backend cueq \
+  --angular-basis e3nn \
+  --train-makefx-compile \
+  --makefx-buckets 6 \
+  --pad-nodes-to-max \
+  --pad-edges-to-max \
+  --batch-size 4 \
+  --device cuda \
+  --ddp auto \
+  --checkpoint model_ddp.pth
+```
+
+On Slurm, request the GPUs through the scheduler and let `srun` or `torchrun`
+create one process per GPU. A minimal pattern is:
+
+```bash
+#!/bin/bash
+#SBATCH -p GPU
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
+
+source /path/to/conda.sh
+conda activate mff
+
+srun python -m mace_ictd.cli.train \
+  --data-dir DATA \
+  --train-prefix train \
+  --val-prefix val \
+  --product-backend cueq \
+  --angular-basis e3nn \
+  --train-makefx-compile \
+  --makefx-buckets 6 \
+  --pad-nodes-to-max \
+  --pad-edges-to-max \
+  --batch-size 4 \
+  --device cuda \
+  --ddp auto \
+  --checkpoint model_ddp.pth
+```
+
+DDP behavior:
+
+- Each process uses `cuda:$LOCAL_RANK`; do not manually give every rank the same
+  `--device cuda:0`.
+- `--batch-size` is per rank. The effective global batch is approximately
+  `batch_size * world_size`.
+- Rank 0 performs validation logging and checkpoint writing; checkpoint keys are
+  saved without a `module.` prefix.
+- With `--makefx-buckets`, the bucket sampler is DDP-aware. Keep padding/bucketing
+  enabled when using `--train-makefx-compile`; otherwise every raw graph shape can
+  trigger a separate compile.
+- `--train-makefx-compile` also works under DDP, but the first compiled bucket has
+  a noticeable compile cost on every rank. It is useful for long runs and stable
+  bucketed shapes, not for very short smoke tests.
+- Use `--ddp on` when you want the command to fail unless DDP is active. Use
+  `--ddp off` for single-process debugging.
+
 ## 6. Data Pipeline
 
 The trainer consumes preprocessed H5 files:
@@ -692,7 +763,9 @@ The package provides:
 
 - `pair_style mff/torch`
 - `pair_style mff/torch/kk`
-- `compute ... mff/torch/phys`
+
+Current `.pt2` LAMMPS deployment supports energy and forces. Physical tensor
+outputs are not exposed as a supported public LAMMPS interface.
 
 General workflow:
 
@@ -719,6 +792,61 @@ run 100
 ```
 
 The element order in `pair_coeff` must match the export/load order.
+
+### 11.1 Multi-GPU LAMMPS Runs
+
+`USER-MFFTORCH` is an MPI pair style. Multi-GPU use is therefore normally
+one MPI rank per GPU, not one LAMMPS process controlling all GPUs. Build LAMMPS
+with MPI, `USER-MFFTORCH`, LibTorch, and optionally Kokkos/CUDA.
+
+For the non-Kokkos pair style:
+
+```bash
+export MFF_DEBUG_BUNDLE=1   # optional: prints requested and selected devices
+mpirun -np 2 /path/to/lmp -in in.mfftorch
+```
+
+with an input using:
+
+```lammps
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+For the Kokkos GPU data path:
+
+```bash
+export MFF_DEBUG_BUNDLE=1
+mpirun -np 2 /path/to/lmp -k on g 2 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+and either write the Kokkos style explicitly:
+
+```lammps
+pair_style mff/torch/kk 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+or use `pair_style mff/torch` and let `-sf kk` map it to the Kokkos variant when
+the build supports that mapping.
+
+Device mapping details:
+
+- Plain `mff/torch` selects the local CUDA device from MPI/Slurm local-rank
+  variables such as `SLURM_LOCALID`, `LOCAL_RANK`, `OMPI_COMM_WORLD_LOCAL_RANK`,
+  or `MPI_LOCALRANKID`.
+- `mff/torch/kk` currently maps ranks to Kokkos GPUs correctly for a single-node
+  run with one MPI rank per GPU. Treat multi-node Kokkos runs as requiring an
+  explicit local-rank validation before production.
+- With `MFF_DEBUG_BUNDLE=1`, the engine prints the requested device and the
+  selected device. Check that different local ranks select different GPUs.
+- For static-N `.pt2` exports, make sure the exported `--atoms`/`--degree`
+  capacity covers local atoms plus ghosts on every MPI rank. N-dynamic `.pt2`
+  exports are more convenient when the deployment environment supports them.
+- Compare `run 0` energy and forces between `-np 1` and `-np N` before long MD.
+  Small fp32 differences can occur from different edge ordering and accumulation,
+  but large differences indicate a decomposition, cutoff, or exported-capacity
+  problem.
 
 ## 12. Benchmarking
 

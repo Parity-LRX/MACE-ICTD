@@ -713,7 +713,9 @@ void MFFTorchEngine::load_core(const std::string& core_pt_path, const std::strin
   device_ = pick_device(device_str);
   const bool debug_bundle = std::getenv("MFF_DEBUG_BUNDLE") != nullptr;
   if (debug_bundle) {
-    std::fprintf(stderr, "[USER-MFFTORCH] load_core path=%s device=%s\n", core_pt_path.c_str(), device_str.c_str());
+    const auto selected_device = device_.str();
+    std::fprintf(stderr, "[USER-MFFTORCH] load_core path=%s requested_device=%s selected_device=%s\n",
+                 core_pt_path.c_str(), device_str.c_str(), selected_device.c_str());
   }
   bundle_mode_ = false;
   bundle_manifest_path_.clear();

@@ -1,47 +1,116 @@
-## 这是什么
+# LAMMPS USER-MFFTORCH
 
-这是一套可拷贝进 **LAMMPS 源码树**的自定义包：`USER-MFFTORCH`。
+`USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTD models through
+LibTorch/AOTInductor from C++. It is intended for production MD after a model has
+already been trained or converted in Python and exported as a deployment core.
 
-**完整编译与运行指南**：见 [docs/BUILD_AND_RUN.md](docs/BUILD_AND_RUN.md)。
+Full build notes: [docs/BUILD_AND_RUN.md](docs/BUILD_AND_RUN.md).
 
-它提供两个 pair style：
+## What It Provides
 
-- `pair_style mff/torch`：C++ + LibTorch/AOTI 推理路径，可用于基础编译和数值烟测
-- `pair_style mff/torch/kk`：Kokkos+CUDA 数据准备 + LibTorch/AOTI 推理路径，用于 GPU MD
+Pair styles:
 
-以及一个 compute style：
+- `pair_style mff/torch`: C++ + LibTorch/AOTI inference path. Use this first for
+  build validation and numerical smoke tests.
+- `pair_style mff/torch/kk`: Kokkos/CUDA data-preparation path plus LibTorch/AOTI
+  inference. Use this for GPU MD when the Kokkos build is available.
 
-- `compute ... mff/torch/phys`：读取最近一次 `pair_style mff/torch*` 缓存的物理张量输出
+The recommended model artifact is an AOTInductor `.pt2` core exported by
+`mff-export-aoti` or `python -m mace_ictd.cli.export_aoti_core`. Legacy
+TorchScript `core.pt` support is still kept for older LibTorch deployments, but
+new validation uses `.pt2`.
 
-推荐模型文件是 MACE-ICTD 导出的 **AOTInductor `.pt2` core**，由
-`mff-export-aoti` 或 `python -m mace_ictd.cli.export_aoti_core` 生成。
-旧的 TorchScript `core.pt` 路径仍保留给 legacy LibTorch 部署，但新测试和 OFF23 smoke test
-都使用 `.pt2`。
+Current supported deployment output is energy and force. Physical tensor outputs
+are not a supported public LAMMPS interface in the current `.pt2` deployment
+path; do not rely on `compute mff/torch/phys` for production runs.
 
-## 目录结构（拷贝到 LAMMPS 源码）
+## Install Into LAMMPS
 
-把本目录中的：
-
-- `src/USER-MFFTORCH/` → 拷贝到 `LAMMPS/src/USER-MFFTORCH/`
-- （你的版本为 22Jul2025）`cmake/Modules/Packages/USER-MFFTORCH.cmake` → 拷贝到 `LAMMPS/cmake/Modules/Packages/USER-MFFTORCH.cmake`
-
-## LAMMPS CMake 编译示例
+From the MACE-ICTD repository root:
 
 ```bash
-cmake -S /path/to/lammps/cmake -B build-lmp \
-  -D PKG_KOKKOS=ON -D Kokkos_ENABLE_CUDA=ON -D Kokkos_ARCH_AMPERE86=ON \
-  -D PKG_USER-MFFTORCH=ON \
-  -D CMAKE_PREFIX_PATH="$(python - <<'PY'\nimport torch\nprint(torch.utils.cmake_prefix_path)\nPY\n)"
-cmake --build build-lmp -j
+bash scripts/install_user_mfftorch_into_lammps.sh /path/to/lammps
 ```
 
-此外你需要在 `LAMMPS/cmake/CMakeLists.txt` 里做 2 处一次性改动（否则 CMake 不会识别这个新包）：
-- 把 `USER-MFFTORCH` 加进 `STANDARD_PACKAGES` 列表
-- 把 `USER-MFFTORCH` 加进 `foreach(PKG_WITH_INCL ...)` 的 include 列表（这样会执行 `cmake/Modules/Packages/USER-MFFTORCH.cmake` 来链接 LibTorch）
+Manual copy, if needed:
 
-如果运行时找不到 `libtorch.so` / `libc10.so`，给可执行文件设置 `LD_LIBRARY_PATH`（指向你的 Python venv 里 `torch/lib`）。
+- `lammps_user_mfftorch/src/USER-MFFTORCH/` to `LAMMPS/src/USER-MFFTORCH/`
+- `lammps_user_mfftorch/cmake/Modules/Packages/USER-MFFTORCH.cmake` to
+  `LAMMPS/cmake/Modules/Packages/USER-MFFTORCH.cmake`
 
-## LAMMPS 输入示例
+Some LAMMPS versions also require adding `USER-MFFTORCH` to package lists in
+`LAMMPS/cmake/CMakeLists.txt`. The full guide covers the exact edits.
+
+## Build
+
+Example CUDA/Kokkos build:
+
+```bash
+cd /path/to/lammps
+export LIBTORCH_PREFIX="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+
+cmake -S cmake -B build-mfftorch-kk \
+  -D CMAKE_PREFIX_PATH="$LIBTORCH_PREFIX" \
+  -D PKG_USER-MFFTORCH=ON \
+  -D PKG_KOKKOS=ON \
+  -D Kokkos_ENABLE_CUDA=ON \
+  -D Kokkos_ARCH_AMPERE86=ON
+
+cmake --build build-mfftorch-kk -j
+```
+
+For a non-Kokkos validation build, drop the Kokkos options and use a separate
+build directory, for example `build-mfftorch`.
+
+At runtime, make sure the PyTorch shared libraries are visible:
+
+```bash
+export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):${LD_LIBRARY_PATH:-}"
+```
+
+## Export a Model
+
+Basic `.pt2` export from a MACE-ICTD checkpoint:
+
+```bash
+mff-export-aoti \
+  --checkpoint model.pth \
+  --elements H,C,N,O \
+  --out model.pt2 \
+  --dynamic \
+  --dtype float32 \
+  --device cuda \
+  --embed-e0
+```
+
+For fixed-size MD systems, a static-N export is often the most conservative
+LAMMPS smoke-test target:
+
+```bash
+mff-export-aoti \
+  --checkpoint model.pth \
+  --elements H,C,N,O \
+  --atoms 256 \
+  --degree 32 \
+  --static-n \
+  --dtype float32 \
+  --device cuda \
+  --embed-e0 \
+  --out model_static256.pt2
+```
+
+Rules that matter:
+
+- `--elements` must match the element order passed to LAMMPS `pair_coeff`.
+- `--embed-e0` makes LAMMPS `pe` include atomic reference energies.
+- Static export capacity is controlled by `--atoms` and `--degree`; a LAMMPS
+  run that exceeds the exported capacity is invalid.
+- Always check the exporter's eager-vs-compiled energy/force comparison before
+  running LAMMPS.
+
+## LAMMPS Input
+
+Minimal example:
 
 ```lammps
 units metal
@@ -49,79 +118,94 @@ atom_style atomic
 boundary p p p
 
 read_data system.data
-
 neighbor 1.0 bin
 
 pair_style mff/torch/kk 5.0 cuda
-pair_coeff * * /path/to/model.pt2 H O
+pair_coeff * * /path/to/model.pt2 H C N O
 
 velocity all create 300 42
 fix 1 all nve
 run 100
 ```
 
-说明：
-- `pair_style ... 5.0` 是 cutoff（Angstrom）。
-- `pair_coeff * * model.pt2 H O` 的元素顺序必须与导出时一致（type→元素→Z 映射）。可用 `NULL` 跳过某个 type。
-- `pair_style mff/torch` 和 `pair_style mff/torch/kk` 都可加载 `.pt2`；`/kk` 版本用于 Kokkos GPU 数据路径。
+Notes:
 
-## 已验证的 OFF23 `.pt2` 烟测
+- `5.0` is the cutoff in Angstrom.
+- The `pair_coeff` element list maps LAMMPS atom types to element symbols. Use
+  `NULL` for atom types that should be skipped.
+- Both `mff/torch` and `mff/torch/kk` can load `.pt2`; the `/kk` variant uses
+  Kokkos for the GPU data path.
 
-在 RTX 4090 验证环境中，`build-mfftorch` 和 `build-mfftorch-kk` 都已重新编译并加载 fresh
-converted `MACE-OFF23_small` bridge-U ICTD `.pt2`。对一个 6 原子 static-N 输入，LAMMPS
-`run 0` 与 Python checkpoint 对应到：
+## Multi-GPU MPI Runs
 
-| 量 | LAMMPS `mff/torch` | Python checkpoint |
+LAMMPS multi-GPU execution uses MPI decomposition: run one MPI rank per GPU.
+Do not expect one LAMMPS rank to drive all GPUs.
+
+Plain LibTorch/AOTI path:
+
+```bash
+export MFF_DEBUG_BUNDLE=1
+mpirun -np 2 /path/to/lmp -in in.mfftorch
+```
+
+with:
+
+```lammps
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+Kokkos GPU data path:
+
+```bash
+export MFF_DEBUG_BUNDLE=1
+mpirun -np 2 /path/to/lmp -k on g 2 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+with either:
+
+```lammps
+pair_style mff/torch/kk 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+or `pair_style mff/torch` when `-sf kk` mapping is available in the build.
+
+The plain `mff/torch` engine selects the local CUDA device from local-rank
+environment variables such as `SLURM_LOCALID`, `LOCAL_RANK`,
+`OMPI_COMM_WORLD_LOCAL_RANK`, or `MPI_LOCALRANKID`. The Kokkos variant maps
+ranks to Kokkos GPUs correctly for the common single-node, one-rank-per-GPU
+case. Validate multi-node Kokkos runs before production.
+
+With `MFF_DEBUG_BUNDLE=1`, initialization prints the requested and selected
+device. Check that different local ranks select different GPUs. Before a long
+MD run, compare `run 0` energy and forces for `-np 1` and `-np N`. Small fp32
+roundoff differences are possible; large differences usually mean a domain
+decomposition, cutoff, ghost, or static `.pt2` capacity issue.
+
+## OFF23 Smoke Test
+
+On an RTX 4090 validation host, `MACE-OFF23_small.model` was converted to
+bridge-U MACE-ICTD, exported as a float32 static-6 `.pt2`, and loaded by both
+`build-mfftorch` and `build-mfftorch-kk`.
+
+Fresh LAMMPS `run 0` result:
+
+| Quantity | LAMMPS `mff/torch` | Python checkpoint |
 |---|---:|---:|
-| energy (eV) | `-6633.036` | `-6633.03613281` |
-| 最大绝对力分量 (eV/A) | `11.767612` | `11.76760674` |
+| Energy (eV) | `-6633.036` | `-6633.03613281` |
+| Max absolute force component (eV/A) | `11.767612` | `11.76760674` |
 
-注意 LAMMPS thermo 的 `fmax` 是最大绝对力分量，不是最大力向量范数。
+The corresponding float64 conversion bridge check against native `mace-torch`
+on a benzene same-frame trajectory gave:
 
-## 物理张量输出
+- max energy difference: `2.73e-12 eV`
+- max force-component difference: `4.44e-15 eV/A`
 
-如果导出的模型 core 来自带 `physical_tensor_outputs` 的 MACE-ICTD 模型，
-那么 `pair_style mff/torch*` 会在每一步缓存固定 schema 的笛卡尔物理张量，可通过：
+LAMMPS thermo `fmax` is the maximum absolute force component. Compare it against
+`max(abs(forces))` from Python, not against the maximum per-atom force-vector
+norm.
 
-```lammps
-compute mffg all mff/torch/phys global
-compute mffgm all mff/torch/phys global/mask
-compute mffa all mff/torch/phys atom
-compute mffam all mff/torch/phys atom/mask
-```
-
-来读取。
-
-- `global`：返回长度为 22 的全局向量，可用于 `thermo_style custom`
-- `global/mask`：返回长度为 4 的全局 mask，顺序为 `charge dipole polarizability quadrupole`
-- `atom`：返回 `N x 22` 的逐原子数组，可用于 `dump custom`
-- `atom/mask`：返回长度为 4 的全局 mask，顺序为 `charge_per_atom dipole_per_atom polarizability_per_atom quadrupole_per_atom`
-
-22 列固定顺序如下：
-
-`[charge, dipole_x, dipole_y, dipole_z, polar_xx, polar_xy, polar_xz, polar_yx, polar_yy, polar_yz, polar_zx, polar_zy, polar_zz, quad_xx, quad_xy, quad_xz, quad_yx, quad_yy, quad_yz, quad_zx, quad_zy, quad_zz]`
-
-若某个物理头未在模型中启用，对应 22 列会填 0，是否启用请看 `mask`。
-
-也支持按名字直接取某个物理量或分量，避免手工记 22 列索引，例如：
-
-```lammps
-compute dip all mff/torch/phys global dipole
-compute dipx all mff/torch/phys global dipole x
-compute pol all mff/torch/phys global polarizability
-compute polxx all mff/torch/phys global polarizability xx
-
-compute adip all mff/torch/phys atom dipole
-compute adipx all mff/torch/phys atom dipole x
-```
-
-- `global charge` / `global dipole x` / `global polarizability xx` 这类单分量会直接返回标量
-- `global dipole` 返回 3 维向量，`global polarizability` / `global quadrupole` 返回 9 维向量
-- `atom dipole x` 返回逐原子向量，`atom dipole` 返回逐原子 `N x 3` 数组，`atom polarizability` 返回 `N x 9` 数组
-- `global/mask dipole` 或 `atom/mask polarizability` 可直接检查某个头是否启用
-
-如果你的模型训练时根本没有配置 `physical_tensor_outputs`，`pair_style mff/torch*` 仍然会正常运行，能量和力链路不受影响。
-此时：
-
-- `compute ... mff/torch/phys global` / `atom` 会返回全 0
-- `compute ... mff/torch/phys global/mask` / `atom/mask` 会返回全 0
+Older public OFF23 pickle files may require a matching historical
+`mace-torch`/`e3nn` environment for the initial load/conversion step. Once
+converted, the MACE-ICTD checkpoint can be exported by the current runtime.

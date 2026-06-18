@@ -267,6 +267,73 @@ scheduler、batch 构造、dtype、ScaleShift 和 E0 设置。
 
 注意：两个 trainer 从随机初始化开始独立训练，不能因为函数形式一致就保证每一步 bitwise 一样；初始化、数据顺序、optimizer、CUDA kernel、dtype 和 loss 累加顺序都会影响训练轨迹。
 
+### 5.1 多卡训练
+
+MACE-ICTD 训练 CLI 支持 PyTorch `DistributedDataParallel`。默认 `--ddp auto`
+会在环境里存在 `WORLD_SIZE>1` 时自动启用 DDP，所以标准 `torchrun` 启动即可：
+
+```bash
+torchrun --standalone --nproc_per_node=2 \
+  -m mace_ictd.cli.train \
+  --data-dir DATA \
+  --train-prefix train \
+  --val-prefix val \
+  --product-backend cueq \
+  --angular-basis e3nn \
+  --train-makefx-compile \
+  --makefx-buckets 6 \
+  --pad-nodes-to-max \
+  --pad-edges-to-max \
+  --batch-size 4 \
+  --device cuda \
+  --ddp auto \
+  --checkpoint model_ddp.pth
+```
+
+在 Slurm 上，必须通过调度器申请 GPU，并让 `srun` 或 `torchrun` 启动每卡一个进程。例如：
+
+```bash
+#!/bin/bash
+#SBATCH -p GPU
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
+
+source /path/to/conda.sh
+conda activate mff
+
+srun python -m mace_ictd.cli.train \
+  --data-dir DATA \
+  --train-prefix train \
+  --val-prefix val \
+  --product-backend cueq \
+  --angular-basis e3nn \
+  --train-makefx-compile \
+  --makefx-buckets 6 \
+  --pad-nodes-to-max \
+  --pad-edges-to-max \
+  --batch-size 4 \
+  --device cuda \
+  --ddp auto \
+  --checkpoint model_ddp.pth
+```
+
+DDP 行为说明：
+
+- 每个进程会使用 `cuda:$LOCAL_RANK`；不要手动让所有 rank 都用同一个
+  `--device cuda:0`。
+- `--batch-size` 是每个 rank 的 batch size；全局有效 batch 约等于
+  `batch_size * world_size`。
+- rank 0 负责 validation log 和 checkpoint 写入；保存出来的 checkpoint key
+  不带 `module.` 前缀。
+- 使用 `--makefx-buckets` 时，bucket sampler 是 DDP-aware 的。配合
+  `--train-makefx-compile` 时建议继续打开 bucket 和 padding，否则每个原始 graph
+  shape 都可能触发单独 compile。
+- `--train-makefx-compile` 可以在 DDP 下使用，但每个 rank 第一次遇到 bucket 时都有
+  compile 开销。它适合长跑和稳定 bucketed shapes，不适合用很短的 smoke test 判断总耗时。
+- 如果希望命令在没启用 DDP 时直接失败，用 `--ddp on`；单进程 debug 时用 `--ddp off`。
+
 ## 6. 数据流程
 
 训练读取预处理后的 H5：
@@ -683,7 +750,9 @@ lammps_user_mfftorch/
 
 - `pair_style mff/torch`
 - `pair_style mff/torch/kk`
-- `compute ... mff/torch/phys`
+
+当前 `.pt2` LAMMPS 部署支持 energy 和 force。Physical tensor outputs 还不是公开支持的
+LAMMPS 接口。
 
 一般流程：
 
@@ -710,6 +779,57 @@ run 100
 ```
 
 `pair_coeff` 里的元素顺序必须和导出/加载时一致。
+
+### 11.1 多卡 LAMMPS 运行
+
+`USER-MFFTORCH` 是 MPI pair style。多卡运行通常是每张 GPU 一个 MPI rank，
+不是一个 LAMMPS 进程同时控制所有 GPU。编译时需要 MPI、`USER-MFFTORCH`、
+LibTorch；如果要用 Kokkos GPU 数据路径，还需要 Kokkos/CUDA。
+
+普通非 Kokkos pair style：
+
+```bash
+export MFF_DEBUG_BUNDLE=1   # 可选：打印 requested/selected device
+mpirun -np 2 /path/to/lmp -in in.mfftorch
+```
+
+LAMMPS input 中使用：
+
+```lammps
+pair_style mff/torch 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+Kokkos GPU 数据路径：
+
+```bash
+export MFF_DEBUG_BUNDLE=1
+mpirun -np 2 /path/to/lmp -k on g 2 -sf kk -pk kokkos newton off neigh full -in in.mfftorch
+```
+
+input 里可以显式写 Kokkos style：
+
+```lammps
+pair_style mff/torch/kk 5.0 cuda
+pair_coeff * * /path/to/model.pt2 H C N O
+```
+
+也可以写 `pair_style mff/torch`，让 `-sf kk` 在支持的 build 中映射到 Kokkos 版本。
+
+设备映射细节：
+
+- 普通 `mff/torch` 会从 MPI/Slurm 的 local-rank 环境变量选择本地 CUDA 设备，
+  例如 `SLURM_LOCALID`、`LOCAL_RANK`、`OMPI_COMM_WORLD_LOCAL_RANK` 或
+  `MPI_LOCALRANKID`。
+- `mff/torch/kk` 在单节点、每 GPU 一个 MPI rank 的情况下按 rank 映射到 Kokkos GPU。
+  多节点 Kokkos 运行需要先显式验证 local-rank 映射，不建议未经验证直接生产。
+- 设置 `MFF_DEBUG_BUNDLE=1` 后，engine 会打印 requested device 和 selected device；
+  生产前应确认不同 local rank 选择了不同 GPU。
+- 如果使用 static-N `.pt2`，导出时的 `--atoms` / `--degree` 容量必须覆盖每个 MPI rank
+  上的 local atoms 加 ghosts。部署环境支持时，N-dynamic `.pt2` 更省心。
+- 长 MD 前先比较 `-np 1` 和 `-np N` 的 `run 0` energy/force。fp32 下由于 edge order
+  和归约顺序不同，可能有很小差异；大差异通常说明 domain decomposition、cutoff
+  或导出容量有问题。
 
 ## 12. Benchmark
 

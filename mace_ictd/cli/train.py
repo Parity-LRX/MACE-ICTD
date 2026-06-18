@@ -30,12 +30,76 @@ import random
 import h5py
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from mace_ictd.data import H5Dataset, collate_fn_h5, BucketBatchSampler
 from mace_ictd.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
 from mace_ictd.utils.config import ModelConfig
 from mace_ictd.training.train_loop import ForceTrainer, _DEFAULT_E0_KEYS, _DEFAULT_E0_VALUES
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _setup_distributed(args):
+    """Initialize torch.distributed for torchrun/Slurm-launched training.
+
+    The CLI defaults to auto mode: a normal single-process invocation remains unchanged,
+    while ``torchrun --nproc_per_node=N`` initializes DDP from ``env://``.
+    """
+    world_env = _env_int("WORLD_SIZE", 1)
+    use_ddp = args.ddp == "on" or (args.ddp == "auto" and world_env > 1)
+    if args.ddp == "on" and world_env <= 1:
+        raise RuntimeError("--ddp on requires a torchrun-style WORLD_SIZE > 1 environment")
+    if not use_ddp:
+        return {
+            "enabled": False,
+            "rank": 0,
+            "local_rank": 0,
+            "world_size": 1,
+            "is_main": True,
+            "backend": None,
+        }
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this PyTorch build")
+
+    backend = args.ddp_backend
+    if backend == "auto":
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl" and not torch.cuda.is_available():
+        raise RuntimeError("DDP backend 'nccl' requires CUDA; use --ddp-backend gloo on CPU")
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = _env_int("LOCAL_RANK", rank)
+    return {
+        "enabled": True,
+        "rank": rank,
+        "local_rank": local_rank,
+        "world_size": world_size,
+        "is_main": rank == 0,
+        "backend": backend,
+    }
+
+
+def _resolve_device(device_arg: str, ddp_info) -> torch.device:
+    requested = torch.device(device_arg)
+    if ddp_info["enabled"] and requested.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP requested a CUDA device but CUDA is not available")
+        device = torch.device(f"cuda:{ddp_info['local_rank']}")
+        torch.cuda.set_device(device)
+        return device
+    return requested
 
 
 def _mace_hidden_irreps(channels: int, lmax: int):
@@ -529,6 +593,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # misc
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="float64", choices=["float32", "float64"])
+    ap.add_argument("--ddp", default="auto", choices=["auto", "on", "off"],
+                    help="DistributedDataParallel training mode. auto enables DDP when WORLD_SIZE>1.")
+    ap.add_argument("--ddp-backend", default="auto", choices=["auto", "nccl", "gloo"],
+                    help="torch.distributed backend for DDP training.")
+    ap.add_argument("--ddp-find-unused-parameters", action="store_true",
+                    help="Pass find_unused_parameters=True to DistributedDataParallel.")
     ap.add_argument("--checkpoint", default="model.pth")
     ap.add_argument("--resume-checkpoint", default=None,
                     help="Load model weights from a previous MACE-ICTD checkpoint before training.")
@@ -543,11 +613,23 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = build_arg_parser().parse_args(argv)
 
+    ddp_info = _setup_distributed(args)
+    if not ddp_info["is_main"]:
+        logging.getLogger().setLevel(logging.WARNING)
     dtype = torch.float64 if args.dtype == "float64" else torch.float32
-    device = torch.device(args.device)
+    device = _resolve_device(args.device, ddp_info)
     generator = _set_global_seed(args.seed)
     worker_init_fn = _make_worker_init_fn(args.seed)
-    logging.info("seed = %s", args.seed)
+    logging.info(
+        "seed = %s ddp=%s rank=%d/%d local_rank=%d backend=%s device=%s",
+        args.seed,
+        ddp_info["enabled"],
+        ddp_info["rank"],
+        ddp_info["world_size"],
+        ddp_info["local_rank"],
+        ddp_info["backend"],
+        device,
+    )
     if args.loss == "smooth_l1" and args.loss_beta <= 0:
         raise ValueError("--loss-beta must be positive for --loss smooth_l1")
     if args.min_lr > args.lr:
@@ -697,21 +779,58 @@ def main(argv=None):
     logging.info("model: %s route=%s channels=%d lmax=%d num_interaction=%d params=%d",
                  type(model).__name__, args.route, args.channels, args.lmax, args.num_interaction, n_params)
 
+    if ddp_info["enabled"]:
+        if device.type != "cuda":
+            model = DistributedDataParallel(
+                model,
+                broadcast_buffers=False,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+        else:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[device.index],
+                output_device=device.index,
+                broadcast_buffers=False,
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+
     # dataloaders
     if makefx_buckets is not None:
         sampler = BucketBatchSampler(
             train_ds.sample_bucket, batch_size=args.batch_size,
-            shuffle=args.shuffle, drop_last=True, seed=args.seed)
+            shuffle=args.shuffle, drop_last=True,
+            num_replicas=ddp_info["world_size"],
+            rank=ddp_info["rank"],
+            seed=args.seed)
         train_loader = DataLoader(train_ds, batch_sampler=sampler,
                                   collate_fn=collate_fn_h5, num_workers=args.num_workers,
                                   worker_init_fn=worker_init_fn)
         logging.info("bucketing ON: %d buckets, bounds=%s",
                      len(set(train_ds.sample_bucket)), getattr(train_ds, "_bucket_bounds", None))
     else:
-        sampler = None
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=args.shuffle,
-                                  drop_last=False, collate_fn=collate_fn_h5, num_workers=args.num_workers,
-                                  generator=generator, worker_init_fn=worker_init_fn)
+        sampler = (
+            DistributedSampler(
+                train_ds,
+                num_replicas=ddp_info["world_size"],
+                rank=ddp_info["rank"],
+                shuffle=args.shuffle,
+                seed=args.seed,
+                drop_last=False,
+            )
+            if ddp_info["enabled"] else None
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=(args.shuffle and sampler is None),
+            sampler=sampler,
+            drop_last=False,
+            collate_fn=collate_fn_h5,
+            num_workers=args.num_workers,
+            generator=(generator if sampler is None else None),
+            worker_init_fn=worker_init_fn,
+        )
     val_loader = (DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate_fn_h5, num_workers=args.num_workers,
                              worker_init_fn=worker_init_fn)
@@ -789,6 +908,10 @@ def main(argv=None):
         makefx_max_slots=args.makefx_max_slots,
         train_sampler=sampler, checkpoint_path=args.checkpoint, log_interval=args.log_interval,
         extra_hparams=extra_hparams,
+        distributed=ddp_info["enabled"],
+        rank=ddp_info["rank"],
+        world_size=ddp_info["world_size"],
+        main_process=ddp_info["is_main"],
     )
     start_epoch = 0
     if args.resume_checkpoint:
@@ -797,8 +920,14 @@ def main(argv=None):
             training_state=bool(args.resume_training_state),
             strict=True,
         )
-    best = trainer.fit(start_epoch=start_epoch)
-    logging.info("done. best loss = %.6f. checkpoint -> %s", best, args.checkpoint)
+    try:
+        best = trainer.fit(start_epoch=start_epoch)
+        logging.info("done. best loss = %.6f. checkpoint -> %s", best, args.checkpoint)
+        if ddp_info["enabled"] and dist.is_initialized():
+            dist.barrier()
+    finally:
+        if ddp_info["enabled"] and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

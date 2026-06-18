@@ -37,6 +37,7 @@ import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.optim.swa_utils import SWALR
 
@@ -118,6 +119,10 @@ class ForceTrainer:
         log_interval: int = 10,
         checkpoint_path: str | None = None,
         extra_hparams: dict | None = None,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        main_process: bool = True,
     ):
         self.model = model
         self.train_loader = train_loader
@@ -188,6 +193,10 @@ class ForceTrainer:
         self.log_interval = int(log_interval)
         self.checkpoint_path = checkpoint_path
         self.train_sampler = train_sampler
+        self.distributed = bool(distributed)
+        self.rank = int(rank)
+        self.world_size = int(max(world_size, 1))
+        self.main_process = bool(main_process)
         # Construction choices the deploy-side from_checkpoint reads but that are NOT
         # ModelConfig fields (save_contraction_order / ictd_save_tp_mode / invariant_channels /
         # radial_sqrt_num_basis / avg_num_neighbors ...). Merged into model_hyperparameters
@@ -260,6 +269,37 @@ class ForceTrainer:
         )
 
     # ------------------------------------------------------------------ setup
+    @property
+    def _raw_model(self) -> torch.nn.Module:
+        return self.model.module if hasattr(self.model, "module") else self.model
+
+    def _dist_ready(self) -> bool:
+        return (
+            self.distributed
+            and self.world_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
+    def _reduce_epoch_metrics(self, run: dict, seen: int) -> dict:
+        keys = ["total_loss", "energy_loss", "force_loss", "stress_loss", "force_rmse", "energy_rmse_avg"]
+        if not self._dist_ready():
+            denom = max(int(seen), 1)
+            return {k: run[k] / denom for k in keys}
+        vals = [float(run[k]) for k in keys] + [float(seen)]
+        t = torch.tensor(vals, dtype=torch.float64, device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        denom = max(float(t[-1].item()), 1.0)
+        return {k: float(t[i].item() / denom) for i, k in enumerate(keys)}
+
+    def _broadcast_float(self, value: float | None) -> float:
+        if not self._dist_ready():
+            return float(value if value is not None else math.inf)
+        v = float(value if (self.main_process and value is not None) else math.inf)
+        t = torch.tensor([v], dtype=torch.float64, device=self.device)
+        dist.broadcast(t, src=0)
+        return float(t.item())
+
     def _mace_style_param_groups(self, lr: float, weight_decay: float):
         groups = {
             "embedding": {"params": [], "weight_decay": 0.0, "lr": lr},
@@ -270,7 +310,7 @@ class ForceTrainer:
             "other_no_decay": {"params": [], "weight_decay": 0.0, "lr": lr},
         }
         seen: set[int] = set()
-        for name, param in self.model.named_parameters():
+        for name, param in self._raw_model.named_parameters():
             if not param.requires_grad:
                 continue
             pid = id(param)
@@ -420,15 +460,16 @@ class ForceTrainer:
             anneal_epochs=self.swa_anneal_epochs,
             anneal_strategy=self.swa_anneal_strategy,
         )
-        log.info(
-            "Stage Two/SWA activated at epoch=%d step=%d: weights E=%g F=%g S=%g lr=%g",
-            epoch,
-            self.global_step,
-            self.a,
-            self.b,
-            self.c,
-            self.swa_lr,
-        )
+        if self.main_process:
+            log.info(
+                "Stage Two/SWA activated at epoch=%d step=%d: weights E=%g F=%g S=%g lr=%g",
+                epoch,
+                self.global_step,
+                self.a,
+                self.b,
+                self.c,
+                self.swa_lr,
+            )
 
     # ----------------------------------------------------------------- make_fx
     def _makefx_forward(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, strain=None):
@@ -509,7 +550,8 @@ class ForceTrainer:
         b = self._unpack(batch)
         pos, A, batch_idx = b["pos"], b["A"], b["batch_idx"]
         edge_src, edge_dst, edge_shifts, cell = b["edge_src"], b["edge_dst"], b["edge_shifts"], b["cell"]
-        force_ref, target_energies = b["force_ref"], b["target_energies"]
+        force_ref = b["force_ref"]
+        target_energies = b["target_energies"].view(-1)
         stress_ref, extras = b["stress_ref"], b["extras"]
 
         atom_mask = None
@@ -630,7 +672,7 @@ class ForceTrainer:
 
     @torch.no_grad()
     def _update_ema_state(self):
-        state = self.model.state_dict()
+        state = self._raw_model.state_dict()
         if self._ema_state is None:
             self._ema_state = {k: v.detach().clone() for k, v in state.items()}
             return
@@ -650,7 +692,7 @@ class ForceTrainer:
 
     @torch.no_grad()
     def _update_swa_state(self):
-        state = self.model.state_dict()
+        state = self._raw_model.state_dict()
         if self._swa_state is None:
             self._swa_state = {k: v.detach().clone() for k, v in state.items()}
             self._swa_n = 1
@@ -706,7 +748,7 @@ class ForceTrainer:
             for k in run:
                 run[k] += float(out[k])
             seen += 1
-            if self.log_interval and (i % self.log_interval == 0):
+            if self.main_process and self.log_interval and (i % self.log_interval == 0):
                 lr = self.optimizer.param_groups[0]["lr"]
                 s = f" S={float(out['stress_loss']):.4f}" if self.c > 0 else ""
                 phase = "stage2" if self._stage_two_active else "stage1"
@@ -714,10 +756,9 @@ class ForceTrainer:
                          epoch, self.global_step, i, n_batches, phase, float(out["total_loss"]),
                          float(out["energy_loss"]), float(out["force_loss"]), s,
                          float(out["force_rmse"]), lr)
-        seen = max(seen, 1)
-        avg = {k: v / seen for k, v in run.items()}
+        avg = self._reduce_epoch_metrics(run, seen)
         avg["time"] = time.time() - t0
-        avg["steps"] = seen
+        avg["steps"] = int(seen)
         return avg
 
     @torch.no_grad()
@@ -739,7 +780,7 @@ class ForceTrainer:
     def load_checkpoint(self, path, *, training_state: bool = False, strict: bool = True) -> int:
         ckpt = torch.load(path, map_location=self.device)
         state = ckpt.get("e3trans_state_dict", ckpt)
-        missing, unexpected = self.model.load_state_dict(state, strict=strict)
+        missing, unexpected = self._raw_model.load_state_dict(state, strict=strict)
         if missing or unexpected:
             log.warning("checkpoint load_state_dict missing=%s unexpected=%s", missing, unexpected)
         start_epoch = 0
@@ -795,19 +836,25 @@ class ForceTrainer:
             msg = (f"[epoch {epoch} step {self.global_step} {phase}] train loss={tr['total_loss']:.4f} "
                    f"E={tr['energy_loss']:.4f} F={tr['force_loss']:.4f}{sterm} "
                    f"Frmse={tr['force_rmse']:.4f} ({tr['time']:.1f}s)")
-            if self.val_loader is not None:
+            if self.val_loader is not None and self.main_process:
                 va = self._val_pass()
                 msg += (f" | val loss={va['total_loss']:.4f} "
                         f"Frmse={va['force_rmse']:.4f} Ermse={va['energy_rmse_avg']:.4f}")
                 cur = va["total_loss"]
             else:
                 cur = tr["total_loss"]
-            log.info(msg)
-            print(msg, flush=True)
+            cur = self._broadcast_float(cur)
+            if self.main_process:
+                log.info(msg)
+                print(msg, flush=True)
             self._step_scheduler_after_epoch(cur)
-            if self.checkpoint_path is not None and cur < best:
+            improved = cur < best
+            if improved:
                 best = cur
+            if self.main_process and self.checkpoint_path is not None and improved:
                 self.save_checkpoint(self.checkpoint_path, epoch=epoch)
+            if self._dist_ready():
+                dist.barrier()
             if self._reached_max_steps():
                 break
         return best
@@ -821,7 +868,7 @@ class ForceTrainer:
         matter to the ictd-fix baseline: the ModelConfig snapshot plus the handful of
         live model attributes (num_interaction / avg_num_neighbors / ictd_fix_* etc.)
         whose defaults would otherwise be guessed wrong on reload."""
-        base = self.model
+        base = self._raw_model
         cfg = self.config
         meta = {}
         if cfg is not None:
@@ -963,7 +1010,7 @@ class ForceTrainer:
         ckpt = {
             "epoch": int(epoch),
             "global_step": int(self.global_step),
-            "e3trans_state_dict": self.model.state_dict(),
+            "e3trans_state_dict": self._raw_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "dtype": str(self.dtype).replace("torch.", ""),
             "max_radius": float(self.max_radius),
