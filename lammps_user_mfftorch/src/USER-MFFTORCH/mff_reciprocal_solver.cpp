@@ -936,54 +936,72 @@ torch::Tensor MFFReciprocalSolver::multipole_reciprocal_energy(
       frac.select(1, axis).copy_(frac_axis - torch::floor(frac_axis));
     }
   }
-  // k_cart = 2*pi * m @ inv(cell)^T (transpose required for k.mu / k.Q.k equivariance).
-  auto cpu_opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+  // k_cart = 2*pi * m @ inv(cell)^T (transpose required for k.mu / k.Q.k equivariance) and the
+  // spectral weights green(k)/V * 1/|W(k)|^2 [* screening] depend ONLY on the cell + mesh (NOT on
+  // atom positions), so cache them keyed on the effective cell: fixed-cell MD (NVE/NVT) builds them
+  // once and per step only does the position-dependent spread/FFT below. Rebuilt on a cell change.
   auto eff_cpu = geom.effective_cell.to(torch::kCPU, torch::kFloat32).contiguous();
-  auto freq = build_integer_frequencies(cpu_opt);
-  auto grids = torch::meshgrid({freq, freq, freq}, "ij");
-  auto integer_k = torch::stack({grids[0], grids[1], grids[2]}, -1).reshape({-1, 3});
-  auto inv_cell_cpu = torch::linalg_inv(eff_cpu);
-  auto k_cart = (2.0 * M_PI * torch::matmul(integer_k, inv_cell_cpu.transpose(0, 1))).to(device);
-  auto k_norm = torch::linalg_vector_norm(k_cart, 2, -1);
-  // CIC assignment window (stencil exponent 2): W = prod_axes sinc(m/mesh)^2, deconvolve by 1/W^2.
-  auto w1d = torch::sinc(freq / static_cast<double>(mesh_size_)).pow(2).to(device);
-  auto window = (w1d.view({mesh_size_, 1, 1}) * w1d.view({1, mesh_size_, 1}) *
-                 w1d.view({1, 1, mesh_size_})).reshape({-1});
-  auto wdeconv = torch::reciprocal(window.clamp_min(1.0e-6).square());
-  auto safe = k_norm.clamp_min(k_norm_floor_);
-  auto spectral = (4.0 * M_PI) / (safe * safe) / geom.volume * wdeconv;
-  if (full_ewald_) {
-    // Ewald Gaussian screening exp(-k^2/4 alpha^2), alpha = prefactor / (0.5 * min periodic box
-    // length) -- mirrors the in-model MeshLongRangeKernel3D.multipole_energy full_ewald branch so the
-    // deployed reciprocal sum matches training (without it the bare 4pi/k^2 mesh sum has large
-    // CIC/mesh translation error). eff_cpu rows are the real-space lattice vectors.
-    auto row_norms = torch::linalg_vector_norm(eff_cpu, 2, 1);  // (3,) lattice vector lengths
-    double Lmin = -1.0;
-    for (int ax = 0; ax < 3; ++ax) {
-      if (pbc[ax] != 1) continue;
-      const double Lax = row_norms[ax].item<double>();
-      if (Lmin < 0.0 || Lax < Lmin) Lmin = Lax;
+  const auto cell_key = flatten_cell_values(eff_cpu);
+  const bool cache_hit = cached_mp_key_valid_ && cached_mp_k_cart_.defined() &&
+                         cached_mp_mesh_ == mesh_size_ && cached_mp_full_ewald_ == full_ewald_ &&
+                         cached_mp_k_cart_.device() == device && cached_mp_cell_key_ == cell_key;
+  if (!cache_hit) {
+    auto cpu_opt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto freq = build_integer_frequencies(cpu_opt);
+    auto grids = torch::meshgrid({freq, freq, freq}, "ij");
+    auto integer_k = torch::stack({grids[0], grids[1], grids[2]}, -1).reshape({-1, 3});
+    auto inv_cell_cpu = torch::linalg_inv(eff_cpu);
+    auto k_cart_new = (2.0 * M_PI * torch::matmul(integer_k, inv_cell_cpu.transpose(0, 1))).to(device);
+    auto k_norm = torch::linalg_vector_norm(k_cart_new, 2, -1);
+    // CIC assignment window (stencil exponent 2): W = prod_axes sinc(m/mesh)^2, deconvolve by 1/W^2.
+    auto w1d = torch::sinc(freq / static_cast<double>(mesh_size_)).pow(2).to(device);
+    auto window = (w1d.view({mesh_size_, 1, 1}) * w1d.view({1, mesh_size_, 1}) *
+                   w1d.view({1, 1, mesh_size_})).reshape({-1});
+    auto wdeconv = torch::reciprocal(window.clamp_min(1.0e-6).square());
+    auto safe = k_norm.clamp_min(k_norm_floor_);
+    auto spectral_new = (4.0 * M_PI) / (safe * safe) / geom.volume * wdeconv;
+    if (full_ewald_) {
+      // Ewald Gaussian screening exp(-k^2/4 alpha^2), alpha = prefactor / (0.5 * min periodic box
+      // length) -- mirrors the in-model MeshLongRangeKernel3D.multipole_energy full_ewald branch so
+      // the deployed sum matches training (without it the bare 4pi/k^2 mesh sum has large CIC/mesh
+      // translation error). eff_cpu rows are the real-space lattice vectors.
+      auto row_norms = torch::linalg_vector_norm(eff_cpu, 2, 1);  // (3,) lattice vector lengths
+      double Lmin = -1.0;
+      for (int ax = 0; ax < 3; ++ax) {
+        if (pbc[ax] != 1) continue;
+        const double Lax = row_norms[ax].item<double>();
+        if (Lmin < 0.0 || Lax < Lmin) Lmin = Lax;
+      }
+      if (Lmin < 0.0) Lmin = row_norms.min().item<double>();  // non-periodic fallback: all axes
+      double real_cutoff = 0.5 * Lmin;
+      if (real_cutoff < k_norm_floor_) real_cutoff = k_norm_floor_;
+      const double alpha = ewald_alpha_prefactor_ / real_cutoff;
+      spectral_new = spectral_new * torch::exp(-(k_norm.square()) / (4.0 * alpha * alpha));
     }
-    if (Lmin < 0.0) Lmin = row_norms.min().item<double>();  // non-periodic fallback: all axes
-    double real_cutoff = 0.5 * Lmin;
-    if (real_cutoff < k_norm_floor_) real_cutoff = k_norm_floor_;
-    const double alpha = ewald_alpha_prefactor_ / real_cutoff;
-    spectral = spectral * torch::exp(-(k_norm.square()) / (4.0 * alpha * alpha));
+    spectral_new = torch::where(k_norm > k_norm_floor_, spectral_new, torch::zeros_like(spectral_new));
+    cached_mp_k_cart_ = k_cart_new;
+    cached_mp_spectral_ = spectral_new;
+    cached_mp_cell_key_ = cell_key;
+    cached_mp_mesh_ = mesh_size_;
+    cached_mp_full_ewald_ = full_ewald_;
+    cached_mp_key_valid_ = true;
   }
-  spectral = torch::where(k_norm > k_norm_floor_, spectral, torch::zeros_like(spectral));
-  auto q = packed_source.narrow(1, 0, C);
-  auto S = torch::fft::fftn(spread_to_mesh_full(frac, q, pbc), {}, {0, 1, 2}).reshape({-1, C});
-  int off = C;
+  const auto& k_cart = cached_mp_k_cart_;
+  const auto& spectral = cached_mp_spectral_;
+  // Spread + FFT ALL channels [q | dipole_xyz | quad_3x3] in ONE batched call (fftn over dims 0,1,2
+  // treats the trailing channel axis as batch), instead of 3 separate spread+FFT pairs. Spread and
+  // FFT are per-channel independent + linear, so this is numerically identical -- but it collapses 6
+  // kernel launches (3 spread + 3 FFT, each also in the autograd backward) to 2, cutting the per-step
+  // launch/autograd overhead that dominates the reciprocal force at small mesh sizes.
+  auto packed_fft = torch::fft::fftn(spread_to_mesh_full(frac, packed_source, pbc), {}, {0, 1, 2})
+                        .reshape({-1, packed_source.size(1)});  // (K, 13C) complex
+  auto S = packed_fft.narrow(1, 0, C);  // q~
   if (max_multipole_l_ >= 1) {
-    auto mu = packed_source.narrow(1, off, 3 * C);
-    auto mut = torch::fft::fftn(spread_to_mesh_full(frac, mu, pbc), {}, {0, 1, 2}).reshape({-1, C, 3});
-    auto kmu = torch::einsum("kx,kcx->kc", {k_cart.to(mut.dtype()), mut});
-    S = S + kmu.mul(c10::complex<double>(0.0, 1.0));  // + i k.mu
-    off += 3 * C;
+    auto mut = packed_fft.narrow(1, C, 3 * C).reshape({-1, C, 3});
+    S = S + torch::einsum("kx,kcx->kc", {k_cart.to(mut.dtype()), mut}).mul(c10::complex<double>(0.0, 1.0));  // + i k.mu
   }
   if (max_multipole_l_ >= 2) {
-    auto qf = packed_source.narrow(1, off, 9 * C);
-    auto qt = torch::fft::fftn(spread_to_mesh_full(frac, qf, pbc), {}, {0, 1, 2}).reshape({-1, C, 3, 3});
+    auto qt = packed_fft.narrow(1, 4 * C, 9 * C).reshape({-1, C, 3, 3});
     auto kc = k_cart.to(qt.dtype());
     S = S - 0.5 * torch::einsum("kx,kcxy,ky->kc", {kc, qt, kc});  // - 1/2 k.Q.k
   }

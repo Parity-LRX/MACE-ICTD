@@ -152,6 +152,14 @@ class MFFReciprocalSolver {
   mutable SparsePartitionCacheKey sparse_partition_cache_key_;
   mutable torch::Tensor cached_local_k_cart_cpu_;
   mutable torch::Tensor cached_local_spectral_weights_cpu_;
+  // Latent-multipole reciprocal: cache the cell-dependent k_cart + spectral weights (everything
+  // except the position-dependent spread/FFT) so fixed-cell MD rebuilds them only on a cell change.
+  mutable torch::Tensor cached_mp_k_cart_;
+  mutable torch::Tensor cached_mp_spectral_;
+  mutable std::vector<float> cached_mp_cell_key_;
+  mutable int cached_mp_mesh_ = -1;
+  mutable bool cached_mp_full_ewald_ = false;
+  mutable bool cached_mp_key_valid_ = false;
   mutable std::vector<int> cached_owner_for_x_;
   mutable std::vector<int64_t> cached_plane_point_displs_;
   mutable std::vector<float> reduce_scatter_recvbuf_;
