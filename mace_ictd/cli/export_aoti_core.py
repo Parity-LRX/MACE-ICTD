@@ -75,22 +75,42 @@ class _E0Wrap(torch.nn.Module):
         self.model = model
         self.register_buffer("e0_lut", e0_lut)
 
-    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
+    def forward(self, pos, A, batch, edge_src, edge_dst, edge_shifts, cell, return_reciprocal_source: bool = False):
+        if return_reciprocal_source:
+            out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell, return_reciprocal_source=True)
+            e_atom, rs = out[0], out[1]
+            e0 = self.e0_lut[A].to(e_atom.dtype).reshape(e_atom.shape)
+            return e_atom + e0, rs
         out = self.model(pos, A, batch, edge_src, edge_dst, edge_shifts, cell)
         e_atom = out[0] if isinstance(out, tuple) else out
         e0 = self.e0_lut[A].to(e_atom.dtype).reshape(e_atom.shape)
         return e_atom + e0
 
 
-def force_compute_fn_factory(model, *, training: bool):
-    """compute_fn returning (E_atom, force=-dE/dpos) -- force traced into the graph."""
+def force_compute_fn_factory(model, *, training: bool, emit_reciprocal_source: bool = False):
+    """compute_fn returning (E_atom, force=-dE/dpos[, reciprocal_source]) -- force traced into the
+    graph. With emit_reciprocal_source the model defers the reciprocal energy and emits the packed
+    [q|mu|Q] source as a 3rd output (the C++ reciprocal solver does the sum); the force is then the
+    short-range force only (the C++ adds the reciprocal force)."""
     def compute_fn(pos, A, batch, edge_src, edge_dst, edge_shifts, cell):
         p = pos.detach().requires_grad_(True)
-        out = model(p, A, batch, edge_src, edge_dst, edge_shifts, cell)
-        e_atom = out[0] if isinstance(out, tuple) else out
+        out = model(p, A, batch, edge_src, edge_dst, edge_shifts, cell, return_reciprocal_source=emit_reciprocal_source)
+        if emit_reciprocal_source:
+            e_atom, rs = out[0], out[1]
+        else:
+            e_atom = out[0] if isinstance(out, tuple) else out
         grad = torch.autograd.grad(e_atom.sum(), p, create_graph=training)[0]
+        if emit_reciprocal_source:
+            return e_atom, -grad, rs
         return e_atom, -grad
     return compute_fn
+
+
+def _ef(out):
+    """First two outputs (energy, force) from a 2- or 3-output (multipole reciprocal_source) result."""
+    if isinstance(out, (tuple, list)):
+        return out[0], out[1]
+    return out, None
 
 
 def _inner_mace_contraction(module):
@@ -603,9 +623,17 @@ def main() -> int:
     print(f"[aoti] device={device} dtype={dtype} atoms={args.atoms} edges={args.atoms*args.degree} "
           f"route={args.route} attn_heads={args.attn_heads} torch={torch.__version__}")
 
+    # Multipole long-range models emit a packed reciprocal_source as a 3rd graph output (E, force,
+    # reciprocal_source); the C++ reciprocal solver does the sum at deploy time. Detect off the bare
+    # model (the E0 wrapper forwards the flag).
+    _bare = model.model if isinstance(model, _E0Wrap) else model
+    emit_rs = bool(getattr(_bare, "long_range_exports_reciprocal_source", False))
+    if emit_rs:
+        print("[aoti] multipole long-range: exporting (E, force, reciprocal_source) 3-tuple")
+
     # ---- eager reference ----
-    eager_fn = force_compute_fn_factory(model, training=False)
-    e_ref, f_ref = eager_fn(*example_inputs)
+    eager_fn = force_compute_fn_factory(model, training=False, emit_reciprocal_source=emit_rs)
+    e_ref, f_ref = _ef(eager_fn(*example_inputs))
     e_ref = e_ref.detach(); f_ref = f_ref.detach()
     print(f"[aoti] eager energy_sum={e_ref.sum().item():.6e}  force_absmax={f_ref.abs().max().item():.6e}")
 
@@ -613,14 +641,14 @@ def main() -> int:
     try:
         gm = trace_and_compile_force(
             model, example_inputs, training=False,
-            compute_fn=force_compute_fn_factory(model, training=False),
+            compute_fn=force_compute_fn_factory(model, training=False, emit_reciprocal_source=emit_rs),
             do_compile=False,
         )
     except Exception as ex:
         import traceback; traceback.print_exc()
         print(f"[aoti] make_fx FLATTEN FAILED: {type(ex).__name__}: {ex}")
         return 1
-    e_gm, f_gm = gm(*example_inputs)
+    e_gm, f_gm = _ef(gm(*example_inputs))
     dE_gm = (e_gm - e_ref).abs().max().item(); dF_gm = (f_gm - f_ref).abs().max().item()
     print(f"[aoti] flat gm vs eager: dE={dE_gm:.3e} dF={dF_gm:.3e}  (should be ~0, bit-identical)")
 
@@ -686,6 +714,40 @@ def main() -> int:
     print(f"[aoti] wrote {meta_path}  ("
           + ("N-DYNAMIC (no padding)" if args.n_dynamic else f"nmax={args.atoms} pad_z={pad_z} fallback={args.fallback}") + ")")
 
+    # Long-range deploy metadata sidecar: engine reads "<core>.pt2.json" for the reciprocal solver
+    # config. Only written for multipole models (others have no .json -> engine uses defaults).
+    # Mirrors export_libtorch_core's meta dict so the C++ reproduces the in-model multipole_energy.
+    if emit_rs:
+        import json as _json
+        lrm = getattr(_bare, "long_range_module", None)
+        es_attr = getattr(lrm, "energy_scale", None) if lrm is not None else None
+        s_chan = int(getattr(getattr(_bare, "multipole_readout", None), "source_channels", 1) or 1)
+        lr_meta = {
+            "export_reciprocal_source": True,
+            "reciprocal_source_channels": s_chan,
+            "reciprocal_source_boundary": "periodic",
+            "reciprocal_source_slab_padding_factor": 2,
+            "long_range_runtime_backend": str(getattr(_bare, "long_range_runtime_backend", "mesh_fft")),
+            "long_range_mesh_size": int(getattr(_bare, "long_range_mesh_size", 16)),
+            "long_range_max_multipole_l": int(getattr(_bare, "long_range_max_multipole_l", 0)),
+            "long_range_source_kind": str(getattr(_bare, "long_range_runtime_source_kind", "latent_multipole")),
+            "long_range_source_channels": s_chan,
+            "long_range_source_layout": str(getattr(_bare, "long_range_runtime_source_layout", "packed_q_dipole_quad")),
+            "long_range_boundary": str(getattr(_bare, "long_range_boundary", "periodic")),
+            "long_range_energy_partition": str(getattr(_bare, "long_range_energy_partition", "uniform")),
+            "long_range_neutralize": bool(getattr(_bare, "long_range_neutralize", True)),
+            "long_range_green_mode": str(getattr(_bare, "long_range_green_mode", "poisson")),
+            "long_range_mesh_fft_full_ewald": bool(getattr(_bare, "long_range_mesh_fft_full_ewald", False)),
+            "long_range_ewald_alpha_prefactor": float(getattr(getattr(lrm, "kernel", None), "ewald_alpha_prefactor", 5.0)),
+            "long_range_energy_scale": (float(es_attr.detach().cpu().item()) if es_attr is not None else 1.0),
+            "long_range_theta": 0.5, "long_range_leaf_size": 32, "long_range_multipole_order": 0,
+            "long_range_screening": 0.0, "long_range_softening": 1.0e-6,
+        }
+        json_path = str(args.out) + ".json"
+        with open(json_path, "w") as jf:
+            _json.dump(lr_meta, jf, indent=2)
+        print(f"[aoti] wrote {json_path} (multipole long-range deploy metadata, l={lr_meta['long_range_max_multipole_l']})")
+
     # ---- load back + verify numerics ----
     try:
         loaded = _aoti_load(pt2, device)
@@ -694,7 +756,7 @@ def main() -> int:
         print(f"[aoti] aoti load FAILED: {type(ex).__name__}: {ex}")
         return 1
     out = loaded(*example_inputs)
-    e_a, f_a = out if isinstance(out, (tuple, list)) else (out, None)
+    e_a, f_a = _ef(out)
     dE = (e_a - e_ref).abs().max().item()
     dF = (f_a - f_ref).abs().max().item() if f_a is not None else float("nan")
     escale = e_ref.abs().max().item() + 1e-30; fscale = f_ref.abs().max().item() + 1e-30
@@ -708,8 +770,8 @@ def main() -> int:
     if not args.no_equiv:
         R = _random_rotation(dtype, device)
         rest = tuple(example_inputs[1:])
-        e0, f0 = loaded(example_inputs[0], *rest)
-        e1, f1 = loaded(example_inputs[0] @ R.T, *rest)
+        e0, f0 = _ef(loaded(example_inputs[0], *rest))
+        e1, f1 = _ef(loaded(example_inputs[0] @ R.T, *rest))
         e_inv = (e1.sum() - e0.sum()).abs().item()
         f_cov = (f1 - f0 @ R.T).abs().max().item()
         e_sc = e0.abs().sum().item() + 1e-30
@@ -726,9 +788,9 @@ def main() -> int:
     if args.dynamic and args.vary_degree > 0 and args.vary_degree != args.degree:
         g2 = _apply_species(make_fixed_graph(num_nodes=args.atoms, avg_degree=args.vary_degree, dtype=dtype, device=device))
         inp2 = (g2[0],) + tuple(g2[1:])
-        e2e, f2e = eager_fn(*inp2); e2e = e2e.detach(); f2e = f2e.detach()
+        e2e, f2e = _ef(eager_fn(*inp2)); e2e = e2e.detach(); f2e = f2e.detach()
         try:
-            e2a, f2a = loaded(*inp2)
+            e2a, f2a = _ef(loaded(*inp2))
             d2e = (e2a - e2e).abs().max().item(); d2f = (f2a - f2e).abs().max().item()
             v_ok = (d2e / (e2e.abs().max().item() + 1e-30) <= tol) and (d2f / (f2e.abs().max().item() + 1e-30) <= tol)
             print(f"[aoti] VARY-E: exported@{args.atoms*args.degree} called@{args.atoms*args.vary_degree} edges "
@@ -744,9 +806,9 @@ def main() -> int:
     if args.n_dynamic and args.vary_atoms > 0 and args.vary_atoms != args.atoms:
         gN = _apply_species(make_fixed_graph(num_nodes=args.vary_atoms, avg_degree=args.degree, dtype=dtype, device=device))
         inpN = (gN[0],) + tuple(gN[1:])
-        eNe, fNe = eager_fn(*inpN); eNe = eNe.detach(); fNe = fNe.detach()
+        eNe, fNe = _ef(eager_fn(*inpN)); eNe = eNe.detach(); fNe = fNe.detach()
         try:
-            eNa, fNa = loaded(*inpN)
+            eNa, fNa = _ef(loaded(*inpN))
             dNe = (eNa - eNe).abs().max().item(); dNf = (fNa - fNe).abs().max().item()
             n_ok = (dNe / (eNe.abs().max().item() + 1e-30) <= tol) and (dNf / (fNe.abs().max().item() + 1e-30) <= tol)
             print(f"[aoti] VARY-N: exported@{args.atoms} atoms called@{args.vary_atoms} atoms -> "
@@ -756,8 +818,8 @@ def main() -> int:
             # equivariance at the new N too (HARD constraint must hold at every N)
             if not args.no_equiv:
                 Rn = _random_rotation(dtype, device)
-                e0n, f0n = loaded(inpN[0], *tuple(inpN[1:]))
-                e1n, f1n = loaded(inpN[0] @ Rn.T, *tuple(inpN[1:]))
+                e0n, f0n = _ef(loaded(inpN[0], *tuple(inpN[1:])))
+                e1n, f1n = _ef(loaded(inpN[0] @ Rn.T, *tuple(inpN[1:])))
                 ei = (e1n.sum() - e0n.sum()).abs().item() / (e0n.abs().sum().item() + 1e-30)
                 fc = (f1n - f0n @ Rn.T).abs().max().item() / (f0n.abs().max().item() + 1e-30)
                 eqtol = 1e-9 if dtype == torch.float64 else 1e-3
