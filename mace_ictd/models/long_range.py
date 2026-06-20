@@ -575,6 +575,7 @@ class MeshLongRangeKernel3D(nn.Module):
         green_mode: str = "poisson",
         assignment: str = "cic",
         full_ewald: bool = False,
+        reciprocal_only: bool = False,
         k_norm_floor: float = 1.0e-6,
     ):
         super().__init__()
@@ -592,6 +593,10 @@ class MeshLongRangeKernel3D(nn.Module):
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
         self.full_ewald = bool(full_ewald)
+        # Latent-Ewald / LES-style: keep the (screened) reciprocal but SKIP the real-space erfc +
+        # self + background -- the network absorbs the real-space part. Much cheaper (no O(N^2) erfc
+        # loop), and a learnable long-range feature rather than an exact Coulomb sum.
+        self.reciprocal_only = bool(reciprocal_only)
         self.k_norm_floor = float(k_norm_floor)
         self.ewald_alpha_prefactor = 5.0
         self.assignment_window_floor = 1.0e-6
@@ -885,7 +890,7 @@ class MeshLongRangeKernel3D(nn.Module):
                 boundary=self.boundary,
             )
             total_potential = reciprocal_potential
-            if self.full_ewald:
+            if self.full_ewald and not self.reciprocal_only:
                 assert alpha is not None and real_cutoff is not None
                 real_space_potential = self._compute_real_space_potential(
                     local_pos,
@@ -933,6 +938,7 @@ class LatentReciprocalLongRange(nn.Module):
         green_mode: str = "poisson",
         assignment: str = "cic",
         mesh_fft_full_ewald: bool = False,
+        mesh_fft_reciprocal_only: bool = False,
     ):
         super().__init__()
         if reciprocal_backend not in {"direct_kspace", "mesh_fft"}:
@@ -953,6 +959,7 @@ class LatentReciprocalLongRange(nn.Module):
         self.green_mode = str(green_mode)
         self.assignment = str(assignment)
         self.mesh_fft_full_ewald = bool(mesh_fft_full_ewald)
+        self.mesh_fft_reciprocal_only = bool(mesh_fft_reciprocal_only)
         self.source_kind = "latent_charge"
         self.source_layout = "channels_last"
         self.runtime_backend = "mesh_fft" if reciprocal_backend == "mesh_fft" else "none"
@@ -968,6 +975,7 @@ class LatentReciprocalLongRange(nn.Module):
                 green_mode=self.green_mode,
                 assignment=self.assignment,
                 full_ewald=self.mesh_fft_full_ewald,
+                reciprocal_only=self.mesh_fft_reciprocal_only,
             )
             self.exports_reciprocal_source = True
             final_linear = self.source_head.net[-1]
@@ -1107,6 +1115,7 @@ def build_long_range_module(
     green_mode: str = "poisson",
     assignment: str = "cic",
     mesh_fft_full_ewald: bool = False,
+    mesh_fft_reciprocal_only: bool = False,
     theta: float = 0.5,
     leaf_size: int = 32,
     multipole_order: int = 0,
@@ -1142,6 +1151,7 @@ def build_long_range_module(
             green_mode=green_mode,
             assignment=assignment,
             mesh_fft_full_ewald=mesh_fft_full_ewald,
+            mesh_fft_reciprocal_only=mesh_fft_reciprocal_only,
         )
     raise ValueError(f"Unsupported long_range_mode: {mode!r}")
 
@@ -1167,6 +1177,7 @@ def configure_long_range_modules(
     long_range_green_mode: str = "poisson",
     long_range_assignment: str = "cic",
     long_range_mesh_fft_full_ewald: bool = False,
+    long_range_mesh_fft_reciprocal_only: bool = False,
     long_range_theta: float = 0.5,
     long_range_leaf_size: int = 32,
     long_range_multipole_order: int = 0,
@@ -1206,6 +1217,7 @@ def configure_long_range_modules(
     owner.long_range_green_mode = str(long_range_green_mode)
     owner.long_range_assignment = str(long_range_assignment)
     owner.long_range_mesh_fft_full_ewald = bool(long_range_mesh_fft_full_ewald)
+    owner.long_range_mesh_fft_reciprocal_only = bool(long_range_mesh_fft_reciprocal_only)
     owner.long_range_theta = float(long_range_theta)
     owner.long_range_leaf_size = int(long_range_leaf_size)
     owner.long_range_multipole_order = int(long_range_multipole_order)
@@ -1249,6 +1261,7 @@ def configure_long_range_modules(
         green_mode=owner.long_range_green_mode,
         assignment=owner.long_range_assignment,
         mesh_fft_full_ewald=owner.long_range_mesh_fft_full_ewald,
+        mesh_fft_reciprocal_only=owner.long_range_mesh_fft_reciprocal_only,
         theta=owner.long_range_theta,
         leaf_size=owner.long_range_leaf_size,
         multipole_order=owner.long_range_multipole_order,
