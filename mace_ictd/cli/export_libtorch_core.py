@@ -755,6 +755,9 @@ def _export_single_core(
         "long_range_neutralize": bool(getattr(metadata_model, "long_range_neutralize", True)),
         "long_range_green_mode": str(getattr(metadata_model, "long_range_green_mode", "poisson")),
         "long_range_mesh_fft_full_ewald": bool(getattr(metadata_model, "long_range_mesh_fft_full_ewald", False)),
+        "long_range_dispersion_mode": str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
+        "long_range_dispersion": bool(getattr(metadata_model, "long_range_dispersion", False)),
+        "dispersion_cutoff": float(getattr(metadata_model, "dispersion_cutoff", 0.0)),
         # Ewald screening prefactor: alpha = prefactor / (0.5 * min periodic box length). The C++
         # multipole_reciprocal_energy applies exp(-k^2/4 alpha^2) when full_ewald is set, matching the
         # in-model MeshLongRangeKernel3D.multipole_energy (kernel.ewald_alpha_prefactor, default 5.0).

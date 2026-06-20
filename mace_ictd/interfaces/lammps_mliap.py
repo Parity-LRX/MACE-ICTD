@@ -1064,6 +1064,15 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
         long_range_energy_partition = str(arch_meta.get("long_range_energy_partition", "potential"))
         long_range_green_mode = str(arch_meta.get("long_range_green_mode", "poisson"))
         long_range_assignment = str(arch_meta.get("long_range_assignment", "cic"))
+        long_range_mesh_fft_full_ewald = bool(arch_meta.get("long_range_mesh_fft_full_ewald", False))
+        long_range_max_multipole_l = int(arch_meta.get("long_range_max_multipole_l", 0))
+        long_range_dispersion_mode = str(
+            arch_meta.get(
+                "long_range_dispersion_mode",
+                "pairwise-c6" if bool(arch_meta.get("long_range_dispersion", False)) else "none",
+            )
+        )
+        dispersion_cutoff = float(arch_meta.get("dispersion_cutoff", 10.0))
         long_range_theta = float(arch_meta.get("long_range_theta", 0.5))
         long_range_leaf_size = int(arch_meta.get("long_range_leaf_size", 32))
         long_range_multipole_order = int(arch_meta.get("long_range_multipole_order", 0))
@@ -1366,6 +1375,10 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_energy_partition=long_range_energy_partition,
                 long_range_green_mode=long_range_green_mode,
                 long_range_assignment=long_range_assignment,
+                long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+                long_range_max_multipole_l=long_range_max_multipole_l,
+                long_range_dispersion_mode=long_range_dispersion_mode,
+                dispersion_cutoff=dispersion_cutoff,
                 long_range_theta=long_range_theta,
                 long_range_leaf_size=long_range_leaf_size,
                 long_range_multipole_order=long_range_multipole_order,
@@ -1431,6 +1444,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_energy_partition=long_range_energy_partition,
                 long_range_green_mode=long_range_green_mode,
                 long_range_assignment=long_range_assignment,
+                long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
                 long_range_theta=long_range_theta,
                 long_range_leaf_size=long_range_leaf_size,
                 long_range_multipole_order=long_range_multipole_order,
@@ -1503,6 +1517,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_energy_partition=long_range_energy_partition,
                 long_range_green_mode=long_range_green_mode,
                 long_range_assignment=long_range_assignment,
+                long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
                 long_range_theta=long_range_theta,
                 long_range_leaf_size=long_range_leaf_size,
                 long_range_multipole_order=long_range_multipole_order,
@@ -1575,6 +1590,7 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_energy_partition=long_range_energy_partition,
                 long_range_green_mode=long_range_green_mode,
                 long_range_assignment=long_range_assignment,
+                long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
                 long_range_theta=long_range_theta,
                 long_range_leaf_size=long_range_leaf_size,
                 long_range_multipole_order=long_range_multipole_order,

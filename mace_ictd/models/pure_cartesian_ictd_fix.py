@@ -32,6 +32,7 @@ from mace_ictd.models._mace_symmetric_contraction import MaceSymmetricContractio
 from mace_ictd.models.mlp import MainNet
 from mace_ictd.utils.scatter import scatter
 from mace_ictd.models.long_range import build_long_range_module
+from mace_ictd.models.dispersion import build_long_range_dispersion, normalize_dispersion_mode
 
 
 _CONTRACTION_BATCH_EXAMPLE = 10
@@ -2127,6 +2128,7 @@ class PureCartesianICTDFix(nn.Module):
         long_range_mesh_fft_reciprocal_only: bool = False,
         long_range_max_multipole_l: int = 0,
         long_range_dispersion: bool = False,
+        long_range_dispersion_mode: str | None = None,
         dispersion_cutoff: float = 10.0,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
@@ -2620,18 +2622,23 @@ class PureCartesianICTDFix(nn.Module):
             self.long_range_energy_partition = "uniform"
             self.long_range_neutralize = bool(getattr(self.long_range_module, "neutralize", True))
 
-        # Pairwise C6 dispersion (van der Waals): a scalar/invariant long-range term that
-        # completes the electrostatics (multipoles) above. OFF by default -> None -> no
-        # contribution (byte-identical). NOTE: L1 reuses the short-range edge list, so the
-        # r^-6 tail beyond max_radius is currently truncated (a longer dispersion cutoff is
-        # a follow-up); the term is exact within the cutoff.
-        self.dispersion = None
+        # Long-range dispersion term. OFF by default -> None -> no contribution
+        # (byte-identical). The legacy boolean `long_range_dispersion=True` maps to
+        # `pairwise-c6`; future MBD modes should plug into this same interface rather
+        # than adding another hand-written branch in forward.
+        self.long_range_dispersion_mode = normalize_dispersion_mode(
+            long_range_dispersion=bool(long_range_dispersion),
+            long_range_dispersion_mode=long_range_dispersion_mode,
+        )
+        self.long_range_dispersion = self.long_range_dispersion_mode != "none"
         self.dispersion_cutoff = float(dispersion_cutoff)
         self.dispersion_pbc = str(long_range_boundary) == "periodic"
-        if bool(long_range_dispersion):
-            from mace_ictd.models.dispersion import PairwiseDispersion
-
-            self.dispersion = PairwiseDispersion(feature_dim=self.channels)
+        self.dispersion = build_long_range_dispersion(
+            mode=self.long_range_dispersion_mode,
+            feature_dim=self.channels,
+            cutoff=self.dispersion_cutoff,
+            pbc=self.dispersion_pbc,
+        )
 
         # Optional fixed scale/shift on the network (short-range) per-atom interaction energy.
         # This mirrors MACE ScaleShiftMACE: E_inter_atom = scale * readout + shift. OFF by
@@ -3011,19 +3018,17 @@ class PureCartesianICTDFix(nn.Module):
                 disp_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(
                     last_state.shape[0], self.channels
                 )
-            if self.dispersion_cutoff and self.dispersion_cutoff > 0.0:
-                # dedicated longer-range neighbor list -> removes the r^-6 truncation of the
-                # short-range cutoff; lengths recomputed from pos for differentiable forces.
-                from mace_ictd.models.dispersion import dispersion_neighbor_list
-
-                d_src, d_dst, d_shift = dispersion_neighbor_list(
-                    pos, batch, cell, self.dispersion_cutoff, pbc=self.dispersion_pbc
-                )
-                shift_vecs = torch.einsum("ni,nij->nj", d_shift.to(pos.dtype), cell[batch[d_dst]])
-                d_len = (pos[d_dst] - pos[d_src] + shift_vecs).norm(dim=1)
-                out = out + self.dispersion(disp_feat, d_src, d_dst, d_len)
-            else:
-                out = out + self.dispersion(disp_feat, edge_src, edge_dst, edge_length)
+            out = out + self.dispersion(
+                disp_feat,
+                pos,
+                batch,
+                cell,
+                edge_src=edge_src,
+                edge_dst=edge_dst,
+                edge_lengths=edge_length,
+                cutoff=self.dispersion_cutoff,
+                pbc=self.dispersion_pbc,
+            )
 
         if return_combined_features:
             combined_features = torch.cat(layer_states, dim=-1)

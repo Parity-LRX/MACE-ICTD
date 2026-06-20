@@ -360,6 +360,9 @@ def build_baseline_model(
     long_range_assignment: str = "cic",
     long_range_slab_padding_factor: int = 2,
     long_range_mesh_fft_full_ewald: bool = False,
+    long_range_max_multipole_l: int = 0,
+    long_range_dispersion_mode: str = "none",
+    dispersion_cutoff: float = 10.0,
 ) -> PureCartesianICTDFix:
     """Construct the model exactly the way from_checkpoint rebuilds it (so the saved
     weights reload into an identical module). All structural choices come from ``cfg``
@@ -419,6 +422,9 @@ def build_baseline_model(
         long_range_assignment=long_range_assignment,
         long_range_slab_padding_factor=long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=long_range_mesh_fft_full_ewald,
+        long_range_max_multipole_l=long_range_max_multipole_l,
+        long_range_dispersion_mode=long_range_dispersion_mode,
+        dispersion_cutoff=dispersion_cutoff,
         internal_compute_dtype=cfg.internal_compute_dtype,
         device=device,
     ).to(device=device, dtype=dtype)
@@ -500,6 +506,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--long-range-slab-padding-factor", type=int, default=2)
     ap.add_argument("--long-range-mesh-fft-full-ewald", action="store_true",
                     help="Use full-Ewald-style mesh FFT correction terms for mesh_fft.")
+    ap.add_argument("--long-range-max-multipole-l", type=int, default=0,
+                    help="Maximum learned multipole rank emitted for mesh_fft reciprocal long-range export.")
+    ap.add_argument("--long-range-dispersion-mode", default="none", choices=["none", "pairwise-c6"],
+                    help="Optional long-range dispersion term. pairwise-c6 is the existing learned C6/R0 model.")
+    ap.add_argument("--long-range-dispersion", dest="long_range_dispersion_mode",
+                    action="store_const", const="pairwise-c6",
+                    help="Deprecated alias for --long-range-dispersion-mode pairwise-c6.")
+    ap.add_argument("--dispersion-cutoff", type=float, default=10.0,
+                    help="Cutoff for the long-range dispersion neighbor list. Use 0 to reuse the input edge list.")
     # atomic-energy E0 offset
     ap.add_argument("--atomic-energy-keys", default=None, help='e.g. "1,6,7,8"')
     ap.add_argument("--atomic-energy-values", default=None, help='e.g. "-430.5,-821.0,-1488.2,-2044.4"')
@@ -700,6 +715,17 @@ def main(argv=None):
             raise ValueError("--long-range-mesh-size must be > 0")
         if args.long_range_source_channels <= 0:
             raise ValueError("--long-range-source-channels must be > 0")
+        if args.long_range_max_multipole_l < 0:
+            raise ValueError("--long-range-max-multipole-l must be >= 0")
+        if args.long_range_max_multipole_l > args.lmax:
+            raise ValueError("--long-range-max-multipole-l must be <= --lmax")
+        if args.long_range_max_multipole_l > 0:
+            if args.long_range_reciprocal_backend != "mesh_fft":
+                raise ValueError("--long-range-max-multipole-l > 0 requires --long-range-reciprocal-backend mesh_fft")
+            if not args.long_range_mesh_fft_full_ewald:
+                raise ValueError("--long-range-max-multipole-l > 0 requires --long-range-mesh-fft-full-ewald")
+    if args.long_range_dispersion_mode != "none" and args.dispersion_cutoff < 0:
+        raise ValueError("--dispersion-cutoff must be >= 0")
     energy_output_scale_enabled = args.scaling != "no_scaling" or args.atomic_inter_scale is not None
     energy_output_shift_enabled = (
         (args.scaling != "no_scaling" and not args.no_atomic_inter_shift)
@@ -762,6 +788,9 @@ def main(argv=None):
         long_range_assignment=args.long_range_assignment,
         long_range_slab_padding_factor=args.long_range_slab_padding_factor,
         long_range_mesh_fft_full_ewald=args.long_range_mesh_fft_full_ewald,
+        long_range_max_multipole_l=args.long_range_max_multipole_l,
+        long_range_dispersion_mode=args.long_range_dispersion_mode,
+        dispersion_cutoff=args.dispersion_cutoff,
         device=device, dtype=dtype,
     )
     if args.mace_compatible_random_init:
@@ -878,6 +907,10 @@ def main(argv=None):
         long_range_green_mode=args.long_range_green_mode,
         long_range_assignment=args.long_range_assignment,
         long_range_mesh_fft_full_ewald=bool(args.long_range_mesh_fft_full_ewald),
+        long_range_max_multipole_l=int(args.long_range_max_multipole_l),
+        long_range_dispersion_mode=args.long_range_dispersion_mode,
+        long_range_dispersion=bool(args.long_range_dispersion_mode != "none"),
+        dispersion_cutoff=float(args.dispersion_cutoff),
     )
 
     trainer = ForceTrainer(

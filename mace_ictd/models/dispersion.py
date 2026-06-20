@@ -91,3 +91,99 @@ class PairwiseDispersion(nn.Module):
         per_atom = node_feats.new_zeros(node_feats.shape[0])
         per_atom.index_add_(0, edge_dst, 0.5 * e_edge)
         return per_atom.unsqueeze(-1)  # [N, 1]
+
+
+class LongRangeDispersion(nn.Module):
+    """Unified long-range dispersion term.
+
+    This wrapper keeps the model forward independent of the concrete dispersion
+    implementation. Today it exposes the existing learned pairwise-C6 term; MBD
+    can be added as another mode without adding a second hand-written branch to
+    the main ICTD forward path.
+    """
+
+    SUPPORTED_MODES = {"pairwise-c6"}
+
+    def __init__(
+        self,
+        *,
+        feature_dim: int,
+        mode: str = "pairwise-c6",
+        hidden_dim: int = 32,
+        cutoff: float = 10.0,
+        pbc: bool = True,
+    ) -> None:
+        super().__init__()
+        self.mode = str(mode)
+        if self.mode not in self.SUPPORTED_MODES:
+            raise ValueError(
+                f"Unsupported long-range dispersion mode {self.mode!r}; "
+                f"supported modes: {sorted(self.SUPPORTED_MODES)}"
+            )
+        self.cutoff = float(cutoff)
+        self.pbc = bool(pbc)
+        if self.mode == "pairwise-c6":
+            self.term = PairwiseDispersion(feature_dim=feature_dim, hidden_dim=hidden_dim)
+        else:  # pragma: no cover - guarded above; future modes land here explicitly.
+            raise ValueError(f"Unsupported long-range dispersion mode {self.mode!r}")
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
+        cell: torch.Tensor,
+        *,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        edge_lengths: torch.Tensor,
+        cutoff: float | None = None,
+        pbc: bool | None = None,
+    ) -> torch.Tensor:
+        cutoff_value = self.cutoff if cutoff is None else float(cutoff)
+        pbc_value = self.pbc if pbc is None else bool(pbc)
+        if self.mode == "pairwise-c6":
+            if cutoff_value and cutoff_value > 0.0:
+                d_src, d_dst, d_shift = dispersion_neighbor_list(
+                    pos, batch, cell, cutoff_value, pbc=pbc_value
+                )
+                shift_vecs = torch.einsum("ni,nij->nj", d_shift.to(pos.dtype), cell[batch[d_dst]])
+                d_len = (pos[d_dst] - pos[d_src] + shift_vecs).norm(dim=1)
+                return self.term(node_feats, d_src, d_dst, d_len)
+            return self.term(node_feats, edge_src, edge_dst, edge_lengths)
+        raise ValueError(f"Unsupported long-range dispersion mode {self.mode!r}")
+
+
+def normalize_dispersion_mode(
+    *,
+    long_range_dispersion: bool = False,
+    long_range_dispersion_mode: str | None = None,
+) -> str:
+    """Resolve legacy boolean and explicit mode into one stable mode string."""
+
+    if long_range_dispersion_mode is None:
+        return "pairwise-c6" if bool(long_range_dispersion) else "none"
+    mode = str(long_range_dispersion_mode)
+    if mode == "none" and bool(long_range_dispersion):
+        return "pairwise-c6"
+    return mode
+
+
+def build_long_range_dispersion(
+    *,
+    mode: str,
+    feature_dim: int,
+    hidden_dim: int = 32,
+    cutoff: float = 10.0,
+    pbc: bool = True,
+) -> LongRangeDispersion | None:
+    mode = str(mode)
+    if mode == "none":
+        return None
+    return LongRangeDispersion(
+        feature_dim=feature_dim,
+        mode=mode,
+        hidden_dim=hidden_dim,
+        cutoff=cutoff,
+        pbc=pbc,
+    )

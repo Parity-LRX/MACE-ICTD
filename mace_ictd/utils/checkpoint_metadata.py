@@ -53,6 +53,10 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "long_range_green_mode": "poisson",
     "long_range_assignment": "cic",
     "long_range_mesh_fft_full_ewald": False,
+    "long_range_max_multipole_l": 0,
+    "long_range_dispersion_mode": "none",
+    "long_range_dispersion": False,
+    "dispersion_cutoff": 10.0,
     "long_range_theta": 0.5,
     "long_range_leaf_size": 32,
     "long_range_multipole_order": 0,
@@ -566,6 +570,44 @@ def resolve_model_architecture(
             arch_meta,
             "long_range_mesh_fft_full_ewald",
             DEFAULT_MODEL_ARCHITECTURE["long_range_mesh_fft_full_ewald"],
+        )
+    )
+    resolved["long_range_max_multipole_l"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "long_range_max_multipole_l",
+            DEFAULT_MODEL_ARCHITECTURE["long_range_max_multipole_l"],
+        )
+    )
+    resolved["long_range_dispersion_mode"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "long_range_dispersion_mode",
+            "pairwise-c6"
+            if bool(
+                _resolve_value(
+                    overrides,
+                    checkpoint,
+                    arch_meta,
+                    "long_range_dispersion",
+                    DEFAULT_MODEL_ARCHITECTURE["long_range_dispersion"],
+                )
+            )
+            else DEFAULT_MODEL_ARCHITECTURE["long_range_dispersion_mode"],
+        )
+    )
+    resolved["long_range_dispersion"] = resolved["long_range_dispersion_mode"] != "none"
+    resolved["dispersion_cutoff"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "dispersion_cutoff",
+            DEFAULT_MODEL_ARCHITECTURE["dispersion_cutoff"],
         )
     )
     resolved["long_range_theta"] = float(
