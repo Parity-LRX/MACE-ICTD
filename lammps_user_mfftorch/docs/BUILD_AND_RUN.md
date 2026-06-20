@@ -399,8 +399,11 @@ pair_coeff * * /path/to/core.pt H C N O
 ```
 
 这会让 LAMMPS 请求 `max(4.0, 6.0)` 的候选邻居，在 `mff/torch` / `mff/torch/kk`
-内部拆成主 edge list 和 dispersion edge list。若省略 `dispersion <cutoff>`，
-新 schema 的 core 会回退为复用主 edge list。
+内部拆成主 edge list 和 dispersion edge list。对 `mbd` / `mbd-slq` core，若省略
+`dispersion <cutoff>`，初始化/运行会直接报错；不要让 MBD 静默复用短程 message-passing edge list。
+这里的 `<cutoff>` 必须等于 checkpoint/export metadata 里的 `dispersion_cutoff`；MBD 的 cutoff
+定义了耦合矩阵的稀疏图，部署时改 cutoff 等价于换了训练时的长程色散模型。
+显式的 dispersion list 可以为空（例如低密度或单原子体系），但不能缺省。
 
 AOTI `.pt2` 对 `mbd-slq` 会导出 `dispersion_edges 1` sidecar metadata，并接收第二套
 dispersion edge list；`mff/torch` 和 `mff/torch/kk` build 都支持这一路径。导出时会把 SLQ 切到

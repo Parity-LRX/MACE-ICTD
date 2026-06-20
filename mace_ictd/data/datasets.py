@@ -507,6 +507,16 @@ class H5Dataset(Dataset):
             'cell': torch.from_numpy(g['cell'][:]).double(),
             'stress': stress,
         }
+        for canonical, aliases, dtype in (
+            ("dispersion_edge_src", ("dispersion_edge_src", "disp_edge_src"), torch.long),
+            ("dispersion_edge_dst", ("dispersion_edge_dst", "disp_edge_dst"), torch.long),
+            ("dispersion_edge_shifts", ("dispersion_edge_shifts", "disp_edge_shifts"), torch.float64),
+        ):
+            for key in aliases:
+                if key in g:
+                    tensor = torch.from_numpy(g[key][:])
+                    out[canonical] = tensor.to(dtype=dtype)
+                    break
         if self.pad_edges_to_max:
             E = int(out['edge_src'].shape[0])
             target = max(self._e_max_for(idx), E)  # bucket E_max (or global); never truncate

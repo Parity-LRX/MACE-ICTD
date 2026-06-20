@@ -189,7 +189,32 @@ def _normalize_pbc_flags(pbc, *, device: torch.device) -> torch.Tensor:
     return pbc_tensor
 
 
-def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None):
+def pbc_image_nmax(cell: Tensor, cutoff: float | Tensor, pbc=None) -> Tensor:
+    """Image shell bound based on cell face heights, not lattice-vector lengths.
+
+    For skewed triclinic cells, a lattice vector can be long while the distance
+    between opposite faces is short.  Bounding image coefficients by
+    ``cutoff / |a_i|`` can then miss valid periodic images.  The conservative
+    bound is ``cutoff / h_i`` where ``h_i = volume / |a_j x a_k|``.
+    """
+    cell_mat = cell.squeeze(0) if cell.dim() == 3 else cell
+    device = cell_mat.device
+    dtype = cell_mat.dtype
+    pbc_flags = _normalize_pbc_flags(pbc, device=device)
+    a0, a1, a2 = cell_mat[0], cell_mat[1], cell_mat[2]
+    volume = torch.linalg.det(cell_mat).abs().clamp_min(1.0e-6)
+    face_areas = torch.stack((
+        torch.linalg.cross(a1, a2).norm(),
+        torch.linalg.cross(a2, a0).norm(),
+        torch.linalg.cross(a0, a1).norm(),
+    )).clamp_min(1.0e-6)
+    heights = (volume / face_areas).clamp_min(1.0e-6)
+    cutoff_t = torch.as_tensor(cutoff, device=device, dtype=dtype)
+    nmax = torch.ceil(cutoff_t / heights).to(torch.long).clamp_min(1)
+    return torch.where(pbc_flags, nmax, torch.zeros_like(nmax))
+
+
+def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None, return_saturation: bool = False):
     """
     Calculate PBC-aware neighbor list on GPU, replacing ASE neighbor_list.
     
@@ -199,6 +224,9 @@ def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None):
         cell: Unit cell tensor [1, 3, 3] or [3, 3]
         max_num_neighbors: Maximum number of neighbors
         pbc: Periodicity flags per axis. ``None`` keeps legacy 3D periodic behavior.
+        return_saturation: when true, also return whether any per-image
+            torch_cluster query reached ``max_num_neighbors`` and may have been
+            truncated.
         
     Returns:
         Tuple of (edge_src, edge_dst, edge_shifts)
@@ -208,20 +236,25 @@ def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None):
     
     device = pos.device
     
-    # 1. Generate mirror offsets only along periodic axes.
+    # 1. Generate mirror offsets only along periodic axes.  Use as many image
+    # shells as the cutoff can reach; falling back to a dense N^2 builder for
+    # large-cutoff MBD graphs would defeat the whole point of the radius search.
     pbc_flags = _normalize_pbc_flags(pbc, device=device)
+    cell_mat = cell.squeeze(0) if cell.dim() == 3 else cell
+    nmax = pbc_image_nmax(cell_mat, float(r), pbc=pbc_flags)
     axis_ranges = []
     for axis in range(3):
         if bool(pbc_flags[axis].item()):
-            axis_ranges.append(torch.tensor([-1, 0, 1], device=device, dtype=torch.long))
+            n_axis = int(nmax[axis].item())
+            axis_ranges.append(torch.arange(-n_axis, n_axis + 1, device=device, dtype=torch.long))
         else:
             axis_ranges.append(torch.tensor([0], device=device, dtype=torch.long))
     offsets_idx = torch.cartesian_prod(*axis_ranges)
     
     all_src, all_dst, all_shifts = [], [], []
+    saturated = False
 
     # Normalize cell shape: allow [1,3,3] or [3,3]
-    cell_mat = cell.squeeze(0) if cell.dim() == 3 else cell
     # Convention used across this repo (and ASE): cell is a 3x3 matrix where each ROW
     # is a lattice vector in Cartesian coordinates: [a; b; c].
     # A PBC integer shift s = (sx, sy, sz) corresponds to the translation:
@@ -239,6 +272,10 @@ def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None):
         # GPU radius search
         edge_index = radius(pos_shifted, pos, r, max_num_neighbors=max_num_neighbors)
         src, dst = edge_index[0], edge_index[1]
+        if max_num_neighbors > 0 and dst.numel() > 0:
+            counts = torch.bincount(dst, minlength=pos.size(0))
+            if bool((counts >= int(max_num_neighbors)).any().item()):
+                saturated = True
         
         # Exclude self-loops (0 offset and src==dst)
         if s_idx.abs().sum() == 0:
@@ -251,8 +288,10 @@ def radius_graph_pbc_gpu(pos, r, cell, max_num_neighbors=100, pbc=None):
             all_shifts.append(s_idx.expand(len(src), -1))
 
     if not all_src:
-        return (torch.empty(0, device=device, dtype=torch.long),
-                torch.empty(0, device=device, dtype=torch.long),
-                torch.empty(0, 3, device=device, dtype=torch.float64))
+        result = (torch.empty(0, device=device, dtype=torch.long),
+                  torch.empty(0, device=device, dtype=torch.long),
+                  torch.empty(0, 3, device=device, dtype=torch.float64))
+        return result + (saturated,) if return_saturation else result
 
-    return torch.cat(all_src), torch.cat(all_dst), torch.cat(all_shifts).to(torch.float64)
+    result = (torch.cat(all_src), torch.cat(all_dst), torch.cat(all_shifts).to(torch.float64))
+    return result + (saturated,) if return_saturation else result

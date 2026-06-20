@@ -104,6 +104,60 @@ bool parse_string_from_metadata(const std::string& content, const std::string& k
   return true;
 }
 
+std::string expected_dispersion_deployment_graph_rule(
+    const std::string& mode, const std::string& mbd_backend) {
+  if (mode == "none") return "none";
+  if (mode == "pairwise-c6") return "main_neighbor_graph";
+  if (mode == "mbd-slq" && mbd_backend == "pme_fft") return "pme_fft_matvec_prototype";
+  if (mode == "mbd" || mode == "mbd-slq") return "explicit_canonical_single_image_edge_sparse";
+  return "unknown";
+}
+
+std::string expected_dispersion_training_graph_rule(
+    const std::string& mode, const std::string& mbd_backend) {
+  if (mode == "none") return "none";
+  if (mode == "pairwise-c6") return "directed_cutoff_or_main_neighbor_graph";
+  if (mode == "mbd-slq" && mbd_backend == "pme_fft") return "pme_fft_matvec_no_cutoff_edges";
+  if (mode == "mbd" || mode == "mbd-slq") return "explicit_or_built_canonical_cutoff_edge_sparse";
+  return "unknown";
+}
+
+void reconcile_dispersion_training_graph_rule(
+    bool metadata_has_rule,
+    std::string& rule,
+    const std::string& mode,
+    const std::string& mbd_backend) {
+  const std::string expected = expected_dispersion_training_graph_rule(mode, mbd_backend);
+  if (!metadata_has_rule || rule.empty()) {
+    rule = expected;
+    return;
+  }
+  if (expected != "unknown" && rule != expected) {
+    throw std::runtime_error(
+        "dispersion_training_graph_rule='" + rule + "' does not match "
+        "long_range_dispersion_mode='" + mode + "' and mbd_operator_backend='" +
+        mbd_backend + "'; export metadata is internally inconsistent.");
+  }
+}
+
+void reconcile_dispersion_deployment_graph_rule(
+    bool metadata_has_rule,
+    std::string& rule,
+    const std::string& mode,
+    const std::string& mbd_backend) {
+  const std::string expected = expected_dispersion_deployment_graph_rule(mode, mbd_backend);
+  if (!metadata_has_rule || rule.empty()) {
+    rule = expected;
+    return;
+  }
+  if (expected != "unknown" && rule != expected) {
+    throw std::runtime_error(
+        "dispersion_deployment_graph_rule='" + rule + "' does not match "
+        "long_range_dispersion_mode='" + mode + "' and mbd_operator_backend='" +
+        mbd_backend + "'; export metadata is internally inconsistent.");
+  }
+}
+
 std::string trim_copy(const std::string& s) {
   const auto start = s.find_first_not_of(" \t\r\n");
   if (start == std::string::npos) return std::string();
@@ -460,7 +514,8 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
       core_pt_path.compare(core_pt_path.size() - 4, 4, ".pt2") == 0) {
 #if MFF_HAS_AOTI
     aoti_loader_ = std::make_unique<torch::inductor::AOTIModelPackageLoader>(
-        core_pt_path, "model", /*run_single_threaded=*/true);
+        core_pt_path, "model", /*run_single_threaded=*/false);
+    aoti_package_path_ = core_pt_path;
     aoti_mode_ = true;
     loaded_ = true;
     cached_ntotal_ = 0;
@@ -471,6 +526,11 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
     core_takes_fidelity_arg_ = false;
     core_requires_runtime_fidelity_ = false;
     core_exports_reciprocal_source_ = false;
+    long_range_dispersion_mode_ = "none";
+    dispersion_training_graph_rule_ = "none";
+    dispersion_deployment_graph_rule_ = "none";
+    mbd_operator_backend_ = "edge_sparse";
+    dispersion_cutoff_ = 0.0;
 
     // Sidecar "<core>.pt2.meta": "nmax <N>" (the baked atom count -> pad ntotal up to it),
     // "pad_z <Z>" (dummy padding species), "fallback <path>" (an N-flexible TorchScript core to use
@@ -480,6 +540,7 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
     have_ts_fallback_ = false;
     aoti_fallback_warned_ = false;
     aoti_takes_dispersion_edges_arg_ = false;
+    aoti_reload_warned_ = false;
     {
       std::ifstream mf(core_pt_path + ".meta");
       std::string key, fb;
@@ -558,6 +619,28 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
         (void)parse_double_from_metadata(content, "\"long_range_energy_scale\"", long_range_energy_scale_);
         (void)parse_bool_from_metadata(content, "\"long_range_mesh_fft_full_ewald\"", long_range_mesh_fft_full_ewald_);
         (void)parse_double_from_metadata(content, "\"long_range_ewald_alpha_prefactor\"", long_range_ewald_alpha_prefactor_);
+        (void)parse_string_from_metadata(content, "\"long_range_dispersion_mode\"", long_range_dispersion_mode_);
+        const bool has_dispersion_training_graph_rule = parse_string_from_metadata(
+            content, "\"dispersion_training_graph_rule\"", dispersion_training_graph_rule_);
+        const bool has_dispersion_graph_rule = parse_string_from_metadata(
+            content, "\"dispersion_deployment_graph_rule\"", dispersion_deployment_graph_rule_);
+        (void)parse_string_from_metadata(content, "\"mbd_operator_backend\"", mbd_operator_backend_);
+        (void)parse_double_from_metadata(content, "\"dispersion_cutoff\"", dispersion_cutoff_);
+        reconcile_dispersion_training_graph_rule(
+            has_dispersion_training_graph_rule,
+            dispersion_training_graph_rule_,
+            long_range_dispersion_mode_,
+            mbd_operator_backend_);
+        reconcile_dispersion_deployment_graph_rule(
+            has_dispersion_graph_rule,
+            dispersion_deployment_graph_rule_,
+            long_range_dispersion_mode_,
+            mbd_operator_backend_);
+        if (long_range_dispersion_mode_ == "mbd-slq" && mbd_operator_backend_ == "pme_fft") {
+          throw std::runtime_error(
+              "mff/torch does not yet support mbd_operator_backend=pme_fft at deployment; "
+              "the required cuFFT MBD dipole-tensor matvec backend is not implemented.");
+        }
         if (long_range_source_channels_ <= 0) long_range_source_channels_ = reciprocal_source_channels_;
         if (long_range_runtime_backend_ == "none" && core_exports_reciprocal_source_ && reciprocal_source_channels_ > 0) {
           long_range_runtime_backend_ = "mesh_fft";
@@ -616,6 +699,11 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
   long_range_energy_scale_ = 1.0;
   long_range_mesh_fft_full_ewald_ = false;
   long_range_ewald_alpha_prefactor_ = 5.0;
+  long_range_dispersion_mode_ = "none";
+  dispersion_training_graph_rule_ = "none";
+  dispersion_deployment_graph_rule_ = "none";
+  mbd_operator_backend_ = "edge_sparse";
+  dispersion_cutoff_ = 0.0;
 
   try {
     auto schema = core_.get_method("forward").function().getSchema();
@@ -660,6 +748,28 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
       (void)parse_double_from_metadata(content, "\"long_range_energy_scale\"", long_range_energy_scale_);
       (void)parse_bool_from_metadata(content, "\"long_range_mesh_fft_full_ewald\"", long_range_mesh_fft_full_ewald_);
       (void)parse_double_from_metadata(content, "\"long_range_ewald_alpha_prefactor\"", long_range_ewald_alpha_prefactor_);
+      (void)parse_string_from_metadata(content, "\"long_range_dispersion_mode\"", long_range_dispersion_mode_);
+      const bool has_dispersion_training_graph_rule = parse_string_from_metadata(
+          content, "\"dispersion_training_graph_rule\"", dispersion_training_graph_rule_);
+      const bool has_dispersion_graph_rule = parse_string_from_metadata(
+          content, "\"dispersion_deployment_graph_rule\"", dispersion_deployment_graph_rule_);
+      (void)parse_string_from_metadata(content, "\"mbd_operator_backend\"", mbd_operator_backend_);
+      (void)parse_double_from_metadata(content, "\"dispersion_cutoff\"", dispersion_cutoff_);
+      reconcile_dispersion_training_graph_rule(
+          has_dispersion_training_graph_rule,
+          dispersion_training_graph_rule_,
+          long_range_dispersion_mode_,
+          mbd_operator_backend_);
+      reconcile_dispersion_deployment_graph_rule(
+          has_dispersion_graph_rule,
+          dispersion_deployment_graph_rule_,
+          long_range_dispersion_mode_,
+          mbd_operator_backend_);
+      if (long_range_dispersion_mode_ == "mbd-slq" && mbd_operator_backend_ == "pme_fft") {
+        throw std::runtime_error(
+            "mff/torch does not yet support mbd_operator_backend=pme_fft at deployment; "
+            "the required cuFFT MBD dipole-tensor matvec backend is not implemented.");
+      }
       (void)parse_int64_from_metadata(content, "\"trace_num_nodes\"", trace_num_nodes_);
       (void)parse_int64_from_metadata(content, "\"trace_num_edges\"", trace_num_edges_);
       (void)parse_string_from_metadata(content, "\"external_tensor_irrep\"", external_tensor_irrep_);
@@ -864,6 +974,12 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   // feeds it a wrong-shaped input -> device-side index assert ("index out of bounds").
   // The first real compute() call runs it at the correct N, so skip warmup in AOTI mode.
   if (aoti_mode_) return;
+  // MBD/SLQ-MBD cores need a physically meaningful second neighbor list. A synthetic warmup
+  // graph can satisfy the signature but still trip traced ICTD/MBD shape branches, so let the
+  // first real LAMMPS graph warm caches instead of validating on fake topology.
+  if (core_takes_dispersion_edges_arg_ && requires_mbd_dispersion_edges()) {
+    return;
+  }
   if (trace_num_nodes_ > 0) N = trace_num_nodes_;
   if (trace_num_edges_ > 0) E = trace_num_edges_;
 
@@ -878,6 +994,14 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   auto edge_dst = torch::zeros({E}, torch::TensorOptions().dtype(torch::kInt64).device(device_));
   auto edge_shifts = torch::zeros({E, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(device_));
   auto cell = torch::eye(3, torch::TensorOptions().dtype(torch::kFloat32).device(device_)).unsqueeze(0) * 100.0f;
+  torch::Tensor warmup_disp_src;
+  torch::Tensor warmup_disp_dst;
+  torch::Tensor warmup_disp_shifts;
+  if (core_takes_dispersion_edges_arg_) {
+    warmup_disp_src = edge_src;
+    warmup_disp_dst = edge_dst;
+    warmup_disp_shifts = edge_shifts;
+  }
   std::vector<torch::Tensor> warmup_external_tensors;
   std::vector<torch::Tensor> warmup_fidelity_tensors;
   if (core_takes_external_tensor_arg_) {
@@ -932,9 +1056,9 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
               edge_dst,
               edge_shifts,
               cell,
-              torch::Tensor(),
-              torch::Tensor(),
-              torch::Tensor(),
+              warmup_disp_src,
+              warmup_disp_dst,
+              warmup_disp_shifts,
               external_tensor,
               fidelity_ids,
               false);
@@ -1021,10 +1145,26 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
   torch::Tensor dispersion_edge_src = edge_src;
   torch::Tensor dispersion_edge_dst = edge_dst;
   torch::Tensor dispersion_edge_shifts = edge_shifts;
-  const bool need_dispersion_edges =
-      core_takes_dispersion_edges_arg_ || (aoti_mode_ && aoti_takes_dispersion_edges_arg_);
-  if (need_dispersion_edges && dispersion_edge_src_in.defined() && dispersion_edge_dst_in.defined() &&
-      dispersion_edge_shifts_in.defined() && dispersion_edge_src_in.numel() > 0) {
+  const bool any_input_dispersion_edges =
+      dispersion_edge_src_in.defined() || dispersion_edge_dst_in.defined() || dispersion_edge_shifts_in.defined();
+  const bool all_input_dispersion_edges =
+      dispersion_edge_src_in.defined() && dispersion_edge_dst_in.defined() && dispersion_edge_shifts_in.defined();
+  if (any_input_dispersion_edges && !all_input_dispersion_edges) {
+    throw std::runtime_error(
+        "dispersion_edge_src, dispersion_edge_dst, and dispersion_edge_shifts must be provided together.");
+  }
+  const bool metadata_requires_mbd_dispersion_edges =
+      core_takes_dispersion_edges_arg_ && requires_mbd_dispersion_edges();
+  const bool need_explicit_dispersion_edges =
+      metadata_requires_mbd_dispersion_edges || (aoti_mode_ && aoti_takes_dispersion_edges_arg_);
+  if (need_explicit_dispersion_edges && !all_input_dispersion_edges) {
+    throw std::runtime_error(
+        "core.pt/.pt2 expects explicit MBD dispersion edges, but pair_style mff/torch did not provide "
+        "a dispersion neighbor list. Add 'dispersion <cutoff>' to pair_style mff/torch and "
+        "use the same cutoff as the exported model metadata.");
+  }
+  if ((core_takes_dispersion_edges_arg_ || (aoti_mode_ && aoti_takes_dispersion_edges_arg_)) &&
+      all_input_dispersion_edges) {
     dispersion_edge_src =
         (dispersion_edge_src_in.device() == device_ && dispersion_edge_src_in.dtype() == torch::kInt64)
             ? dispersion_edge_src_in : dispersion_edge_src_in.to(device_, torch::kInt64);
@@ -1128,6 +1268,28 @@ MFFOutputs MFFTorchEngine::compute(int64_t nlocal, int64_t ntotal,
           "mff/torch: ntotal=" + std::to_string(ntotal) + " exceeds the AOTI .pt2 baked N_max=" +
           std::to_string(aoti_nmax_) + " and no TorchScript fallback configured; re-export with a "
           "larger --atoms or add 'fallback <core.pt>' to <core>.pt2.meta.");
+    }
+    if (aoti_takes_dispersion_edges_arg_ && core_exports_reciprocal_source_ &&
+        long_range_runtime_backend_ != "none") {
+      if (have_ts_fallback_) {
+        if (!aoti_fallback_warned_) {
+          aoti_fallback_warned_ = true;
+          std::fprintf(stderr,
+                       "[mff/torch] AOTI MBD dispersion with runtime reciprocal source "
+                       "uses TorchScript fallback. The current AOTI package output is valid "
+                       "for the core force, but the packaged reciprocal_source path is not "
+                       "stable across MD calls in this libtorch/AOTI runner.\n");
+        }
+        return run_forward_backward(pos0, A, edge_src, edge_dst, edge_shifts, cell,
+                                    dispersion_edge_src, dispersion_edge_dst, dispersion_edge_shifts,
+                                    external_tensor, fidelity_ids,
+                                    nlocal, ntotal, need_energy, need_atom_virial);
+      }
+      throw std::runtime_error(
+          "mff/torch: AOTI .pt2 combines explicit MBD dispersion edges with runtime reciprocal "
+          "long-range output, but no TorchScript fallback is configured. This AOTI/libtorch "
+          "combination is not stable across repeated MD calls. Add 'fallback <core.pt>' to "
+          "<core>.pt2.meta or export without runtime reciprocal_source.");
     }
     MFFOutputs out = run_aoti(pos0, A, edge_src, edge_dst, edge_shifts, cell,
                               dispersion_edge_src, dispersion_edge_dst, dispersion_edge_shifts);
@@ -1237,21 +1399,51 @@ MFFOutputs MFFTorchEngine::run_aoti(
 	    aoti_stream_guard = std::make_unique<c10::cuda::CUDAStreamGuard>(
 	        c10::cuda::getDefaultCUDAStream(device_.index()));
 	  }
-	  c10::InferenceMode inference_guard(true);
-	  std::vector<at::Tensor> outs = aoti_loader_->run(inputs);
+  std::vector<at::Tensor> outs;
+  {
+    c10::InferenceMode inference_guard(true);
+    outs = aoti_loader_->run(inputs);
+  }
   if (outs.size() < 2) {
     throw std::runtime_error(
         "AOTI .pt2 must return (atom_energy, force); got fewer than 2 outputs");
   }
   MFFOutputs out;
   // Slice off the dummy padding atoms -> outputs for the real ntot atoms only.
-  out.atom_energy = outs[0].narrow(0, 0, ntot).contiguous();
-  out.forces = outs[1].narrow(0, 0, ntot).contiguous();
+  // Clone AOTI outputs before caching them in LAMMPS. Some packaged AOTI models reuse internal
+  // output storage across invocations; holding those tensors directly can make the next run()
+  // trip stale-buffer index assertions.
+  out.atom_energy = outs[0].narrow(0, 0, ntot).clone().contiguous();
+  out.forces = outs[1].narrow(0, 0, ntot).clone().contiguous();
   // Optional 3rd output: packed latent-multipole reciprocal_source [q|mu|Q] for the C++ reciprocal
   // solver (the AOTI multipole export returns (E, force, reciprocal_source); slice off padding). The
   // pair style's existing reciprocal-solver path then runs identically to the TorchScript core.
   if (outs.size() > 2 && outs[2].defined() && outs[2].numel() > 0) {
-    out.reciprocal_source = outs[2].narrow(0, 0, ntot).clone().contiguous();
+    auto source_slice = outs[2].narrow(0, 0, ntot).clone().contiguous();
+    if (aoti_takes_dispersion_edges_arg_ && device_.is_cuda()) {
+      // AOTI packaged outputs can retain internal CUDA storage/lifetime state.
+      // The runtime reciprocal solver is a separate cuFFT path that may outlive
+      // the AOTI call, so fully detach the packed source from the package before
+      // handing it off.
+      out.reciprocal_source = source_slice.to(torch::kCPU, torch::kFloat32).contiguous()
+                                  .to(device_, torch::kFloat32).contiguous();
+    } else {
+      out.reciprocal_source = source_slice;
+    }
+  }
+  if (aoti_takes_dispersion_edges_arg_) {
+    outs.clear();
+    if (std::getenv("MFF_AOTI_RELOAD_MBD_DISPERSION")) {
+      if (!aoti_reload_warned_) {
+        aoti_reload_warned_ = true;
+        std::fprintf(stderr,
+                     "[mff/torch] MFF_AOTI_RELOAD_MBD_DISPERSION is set; reloading the "
+                     "AOTI MBD dispersion package after each call. This is a debug workaround "
+                     "and can be slower or less stable than reusing one loader.\n");
+      }
+      aoti_loader_ = std::make_unique<torch::inductor::AOTIModelPackageLoader>(
+          aoti_package_path_, "model", /*run_single_threaded=*/false);
+    }
   }
   return out;
 #else

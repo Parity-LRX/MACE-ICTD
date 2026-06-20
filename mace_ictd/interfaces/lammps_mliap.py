@@ -106,6 +106,9 @@ from mace_ictd.utils.checkpoint_metadata import (
     infer_ictd_save_multiple_fusion_scheme_from_state_dict,
     infer_ictd_save_multiple_order_from_state_dict,
     infer_physical_tensor_outputs_from_state_dict,
+    validate_dispersion_deployment_graph_rule,
+    validate_dispersion_train_deploy_graph_compatibility,
+    validate_dispersion_training_graph_rule,
 )
 from mace_ictd.utils.external_tensor_specs import normalize_external_tensor_specs
 from mace_ictd.models.zbl import maybe_wrap_model_with_zbl
@@ -1239,9 +1242,60 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
             )
         )
         dispersion_cutoff = float(arch_meta.get("dispersion_cutoff", 10.0))
+        dispersion_max_num_neighbors_raw = arch_meta.get("dispersion_max_num_neighbors", None)
+        dispersion_max_num_neighbors = (
+            None
+            if dispersion_max_num_neighbors_raw is None or int(dispersion_max_num_neighbors_raw) <= 0
+            else int(dispersion_max_num_neighbors_raw)
+        )
+        dispersion_neighbor_method = str(arch_meta.get("dispersion_neighbor_method", "auto"))
+        dispersion_bruteforce_threshold = int(arch_meta.get("dispersion_bruteforce_threshold", 1024))
+        dispersion_allow_large_bruteforce_fallback = bool(
+            arch_meta.get("dispersion_allow_large_bruteforce_fallback", False)
+        )
         dispersion_slq_num_probes = int(ckpt.get("dispersion_slq_num_probes", arch_meta.get("dispersion_slq_num_probes", 8)))
         dispersion_slq_lanczos_steps = int(
             ckpt.get("dispersion_slq_lanczos_steps", arch_meta.get("dispersion_slq_lanczos_steps", 16))
+        )
+        mbd_operator_backend = str(ckpt.get("mbd_operator_backend", arch_meta.get("mbd_operator_backend", "edge_sparse")))
+        raw_dispersion_graph_rule = ckpt.get(
+            "dispersion_deployment_graph_rule",
+            arch_meta.get("dispersion_deployment_graph_rule", None),
+        )
+        raw_dispersion_training_graph_rule = ckpt.get(
+            "dispersion_training_graph_rule",
+            arch_meta.get("dispersion_training_graph_rule", None),
+        )
+        raw_dispersion_graph_compatibility = ckpt.get(
+            "dispersion_train_deploy_graph_compatibility",
+            arch_meta.get("dispersion_train_deploy_graph_compatibility", None),
+        )
+        validate_dispersion_training_graph_rule(
+            long_range_dispersion_mode=long_range_dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+            raw_rule=raw_dispersion_training_graph_rule,
+            source_label="checkpoint dispersion_training_graph_rule",
+        )
+        validate_dispersion_deployment_graph_rule(
+            long_range_dispersion_mode=long_range_dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+            raw_rule=raw_dispersion_graph_rule,
+            source_label="checkpoint dispersion_deployment_graph_rule",
+        )
+        validate_dispersion_train_deploy_graph_compatibility(
+            long_range_dispersion_mode=long_range_dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+            raw_value=raw_dispersion_graph_compatibility,
+            source_label="checkpoint dispersion_train_deploy_graph_compatibility",
+        )
+        mbd_pme_mesh_size = int(ckpt.get("mbd_pme_mesh_size", arch_meta.get("mbd_pme_mesh_size", 16)))
+        mbd_pme_assignment = str(ckpt.get("mbd_pme_assignment", arch_meta.get("mbd_pme_assignment", "cic")))
+        mbd_pme_k_norm_floor = float(ckpt.get("mbd_pme_k_norm_floor", arch_meta.get("mbd_pme_k_norm_floor", 1.0e-6)))
+        mbd_pme_assignment_window_floor = float(
+            ckpt.get("mbd_pme_assignment_window_floor", arch_meta.get("mbd_pme_assignment_window_floor", 1.0e-6))
+        )
+        mbd_pme_ewald_alpha_prefactor = float(
+            ckpt.get("mbd_pme_ewald_alpha_prefactor", arch_meta.get("mbd_pme_ewald_alpha_prefactor", 5.0))
         )
         long_range_theta = float(arch_meta.get("long_range_theta", 0.5))
         long_range_leaf_size = int(arch_meta.get("long_range_leaf_size", 32))
@@ -1549,8 +1603,18 @@ class LAMMPS_MLIAP_MFF(MLIAPUnified):
                 long_range_max_multipole_l=long_range_max_multipole_l,
                 long_range_dispersion_mode=long_range_dispersion_mode,
                 dispersion_cutoff=dispersion_cutoff,
+                dispersion_max_num_neighbors=dispersion_max_num_neighbors,
+                dispersion_neighbor_method=dispersion_neighbor_method,
+                dispersion_bruteforce_threshold=dispersion_bruteforce_threshold,
+                dispersion_allow_large_bruteforce_fallback=dispersion_allow_large_bruteforce_fallback,
                 dispersion_slq_num_probes=dispersion_slq_num_probes,
                 dispersion_slq_lanczos_steps=dispersion_slq_lanczos_steps,
+                mbd_operator_backend=mbd_operator_backend,
+                mbd_pme_mesh_size=mbd_pme_mesh_size,
+                mbd_pme_assignment=mbd_pme_assignment,
+                mbd_pme_k_norm_floor=mbd_pme_k_norm_floor,
+                mbd_pme_assignment_window_floor=mbd_pme_assignment_window_floor,
+                mbd_pme_ewald_alpha_prefactor=mbd_pme_ewald_alpha_prefactor,
                 long_range_theta=long_range_theta,
                 long_range_leaf_size=long_range_leaf_size,
                 long_range_multipole_order=long_range_multipole_order,

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from mace_ictd.models.long_range import build_long_range_module
+from mace_ictd.models.long_range import build_feature_spectral_module, build_long_range_module
 
 
 def _random_rotation(dtype) -> torch.Tensor:
@@ -166,6 +166,85 @@ def _neighbor_list(pos, cell, r_max):
     )
 
 
+def _two_graph_inputs(dtype=torch.float64):
+    torch.manual_seed(12)
+    L0 = 8.0
+    L1 = 9.0
+    cell0 = torch.eye(3, dtype=dtype) * L0
+    cell1 = torch.eye(3, dtype=dtype) * L1
+    A0 = torch.tensor([1, 6, 7, 8, 1], dtype=torch.long)
+    A1 = torch.tensor([6, 8, 1, 7], dtype=torch.long)
+    pos0 = torch.rand(A0.numel(), 3, dtype=dtype) * L0
+    pos1 = torch.rand(A1.numel(), 3, dtype=dtype) * L1
+    es0, ed0, sh0 = _neighbor_list(pos0, cell0, r_max=4.5)
+    es1, ed1, sh1 = _neighbor_list(pos1, cell1, r_max=4.5)
+    n0 = A0.numel()
+    return dict(
+        pos=torch.cat([pos0, pos1], dim=0),
+        A=torch.cat([A0, A1], dim=0),
+        batch=torch.cat([
+            torch.zeros(A0.numel(), dtype=torch.long),
+            torch.ones(A1.numel(), dtype=torch.long),
+        ]),
+        edge_src=torch.cat([es0, es1 + n0], dim=0),
+        edge_dst=torch.cat([ed0, ed1 + n0], dim=0),
+        shifts=torch.cat([sh0, sh1], dim=0),
+        cell=torch.stack([cell0, cell1], dim=0),
+        split=n0,
+    )
+
+
+def test_collate_offsets_explicit_dispersion_edges():
+    from mace_ictd.data.collate import collate_fn_h5
+
+    dtype = torch.float64
+    sample0 = {
+        "pos": torch.zeros(2, 3, dtype=dtype),
+        "A": torch.tensor([1, 6], dtype=torch.long),
+        "force": torch.zeros(2, 3, dtype=dtype),
+        "y": torch.tensor([0.0], dtype=dtype),
+        "edge_src": torch.tensor([0], dtype=torch.long),
+        "edge_dst": torch.tensor([1], dtype=torch.long),
+        "edge_shifts": torch.zeros(1, 3, dtype=dtype),
+        "dispersion_edge_src": torch.tensor([0], dtype=torch.long),
+        "dispersion_edge_dst": torch.tensor([1], dtype=torch.long),
+        "dispersion_edge_shifts": torch.zeros(1, 3, dtype=dtype),
+        "cell": torch.eye(3, dtype=dtype),
+        "stress": torch.zeros(3, 3, dtype=dtype),
+    }
+    sample1 = {
+        "pos": torch.zeros(3, 3, dtype=dtype),
+        "A": torch.tensor([7, 8, 1], dtype=torch.long),
+        "force": torch.zeros(3, 3, dtype=dtype),
+        "y": torch.tensor([0.0], dtype=dtype),
+        "edge_src": torch.tensor([0], dtype=torch.long),
+        "edge_dst": torch.tensor([2], dtype=torch.long),
+        "edge_shifts": torch.zeros(1, 3, dtype=dtype),
+        "dispersion_edge_src": torch.tensor([0, 1], dtype=torch.long),
+        "dispersion_edge_dst": torch.tensor([2, 0], dtype=torch.long),
+        "dispersion_edge_shifts": torch.zeros(2, 3, dtype=dtype),
+        "cell": torch.eye(3, dtype=dtype),
+        "stress": torch.zeros(3, 3, dtype=dtype),
+    }
+
+    *_, extras = collate_fn_h5([sample0, sample1])
+    assert torch.equal(extras["dispersion_edge_src"], torch.tensor([0, 2, 3]))
+    assert torch.equal(extras["dispersion_edge_dst"], torch.tensor([1, 4, 2]))
+    assert extras["dispersion_edge_shifts"].shape == (3, 3)
+
+
+def test_force_trainer_disables_tf32():
+    from mace_ictd.training.train_loop import ForceTrainer
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    model = _build_model(max_multipole_l=0).float()
+    ForceTrainer(model, train_loader=[], device="cpu", dtype=torch.float32, lr_scheduler="none")
+    assert torch.get_float32_matmul_precision() == "highest"
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+    assert torch.backends.cudnn.allow_tf32 is False
+
+
 def test_model_multipole_forward_smoke():
     """End-to-end: a wired model with multipole long-range ON runs forward, gives a finite
     energy + finite forces, and a rotation-invariant total energy."""
@@ -194,6 +273,93 @@ def test_model_multipole_forward_smoke():
     assert torch.allclose(e.detach(), e_r.detach(), atol=1e-6), (
         f"total energy not rotation-invariant: {(e - e_r).abs().item():.2e}"
     )
+
+
+def test_long_range_multi_graph_matches_separate_graphs():
+    """Batched mesh long-range must be separable across structures."""
+    torch.set_default_dtype(torch.float64)
+    dtype = torch.float64
+    inputs = _two_graph_inputs(dtype)
+    n0 = inputs["split"]
+
+    for max_l in (0, 2):
+        model = _build_model(max_multipole_l=max_l).double().eval()
+        for m in model.modules():
+            if getattr(m, "energy_scale", None) is not None:
+                with torch.no_grad():
+                    m.energy_scale.fill_(0.1)
+
+        e_batched = model(
+            inputs["pos"],
+            inputs["A"],
+            inputs["batch"],
+            inputs["edge_src"],
+            inputs["edge_dst"],
+            inputs["shifts"],
+            inputs["cell"],
+        )
+
+        edge0_mask = inputs["edge_src"] < n0
+        e0 = model(
+            inputs["pos"][:n0],
+            inputs["A"][:n0],
+            torch.zeros(n0, dtype=torch.long),
+            inputs["edge_src"][edge0_mask],
+            inputs["edge_dst"][edge0_mask],
+            inputs["shifts"][edge0_mask],
+            inputs["cell"][:1],
+        )
+        edge1_mask = inputs["edge_src"] >= n0
+        e1 = model(
+            inputs["pos"][n0:],
+            inputs["A"][n0:],
+            torch.zeros(inputs["A"].numel() - n0, dtype=torch.long),
+            inputs["edge_src"][edge1_mask] - n0,
+            inputs["edge_dst"][edge1_mask] - n0,
+            inputs["shifts"][edge1_mask],
+            inputs["cell"][1:],
+        )
+        assert torch.allclose(e_batched, torch.cat([e0, e1], dim=0), atol=1e-8), max_l
+
+
+def test_feature_spectral_multi_graph_matches_separate_graphs():
+    """Feature-spectral long-range residual also uses the batched mesh path."""
+    torch.set_default_dtype(torch.float64)
+    dtype = torch.float64
+    inputs = _two_graph_inputs(dtype)
+    n0 = inputs["split"]
+    feature_dim = 8
+    torch.manual_seed(13)
+    x = torch.randn(inputs["A"].numel(), feature_dim, dtype=dtype)
+    block = build_feature_spectral_module(
+        mode="fft",
+        feature_dim=feature_dim,
+        bottleneck_dim=4,
+        mesh_size=16,
+        filter_hidden_dim=8,
+        boundary="periodic",
+        neutralize=True,
+        assignment="pcs",
+        gate_init=0.2,
+    ).double().eval()
+
+    pos = inputs["pos"].clone().requires_grad_(True)
+    y_batch, _ = block(x, pos, inputs["batch"], inputs["cell"])
+    y0, _ = block(
+        x[:n0],
+        inputs["pos"][:n0],
+        torch.zeros(n0, dtype=torch.long),
+        inputs["cell"][:1],
+    )
+    y1, _ = block(
+        x[n0:],
+        inputs["pos"][n0:],
+        torch.zeros(inputs["A"].numel() - n0, dtype=torch.long),
+        inputs["cell"][1:],
+    )
+    assert torch.allclose(y_batch, torch.cat([y0, y1], dim=0), atol=1e-8)
+    (grad,) = torch.autograd.grad(y_batch.sum(), pos)
+    assert torch.isfinite(grad).all()
 
 
 def test_model_multipole_training_smoke():
@@ -234,6 +400,222 @@ def test_model_multipole_training_smoke():
     mp_grads = [p.grad for p in model.multipole_readout.parameters() if p.grad is not None]
     assert mp_grads and any(g.abs().sum() > 0 for g in mp_grads), "multipole readout received no gradient"
     return losses[0], losses[-1]
+
+
+def test_model_multipole_makefx_single_graph_trace():
+    """Regression: single-graph multipole long-range training can be make_fx-traced.
+
+    Multi-graph batches still need a batched mesh implementation; this locks the
+    common one-cell path so it does not regress to data-dependent nonzero/int(numel)
+    control flow.
+    """
+    from mace_ictd.training.makefx_compile import make_force_compute_fn, trace_and_compile_force
+
+    torch.set_default_dtype(torch.float64)
+    model = _build_model(max_multipole_l=2).double().train()
+    for m in model.modules():
+        if getattr(m, "energy_scale", None) is not None:
+            with torch.no_grad():
+                m.energy_scale.fill_(0.1)
+
+    torch.manual_seed(7)
+    L = 8.0
+    cell = (torch.eye(3, dtype=torch.float64) * L).reshape(1, 3, 3)
+    A = torch.tensor([1, 6, 7, 8, 1, 6, 7, 8], dtype=torch.long)
+    pos = torch.rand(A.numel(), 3, dtype=torch.float64) * L
+    batch = torch.zeros(A.numel(), dtype=torch.long)
+    edge_src, edge_dst, shifts = _neighbor_list(pos, cell[0], r_max=4.5)
+
+    gm = trace_and_compile_force(
+        model,
+        (pos, A, batch, edge_src, edge_dst, shifts, cell),
+        training=True,
+        compute_fn=make_force_compute_fn(model, training=True),
+        do_compile=False,
+    )
+    energy, force = gm(pos, A, batch, edge_src, edge_dst, shifts, cell)
+    assert torch.isfinite(energy)
+    assert torch.isfinite(force).all() and force.shape == pos.shape
+
+
+def test_model_multipole_makefx_multi_graph_trace():
+    """Regression: multi-graph multipole long-range training can be make_fx-traced."""
+    from mace_ictd.training.makefx_compile import make_force_compute_fn, trace_and_compile_force
+
+    torch.set_default_dtype(torch.float64)
+    model = _build_model(max_multipole_l=2).double().train()
+    for m in model.modules():
+        if getattr(m, "energy_scale", None) is not None:
+            with torch.no_grad():
+                m.energy_scale.fill_(0.1)
+    inputs = _two_graph_inputs(torch.float64)
+
+    gm = trace_and_compile_force(
+        model,
+        (
+            inputs["pos"],
+            inputs["A"],
+            inputs["batch"],
+            inputs["edge_src"],
+            inputs["edge_dst"],
+            inputs["shifts"],
+            inputs["cell"],
+        ),
+        training=True,
+        compute_fn=make_force_compute_fn(model, training=True),
+        do_compile=False,
+    )
+    energy, force = gm(
+        inputs["pos"],
+        inputs["A"],
+        inputs["batch"],
+        inputs["edge_src"],
+        inputs["edge_dst"],
+        inputs["shifts"],
+        inputs["cell"],
+    )
+    assert torch.isfinite(energy)
+    assert torch.isfinite(force).all() and force.shape == inputs["pos"].shape
+
+
+def test_model_latent_charge_makefx_single_graph_trace():
+    """Regression: the scalar latent-source mesh long-range path is also traceable."""
+    from mace_ictd.training.makefx_compile import make_force_compute_fn, trace_and_compile_force
+
+    torch.set_default_dtype(torch.float64)
+    model = _build_model(max_multipole_l=0).double().train()
+    for m in model.modules():
+        if getattr(m, "energy_scale", None) is not None:
+            with torch.no_grad():
+                m.energy_scale.fill_(0.1)
+
+    torch.manual_seed(8)
+    L = 8.0
+    cell = (torch.eye(3, dtype=torch.float64) * L).reshape(1, 3, 3)
+    A = torch.tensor([1, 6, 7, 8, 1, 6, 7, 8], dtype=torch.long)
+    pos = torch.rand(A.numel(), 3, dtype=torch.float64) * L
+    batch = torch.zeros(A.numel(), dtype=torch.long)
+    edge_src, edge_dst, shifts = _neighbor_list(pos, cell[0], r_max=4.5)
+
+    gm = trace_and_compile_force(
+        model,
+        (pos, A, batch, edge_src, edge_dst, shifts, cell),
+        training=True,
+        compute_fn=make_force_compute_fn(model, training=True),
+        do_compile=False,
+    )
+    energy, force = gm(pos, A, batch, edge_src, edge_dst, shifts, cell)
+    assert torch.isfinite(energy)
+    assert torch.isfinite(force).all() and force.shape == pos.shape
+
+
+def test_model_latent_charge_makefx_multi_graph_trace():
+    """Regression: multi-graph scalar latent-source mesh long-range is traceable."""
+    from mace_ictd.training.makefx_compile import make_force_compute_fn, trace_and_compile_force
+
+    torch.set_default_dtype(torch.float64)
+    model = _build_model(max_multipole_l=0).double().train()
+    for m in model.modules():
+        if getattr(m, "energy_scale", None) is not None:
+            with torch.no_grad():
+                m.energy_scale.fill_(0.1)
+    inputs = _two_graph_inputs(torch.float64)
+
+    gm = trace_and_compile_force(
+        model,
+        (
+            inputs["pos"],
+            inputs["A"],
+            inputs["batch"],
+            inputs["edge_src"],
+            inputs["edge_dst"],
+            inputs["shifts"],
+            inputs["cell"],
+        ),
+        training=True,
+        compute_fn=make_force_compute_fn(model, training=True),
+        do_compile=False,
+    )
+    energy, force = gm(
+        inputs["pos"],
+        inputs["A"],
+        inputs["batch"],
+        inputs["edge_src"],
+        inputs["edge_dst"],
+        inputs["shifts"],
+        inputs["cell"],
+    )
+    assert torch.isfinite(energy)
+    assert torch.isfinite(force).all() and force.shape == inputs["pos"].shape
+
+
+def test_model_combined_long_range_dispersion_makefx_multi_graph_trace():
+    from mace_ictd.models.dispersion import dispersion_neighbor_list
+    from mace_ictd.training.makefx_compile import trace_and_compile_force
+
+    torch.set_default_dtype(torch.float64)
+    inputs = _two_graph_inputs(torch.float64)
+    disp_src, disp_dst, disp_shift = dispersion_neighbor_list(
+        inputs["pos"],
+        inputs["batch"],
+        inputs["cell"],
+        cutoff=10.0,
+        pbc=True,
+    )
+
+    for max_multipole_l in (0, 2):
+        model = _build_model(max_multipole_l=max_multipole_l, dispersion=True).double().train()
+        for m in model.modules():
+            if getattr(m, "energy_scale", None) is not None:
+                with torch.no_grad():
+                    m.energy_scale.fill_(0.1)
+
+        def compute_fn(
+            pos,
+            A,
+            batch,
+            edge_src,
+            edge_dst,
+            shifts,
+            cell,
+            dispersion_edge_src,
+            dispersion_edge_dst,
+            dispersion_edge_shifts,
+        ):
+            p = pos.detach().requires_grad_(True)
+            e_atom = model(
+                p,
+                A,
+                batch,
+                edge_src,
+                edge_dst,
+                shifts,
+                cell,
+                dispersion_edge_src=dispersion_edge_src,
+                dispersion_edge_dst=dispersion_edge_dst,
+                dispersion_edge_shifts=dispersion_edge_shifts,
+            )
+            if isinstance(e_atom, tuple):
+                e_atom = e_atom[0]
+            grad = torch.autograd.grad(e_atom.sum(), p, create_graph=True)[0]
+            return e_atom.sum(), -grad
+
+        example_inputs = (
+            inputs["pos"],
+            inputs["A"],
+            inputs["batch"],
+            inputs["edge_src"],
+            inputs["edge_dst"],
+            inputs["shifts"],
+            inputs["cell"],
+            disp_src,
+            disp_dst,
+            disp_shift,
+        )
+        gm = trace_and_compile_force(model, example_inputs, training=True, compute_fn=compute_fn, do_compile=False)
+        energy, force = gm(*example_inputs)
+        assert torch.isfinite(energy)
+        assert torch.isfinite(force).all() and force.shape == inputs["pos"].shape
 
 
 def test_export_reciprocal_source_equivariant_layout():

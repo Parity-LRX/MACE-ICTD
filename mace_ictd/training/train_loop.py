@@ -53,6 +53,16 @@ _DEFAULT_E0_KEYS = [1, 6, 7, 8]
 _DEFAULT_E0_VALUES = [-430.53299511, -821.03326787, -1488.18856918, -2044.3509823]
 
 
+def disable_tf32() -> None:
+    """Force full IEEE float32 matmul/convolution precision on CUDA."""
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+
 class ForceTrainer:
     """Energy+force trainer with optional make_fx compile + size-bucketing."""
 
@@ -124,6 +134,7 @@ class ForceTrainer:
         world_size: int = 1,
         main_process: bool = True,
     ):
+        disable_tf32()
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -210,6 +221,40 @@ class ForceTrainer:
         self._makefx_max_slots = int(makefx_max_slots)
         self._makefx_disabled = False
         object.__setattr__(self, "_makefx_cache", None)
+        self._dispersion_graph_observation = {
+            "observed_batches": 0,
+            "observed_edges": 0,
+            "single_image_cell_batches": 0,
+            "non_single_image_cell_batches": 0,
+            "self_image_edges": 0,
+            "multi_image_shift_edges": 0,
+            "builder_explicit_batches": 0,
+            "builder_auto_bruteforce_batches": 0,
+            "builder_auto_torch_cluster_batches": 0,
+            "builder_auto_cell_batches": 0,
+            "builder_auto_bruteforce_fallback_batches": 0,
+            "builder_bruteforce_batches": 0,
+            "builder_cell_batches": 0,
+            "builder_unknown_batches": 0,
+        }
+        self._dispersion_graph_observation_base = {
+            "observed_batches": 0,
+            "observed_edges": 0,
+            "single_image_cell_batches": 0,
+            "non_single_image_cell_batches": 0,
+            "self_image_edges": 0,
+            "multi_image_shift_edges": 0,
+            "builder_explicit_batches": 0,
+            "builder_auto_bruteforce_batches": 0,
+            "builder_auto_torch_cluster_batches": 0,
+            "builder_auto_cell_batches": 0,
+            "builder_auto_bruteforce_fallback_batches": 0,
+            "builder_bruteforce_batches": 0,
+            "builder_cell_batches": 0,
+            "builder_unknown_batches": 0,
+        }
+        self._dispersion_graph_observation_synced = None
+        self._last_dispersion_neighbor_build_info = None
 
         self.ema_decay = float(ema_decay)
         if self.ema_decay < 0.0 or self.ema_decay >= 1.0:
@@ -472,7 +517,20 @@ class ForceTrainer:
             )
 
     # ----------------------------------------------------------------- make_fx
-    def _makefx_forward(self, pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, strain=None):
+    def _makefx_forward(
+        self,
+        pos,
+        A,
+        batch_idx,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        strain=None,
+        dispersion_edge_src=None,
+        dispersion_edge_dst=None,
+        dispersion_edge_shifts=None,
+    ):
         """make_fx-compiled ``(E_per_atom, dE/dpos)`` -- and, when ``strain`` is given,
         also ``dE/dstrain`` for the stress/virial loss (positions and cell deformed by
         ``I + sym(strain)``, traced at ``strain=0`` so the forward is undeformed).
@@ -487,8 +545,52 @@ class ForceTrainer:
                                CompiledForceCache(self.model, max_slots=self._makefx_max_slots))
 
         stress = strain is not None
+        dispersion_edge_args = (dispersion_edge_src, dispersion_edge_dst, dispersion_edge_shifts)
+        has_dispersion_edges = all(arg is not None for arg in dispersion_edge_args)
+        if any(arg is not None for arg in dispersion_edge_args) and not has_dispersion_edges:
+            raise ValueError(
+                "dispersion_edge_src, dispersion_edge_dst, and dispersion_edge_shifts must be provided together"
+            )
 
         def _factory(model, *, training):
+            if stress and has_dispersion_edges:
+                def compute_fn(
+                    pos,
+                    strain,
+                    A,
+                    batch_idx,
+                    edge_src,
+                    edge_dst,
+                    edge_shifts,
+                    cell,
+                    dispersion_edge_src,
+                    dispersion_edge_dst,
+                    dispersion_edge_shifts,
+                ):
+                    p = pos.detach().requires_grad_(True)
+                    s = strain.detach().requires_grad_(True)
+                    sym = 0.5 * (s + s.transpose(-1, -2))
+                    defo = torch.eye(3, dtype=p.dtype, device=p.device) + sym  # [B,3,3]
+                    pos_in = torch.einsum("ni,nij->nj", p, defo[batch_idx])
+                    cell_in = torch.bmm(cell, defo)
+                    e_atom = model(
+                        pos_in,
+                        A,
+                        batch_idx,
+                        edge_src,
+                        edge_dst,
+                        edge_shifts,
+                        cell_in,
+                        dispersion_edge_src=dispersion_edge_src,
+                        dispersion_edge_dst=dispersion_edge_dst,
+                        dispersion_edge_shifts=dispersion_edge_shifts,
+                    )
+                    if isinstance(e_atom, tuple):
+                        e_atom = e_atom[0]
+                    g = torch.autograd.grad(e_atom.sum(), [p, s], create_graph=training)
+                    return e_atom, g[0], g[1]
+                return compute_fn
+
             if stress:
                 def compute_fn(pos, strain, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
                     p = pos.detach().requires_grad_(True)
@@ -502,6 +604,38 @@ class ForceTrainer:
                         e_atom = e_atom[0]
                     g = torch.autograd.grad(e_atom.sum(), [p, s], create_graph=training)
                     return e_atom, g[0], g[1]
+                return compute_fn
+
+            if has_dispersion_edges:
+                def compute_fn(
+                    pos,
+                    A,
+                    batch_idx,
+                    edge_src,
+                    edge_dst,
+                    edge_shifts,
+                    cell,
+                    dispersion_edge_src,
+                    dispersion_edge_dst,
+                    dispersion_edge_shifts,
+                ):
+                    p = pos.detach().requires_grad_(True)
+                    e_atom = model(
+                        p,
+                        A,
+                        batch_idx,
+                        edge_src,
+                        edge_dst,
+                        edge_shifts,
+                        cell,
+                        dispersion_edge_src=dispersion_edge_src,
+                        dispersion_edge_dst=dispersion_edge_dst,
+                        dispersion_edge_shifts=dispersion_edge_shifts,
+                    )
+                    if isinstance(e_atom, tuple):
+                        e_atom = e_atom[0]
+                    grad = torch.autograd.grad(e_atom.sum(), p, create_graph=training)[0]
+                    return e_atom, grad
                 return compute_fn
 
             def compute_fn(pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell):
@@ -519,6 +653,8 @@ class ForceTrainer:
             example_inputs = (pos, strain, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
         else:
             example_inputs = (pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+        if has_dispersion_edges:
+            example_inputs = example_inputs + (dispersion_edge_src, dispersion_edge_dst, dispersion_edge_shifts)
         compiled = self._makefx_cache.get(
             example_inputs,
             training=bool(self.model.training),
@@ -545,6 +681,295 @@ class ForceTrainer:
             stress_ref=stress_ref.to(dev, fd), extras=extras,
         )
 
+    def _dispersion_edges_for_batch(self, pos, batch_idx, cell, extras):
+        self._last_dispersion_neighbor_build_info = None
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(raw_model, "dispersion", None) is None:
+            return None
+        dispersion_mode = str(getattr(raw_model, "long_range_dispersion_mode", "pairwise-c6"))
+        mbd_operator_backend = str(getattr(raw_model, "mbd_operator_backend", "edge_sparse"))
+        from mace_ictd.models.dispersion import (
+            dispersion_mode_uses_canonical_edges,
+            dispersion_mode_uses_cutoff_edges,
+        )
+
+        if not dispersion_mode_uses_cutoff_edges(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        ):
+            return None
+        canonical_undirected = dispersion_mode_uses_canonical_edges(dispersion_mode)
+
+        def _extra_tensor(*names, dtype):
+            if not isinstance(extras, dict):
+                return None
+            for name in names:
+                value = extras.get(name, None)
+                if torch.is_tensor(value):
+                    return value.to(device=self.device, dtype=dtype)
+            return None
+
+        disp_src = _extra_tensor("dispersion_edge_src", "disp_edge_src", dtype=torch.long)
+        disp_dst = _extra_tensor("dispersion_edge_dst", "disp_edge_dst", dtype=torch.long)
+        disp_shifts = _extra_tensor("dispersion_edge_shifts", "disp_edge_shifts", dtype=pos.dtype)
+        if disp_src is not None or disp_dst is not None or disp_shifts is not None:
+            if disp_src is None or disp_dst is None or disp_shifts is None:
+                raise ValueError(
+                    "dispersion_edge_src, dispersion_edge_dst, and dispersion_edge_shifts must be provided together"
+                )
+            from mace_ictd.models.dispersion import normalize_dispersion_edges
+
+            disp_src, disp_dst, disp_shifts = normalize_dispersion_edges(
+                disp_src,
+                disp_dst,
+                disp_shifts,
+                canonical_undirected=canonical_undirected,
+                sort_edges=True,
+            )
+            bad_shape = (
+                disp_src.numel() != disp_dst.numel()
+                or disp_shifts.ndim != 2
+                or disp_shifts.shape[0] != disp_src.numel()
+                or disp_shifts.shape[1] != 3
+            )
+            if bad_shape:
+                raise ValueError(
+                    "explicit dispersion edges must have matching src/dst lengths and shifts shape [num_edges, 3]"
+                )
+            if disp_src.numel() > 0:
+                n_atoms = int(pos.shape[0])
+                out_of_range = (disp_src < 0) | (disp_dst < 0) | (disp_src >= n_atoms) | (disp_dst >= n_atoms)
+                if bool(out_of_range.any().item()):
+                    raise ValueError("explicit dispersion edges contain atom indices outside the current batch")
+                crosses_graph = batch_idx.index_select(0, disp_src) != batch_idx.index_select(0, disp_dst)
+                if bool(crosses_graph.any().item()):
+                    raise ValueError("explicit dispersion edges must not connect atoms from different batch graphs")
+            self._last_dispersion_neighbor_build_info = {
+                "requested_method": "explicit",
+                "selected_method": "explicit",
+            }
+            return disp_src, disp_dst, disp_shifts.to(device=self.device, dtype=pos.dtype)
+
+        from mace_ictd.models.dispersion import dispersion_neighbor_list
+
+        cutoff = float(getattr(raw_model, "dispersion_cutoff", getattr(raw_model, "max_radius", self.max_radius)))
+        if cutoff <= 0.0:
+            return None
+
+        pbc = bool(getattr(raw_model, "dispersion_pbc", True))
+        max_num_neighbors = getattr(raw_model, "dispersion_max_num_neighbors", None)
+        if max_num_neighbors is not None:
+            max_num_neighbors = int(max_num_neighbors)
+        neighbor_method = str(getattr(raw_model, "dispersion_neighbor_method", "auto"))
+        bruteforce_threshold = int(getattr(raw_model, "dispersion_bruteforce_threshold", 1024))
+        allow_large_bruteforce_fallback = bool(
+            getattr(raw_model, "dispersion_allow_large_bruteforce_fallback", False)
+        )
+        result = dispersion_neighbor_list(
+            pos.detach(),
+            batch_idx.detach(),
+            cell.detach(),
+            cutoff,
+            pbc=pbc,
+            canonical_undirected=canonical_undirected,
+            method=neighbor_method,
+            bruteforce_threshold=bruteforce_threshold,
+            max_num_neighbors=max_num_neighbors,
+            allow_large_bruteforce_fallback=allow_large_bruteforce_fallback,
+            return_info=True,
+        )
+        if len(result) == 4:
+            disp_src, disp_dst, disp_shifts, build_info = result
+        else:
+            disp_src, disp_dst, disp_shifts = result
+            build_info = {
+                "requested_method": neighbor_method,
+                "selected_method": "unknown",
+            }
+        self._last_dispersion_neighbor_build_info = dict(build_info)
+        return disp_src.to(self.device), disp_dst.to(self.device), disp_shifts.to(device=self.device, dtype=pos.dtype)
+
+    def _uses_mesh_fft_long_range(self) -> bool:
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        if getattr(raw_model, "long_range_module", None) is None:
+            return False
+        if str(getattr(raw_model, "long_range_reciprocal_backend", "")) == "mesh_fft":
+            return True
+        if str(getattr(raw_model, "long_range_runtime_backend", "")) == "mesh_fft":
+            return True
+        lr_module = getattr(raw_model, "long_range_module", None)
+        return str(getattr(lr_module, "reciprocal_backend", "")) == "mesh_fft"
+
+    def _model_dispersion_kwargs(self, dispersion_edges):
+        if dispersion_edges is None:
+            return {}
+        return {
+            "dispersion_edge_src": dispersion_edges[0],
+            "dispersion_edge_dst": dispersion_edges[1],
+            "dispersion_edge_shifts": dispersion_edges[2],
+        }
+
+    @torch.no_grad()
+    def _record_dispersion_graph_observation(self, batch_idx, cell, dispersion_edges):
+        if dispersion_edges is None:
+            return
+        raw_model = self.model.module if hasattr(self.model, "module") else self.model
+        dispersion_mode = str(getattr(raw_model, "long_range_dispersion_mode", "none"))
+        mbd_operator_backend = str(getattr(raw_model, "mbd_operator_backend", "edge_sparse"))
+        from mace_ictd.models.dispersion import (
+            dispersion_cutoff_is_single_image_exact,
+            dispersion_train_deploy_graph_compatibility,
+        )
+
+        compatibility = dispersion_train_deploy_graph_compatibility(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        )
+        if compatibility != "conditional_on_single_image_cutoff":
+            return
+
+        self._dispersion_graph_observation_synced = None
+        disp_src, disp_dst, disp_shifts = dispersion_edges
+        obs = self._dispersion_graph_observation
+        obs["observed_batches"] += 1
+        obs["observed_edges"] += int(disp_src.numel())
+        build_info = self._last_dispersion_neighbor_build_info
+        selected_method = str(build_info.get("selected_method", "unknown")) if isinstance(build_info, dict) else "unknown"
+        builder_key = f"builder_{selected_method}_batches"
+        if builder_key not in obs:
+            builder_key = "builder_unknown_batches"
+        obs[builder_key] += 1
+
+        cutoff = float(getattr(raw_model, "dispersion_cutoff", getattr(raw_model, "max_radius", self.max_radius)))
+        pbc = bool(getattr(raw_model, "dispersion_pbc", True))
+        single_image_cell = bool(dispersion_cutoff_is_single_image_exact(cell.detach(), cutoff, pbc=pbc))
+        if single_image_cell:
+            obs["single_image_cell_batches"] += 1
+        else:
+            obs["non_single_image_cell_batches"] += 1
+
+        if disp_src.numel() > 0:
+            obs["self_image_edges"] += int((disp_src == disp_dst).sum().detach().cpu().item())
+            shift_i = disp_shifts.detach().round().to(dtype=torch.long)
+            obs["multi_image_shift_edges"] += int((shift_i.abs() > 1).any(dim=1).sum().cpu().item())
+
+    def _dispersion_graph_observation_keys(self) -> tuple[str, ...]:
+        return (
+            "observed_batches",
+            "observed_edges",
+            "single_image_cell_batches",
+            "non_single_image_cell_batches",
+            "self_image_edges",
+            "multi_image_shift_edges",
+            "builder_explicit_batches",
+            "builder_auto_bruteforce_batches",
+            "builder_auto_torch_cluster_batches",
+            "builder_auto_cell_batches",
+            "builder_auto_bruteforce_fallback_batches",
+            "builder_bruteforce_batches",
+            "builder_cell_batches",
+            "builder_unknown_batches",
+        )
+
+    def _zero_dispersion_graph_observation(self) -> dict:
+        return {k: 0 for k in self._dispersion_graph_observation_keys()}
+
+    def _restore_dispersion_graph_observation(self, value) -> None:
+        if not isinstance(value, dict):
+            return
+        restored = self._zero_dispersion_graph_observation()
+        for key in self._dispersion_graph_observation_keys():
+            raw = value.get(key, 0)
+            try:
+                restored[key] = max(0, int(raw))
+            except (TypeError, ValueError):
+                restored[key] = 0
+        self._dispersion_graph_observation_base = restored
+        self._dispersion_graph_observation = self._zero_dispersion_graph_observation()
+        self._dispersion_graph_observation_synced = None
+
+    @torch.no_grad()
+    def _sync_dispersion_graph_observation(self) -> None:
+        if not self._dist_ready():
+            return
+        keys = self._dispersion_graph_observation_keys()
+        values = [float(self._dispersion_graph_observation[k]) for k in keys]
+        packed = torch.tensor(values, dtype=torch.float64, device=self.device)
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        reduced = {k: int(round(float(v))) for k, v in zip(keys, packed.detach().cpu().tolist())}
+        self._dispersion_graph_observation_synced = reduced
+
+    def _dispersion_graph_observation_summary(self) -> dict:
+        source = self._dispersion_graph_observation_synced or self._dispersion_graph_observation
+        obs = {
+            k: int(self._dispersion_graph_observation_base[k]) + int(source[k])
+            for k in self._dispersion_graph_observation_keys()
+        }
+        if obs["observed_batches"] <= 0:
+            status = "not_observed"
+        elif (
+            obs["non_single_image_cell_batches"] > 0
+            or obs["self_image_edges"] > 0
+            or obs["multi_image_shift_edges"] > 0
+        ):
+            status = "observed_not_single_image_deployable"
+        else:
+            status = "observed_single_image_deployable"
+        obs["status"] = status
+        if obs["observed_batches"] <= 0:
+            builder_status = "not_observed"
+        elif obs["builder_auto_bruteforce_fallback_batches"] > 0:
+            builder_status = "observed_large_dense_fallback"
+        elif obs["builder_auto_bruteforce_batches"] > 0 or obs["builder_bruteforce_batches"] > 0:
+            builder_status = "observed_dense_builder"
+        elif (
+            obs["builder_unknown_batches"] > 0
+            or (
+                obs["builder_explicit_batches"]
+                + obs["builder_auto_torch_cluster_batches"]
+                + obs["builder_auto_cell_batches"]
+                + obs["builder_cell_batches"]
+            )
+            <= 0
+        ):
+            builder_status = "observed_unknown_builder"
+        else:
+            builder_status = "observed_sparse_or_explicit_builder"
+        obs["neighbor_builder_status"] = builder_status
+        obs["scope"] = "distributed" if self._dispersion_graph_observation_synced is not None else "local"
+        return obs
+
+    def _eager_strain_gradient(
+        self,
+        pos,
+        A,
+        batch_idx,
+        edge_src,
+        edge_dst,
+        edge_shifts,
+        cell,
+        dispersion_edges,
+    ):
+        num_mol = cell.shape[0]
+        pos_leaf = pos.detach().requires_grad_(True)
+        strain = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device, requires_grad=True)
+        sym = 0.5 * (strain + strain.transpose(-1, -2))
+        defo = torch.eye(3, dtype=pos.dtype, device=self.device) + sym
+        pos_in = torch.einsum("ni,nij->nj", pos_leaf, defo[batch_idx])
+        cell_in = torch.bmm(cell, defo)
+        out = self.model(
+            pos_in,
+            A,
+            batch_idx,
+            edge_src,
+            edge_dst,
+            edge_shifts,
+            cell_in,
+            **self._model_dispersion_kwargs(dispersion_edges),
+        )
+        E_per_atom = out[0] if isinstance(out, tuple) else out
+        return torch.autograd.grad(E_per_atom.sum(), [pos_leaf, strain], create_graph=True, retain_graph=True)[1]
+
     def _compute(self, batch, *, training):
         """Forward + force-autograd + energy/force loss. Mirrors the FSCETP baseline."""
         b = self._unpack(batch)
@@ -553,6 +978,9 @@ class ForceTrainer:
         force_ref = b["force_ref"]
         target_energies = b["target_energies"].view(-1)
         stress_ref, extras = b["stress_ref"], b["extras"]
+        dispersion_edges = self._dispersion_edges_for_batch(pos, batch_idx, cell, extras)
+        if training:
+            self._record_dispersion_graph_observation(batch_idx, cell, dispersion_edges)
 
         atom_mask = None
         if isinstance(extras, dict) and torch.is_tensor(extras.get("atom_mask", None)):
@@ -577,12 +1005,61 @@ class ForceTrainer:
         if use_makefx:
             try:
                 if compute_stress:
-                    strain0 = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device)
-                    E_per_atom, grad0, grad_strain = self._makefx_forward(
-                        pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell, strain=strain0)
+                    if self._uses_mesh_fft_long_range():
+                        # Inductor currently hits a complex conjugate-view dtype bug when the
+                        # cuFFT long-range path is compiled inside the strain-gradient graph.
+                        # Keep the dominant energy/force path make_fx-compiled, and compute only
+                        # the virial strain derivative eagerly with the same fixed topology.
+                        E_per_atom, grad0 = self._makefx_forward(
+                            pos,
+                            A,
+                            batch_idx,
+                            edge_src,
+                            edge_dst,
+                            edge_shifts,
+                            cell,
+                            dispersion_edge_src=None if dispersion_edges is None else dispersion_edges[0],
+                            dispersion_edge_dst=None if dispersion_edges is None else dispersion_edges[1],
+                            dispersion_edge_shifts=None if dispersion_edges is None else dispersion_edges[2],
+                        )
+                        grad_strain = self._eager_strain_gradient(
+                            pos,
+                            A,
+                            batch_idx,
+                            edge_src,
+                            edge_dst,
+                            edge_shifts,
+                            cell,
+                            dispersion_edges,
+                        )
+                    else:
+                        strain0 = torch.zeros((num_mol, 3, 3), dtype=pos.dtype, device=self.device)
+                        E_per_atom, grad0, grad_strain = self._makefx_forward(
+                            pos,
+                            A,
+                            batch_idx,
+                            edge_src,
+                            edge_dst,
+                            edge_shifts,
+                            cell,
+                            strain=strain0,
+                            dispersion_edge_src=None if dispersion_edges is None else dispersion_edges[0],
+                            dispersion_edge_dst=None if dispersion_edges is None else dispersion_edges[1],
+                            dispersion_edge_shifts=None if dispersion_edges is None else dispersion_edges[2],
+                        )
                 else:
                     E_per_atom, grad0 = self._makefx_forward(
-                        pos, A, batch_idx, edge_src, edge_dst, edge_shifts, cell)
+                        pos,
+                        A,
+                        batch_idx,
+                        edge_src,
+                        edge_dst,
+                        edge_shifts,
+                        cell,
+                        dispersion_edge_src=None if dispersion_edges is None else dispersion_edges[0],
+                        dispersion_edge_dst=None if dispersion_edges is None else dispersion_edges[1],
+                        dispersion_edge_shifts=None if dispersion_edges is None else dispersion_edges[2],
+                    )
             except Exception as e:
                 object.__setattr__(self, "_makefx_disabled", True)
                 if self.require_train_makefx_compile:
@@ -607,7 +1084,16 @@ class ForceTrainer:
                 grad_targets = [pos_leaf, strain]
             else:
                 pos_in, cell_in, grad_targets = pos_leaf, cell, [pos_leaf]
-            out = self.model(pos_in, A, batch_idx, edge_src, edge_dst, edge_shifts, cell_in)
+            out = self.model(
+                pos_in,
+                A,
+                batch_idx,
+                edge_src,
+                edge_dst,
+                edge_shifts,
+                cell_in,
+                **self._model_dispersion_kwargs(dispersion_edges),
+            )
             E_per_atom = out[0] if isinstance(out, tuple) else out
             E_conv_mol = _mol_sum(E_per_atom).squeeze(-1)
             E_mean = E_conv_mol + E_offset_mol
@@ -814,6 +1300,9 @@ class ForceTrainer:
             self._stage_two_activated_step = ckpt.get(
                 "training_hyperparameters", {}
             ).get("stage_two_activated_step", self._stage_two_activated_step)
+            self._restore_dispersion_graph_observation(
+                ckpt.get("training_hyperparameters", {}).get("dispersion_training_graph_observation", None)
+            )
             log.warning(
                 "resumed optimizer/global_step from %s at epoch=%d step=%d; "
                 "scheduler history is not serialized, so stateful schedulers resume approximately",
@@ -851,8 +1340,11 @@ class ForceTrainer:
             improved = cur < best
             if improved:
                 best = cur
-            if self.main_process and self.checkpoint_path is not None and improved:
-                self.save_checkpoint(self.checkpoint_path, epoch=epoch)
+            should_save = self.checkpoint_path is not None and improved
+            if should_save:
+                self._sync_dispersion_graph_observation()
+                if self.main_process:
+                    self.save_checkpoint(self.checkpoint_path, epoch=epoch)
             if self._dist_ready():
                 dist.barrier()
             if self._reached_max_steps():
@@ -917,7 +1409,14 @@ class ForceTrainer:
                 "long_range_green_mode", "long_range_assignment",
                 "long_range_mesh_fft_full_ewald", "long_range_max_multipole_l",
                 "long_range_dispersion_mode", "long_range_dispersion", "dispersion_cutoff",
+                "dispersion_max_num_neighbors", "dispersion_neighbor_method",
+                "dispersion_bruteforce_threshold", "dispersion_allow_large_bruteforce_fallback",
+                "dispersion_training_graph_rule", "dispersion_deployment_graph_rule",
+                "dispersion_train_deploy_graph_compatibility",
                 "dispersion_slq_num_probes", "dispersion_slq_lanczos_steps",
+                "mbd_operator_backend", "mbd_pme_mesh_size", "mbd_pme_assignment",
+                "mbd_pme_k_norm_floor", "mbd_pme_assignment_window_floor",
+                "mbd_pme_ewald_alpha_prefactor",
             ):
                 if hasattr(base, attr):
                     val = getattr(base, attr)
@@ -944,6 +1443,24 @@ class ForceTrainer:
             # Explicit construction choices win (these are exactly what build_baseline_model
             # passed, so from_checkpoint rebuilds the same architecture).
             hp.update(self.extra_hparams)
+            from mace_ictd.models.dispersion import (
+                dispersion_deployment_graph_rule,
+                dispersion_train_deploy_graph_compatibility,
+                dispersion_training_graph_rule,
+            )
+
+            hp["dispersion_training_graph_rule"] = dispersion_training_graph_rule(
+                str(hp.get("long_range_dispersion_mode", "none")),
+                mbd_operator_backend=str(hp.get("mbd_operator_backend", "edge_sparse")),
+            )
+            hp["dispersion_deployment_graph_rule"] = dispersion_deployment_graph_rule(
+                str(hp.get("long_range_dispersion_mode", "none")),
+                mbd_operator_backend=str(hp.get("mbd_operator_backend", "edge_sparse")),
+            )
+            hp["dispersion_train_deploy_graph_compatibility"] = dispersion_train_deploy_graph_compatibility(
+                str(hp.get("long_range_dispersion_mode", "none")),
+                mbd_operator_backend=str(hp.get("mbd_operator_backend", "edge_sparse")),
+            )
             meta["model_hyperparameters"] = hp
         return meta
 
@@ -993,6 +1510,7 @@ class ForceTrainer:
             "checkpoint_state_source": self.checkpoint_state_source,
             "train_makefx_compile": self.train_makefx_compile,
             "makefx_max_slots": self._makefx_max_slots,
+            "dispersion_training_graph_observation": self._dispersion_graph_observation_summary(),
         }
 
     def _default_state_source(self):

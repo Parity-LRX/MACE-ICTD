@@ -44,6 +44,37 @@ def _fft_integer_frequencies(size: int, device: torch.device, dtype: torch.dtype
     return torch.fft.fftfreq(size, d=1.0 / float(size), device=device).to(dtype=dtype)
 
 
+def _safe_vector_norm(x: torch.Tensor, *, dim: int, floor: float) -> torch.Tensor:
+    return torch.sqrt(x.square().sum(dim=dim).clamp_min(float(floor) * float(floor)))
+
+
+def _inverse_3x3(cell: torch.Tensor, *, floor: float = 1.0e-12) -> torch.Tensor:
+    squeeze = cell.dim() == 2
+    m = cell.unsqueeze(0) if squeeze else cell
+    a = m[..., 0, :]
+    b = m[..., 1, :]
+    c = m[..., 2, :]
+    col0 = torch.cross(b, c, dim=-1)
+    col1 = torch.cross(c, a, dim=-1)
+    col2 = torch.cross(a, b, dim=-1)
+    det = (a * col0).sum(dim=-1)
+    det_floor = det.new_tensor(float(floor))
+    det_safe = torch.where(
+        det.abs() >= det_floor,
+        det,
+        torch.where(det >= 0.0, det_floor, -det_floor),
+    )
+    inv = torch.stack((col0, col1, col2), dim=-1) / det_safe[..., None, None]
+    return inv.squeeze(0) if squeeze else inv
+
+
+def _det_3x3(cell: torch.Tensor) -> torch.Tensor:
+    squeeze = cell.dim() == 2
+    m = cell.unsqueeze(0) if squeeze else cell
+    det = (m[..., 0, :] * torch.cross(m[..., 1, :], m[..., 2, :], dim=-1)).sum(dim=-1)
+    return det.squeeze(0) if squeeze else det
+
+
 def _effective_cell_for_boundary(
     cell: torch.Tensor,
     *,
@@ -54,7 +85,10 @@ def _effective_cell_for_boundary(
     effective_cell = cell.to(dtype=dtype)
     if boundary == "slab":
         effective_cell = effective_cell.clone()
-        effective_cell[2] = effective_cell[2] * float(max(int(slab_padding_factor), 1))
+        if effective_cell.dim() == 2:
+            effective_cell[2] = effective_cell[2] * float(max(int(slab_padding_factor), 1))
+        else:
+            effective_cell[:, 2] = effective_cell[:, 2] * float(max(int(slab_padding_factor), 1))
     return effective_cell
 
 
@@ -65,8 +99,30 @@ def _prepare_frac_for_boundary(
     boundary: str,
     slab_padding_factor: int,
 ) -> torch.Tensor:
-    inv_cell = torch.linalg.inv(cell)
+    inv_cell = _inverse_3x3(cell)
     frac = torch.einsum("ni,ij->nj", pos, inv_cell)
+    if boundary == "periodic":
+        return frac - torch.floor(frac)
+
+    frac = frac.clone()
+    frac[:, :2] = frac[:, :2] - torch.floor(frac[:, :2])
+    pad = float(max(int(slab_padding_factor), 1))
+    z_offset = 0.5 * (pad - 1.0) / pad
+    frac[:, 2] = frac[:, 2] / pad + z_offset
+    return frac
+
+
+def _prepare_frac_for_boundary_batched(
+    pos: torch.Tensor,
+    batch: torch.Tensor,
+    cell: torch.Tensor,
+    *,
+    boundary: str,
+    slab_padding_factor: int,
+) -> torch.Tensor:
+    inv_cell = _inverse_3x3(cell)
+    atom_inv_cell = inv_cell.index_select(0, batch)
+    frac = torch.einsum("ni,nij->nj", pos, atom_inv_cell)
     if boundary == "periodic":
         return frac - torch.floor(frac)
 
@@ -201,6 +257,38 @@ def _spread_source_to_mesh(
     return mesh
 
 
+def _spread_source_to_mesh_batched(
+    frac: torch.Tensor,
+    batch: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    num_graphs: int,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    boundary: str,
+) -> torch.Tensor:
+    channels = int(source.size(1))
+    mesh_points = mesh_size * mesh_size * mesh_size
+    flat_mesh = source.new_zeros((num_graphs * mesh_points, channels))
+    scaled = frac * float(mesh_size)
+    base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
+    idx = _apply_mesh_boundary(
+        base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
+        mesh_size=mesh_size,
+        boundary=boundary,
+    )
+    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
+    flat_idx = flat_idx + graph_offset
+    flat_mesh.scatter_add_(
+        0,
+        flat_idx.reshape(-1, 1).expand(-1, channels),
+        (source.unsqueeze(1) * stencil_weights.unsqueeze(-1)).reshape(-1, channels),
+    )
+    return flat_mesh.view(num_graphs, mesh_size, mesh_size, mesh_size, channels)
+
+
 def _gather_source_from_mesh(
     frac: torch.Tensor,
     mesh: torch.Tensor,
@@ -222,6 +310,301 @@ def _gather_source_from_mesh(
     flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
     gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
     return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
+
+
+def _gather_source_from_mesh_batched(
+    frac: torch.Tensor,
+    batch: torch.Tensor,
+    mesh: torch.Tensor,
+    *,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    boundary: str,
+) -> torch.Tensor:
+    channels = int(mesh.size(-1))
+    mesh_points = mesh_size * mesh_size * mesh_size
+    flat_mesh = mesh.reshape(-1, channels)
+    scaled = frac * float(mesh_size)
+    base, stencil_weights = _assignment_weights_from_scaled(scaled, assignment)
+    idx = _apply_mesh_boundary(
+        base.unsqueeze(1) + assignment_offsets.to(device=base.device).unsqueeze(0),
+        mesh_size=mesh_size,
+        boundary=boundary,
+    )
+    flat_idx = ((idx[..., 0] * mesh_size) + idx[..., 1]) * mesh_size + idx[..., 2]
+    graph_offset = batch.to(dtype=flat_idx.dtype).unsqueeze(-1) * mesh_points
+    flat_idx = flat_idx + graph_offset
+    gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).reshape(frac.size(0), -1, channels)
+    return (gathered * stencil_weights.unsqueeze(-1)).sum(dim=1)
+
+
+def build_periodic_dipole_pme_kernel(
+    *,
+    cell: torch.Tensor,
+    mesh_size: int,
+    assignment: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    k_norm_floor: float = 1.0e-6,
+    assignment_window_floor: float = 1.0e-6,
+    ewald_alpha_prefactor: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Precompute the periodic PME dipole-tensor spectral kernel for repeated matvecs."""
+    mesh_size = int(mesh_size)
+    if mesh_size <= 0:
+        raise ValueError("mesh_size must be positive")
+
+    freq = _fft_integer_frequencies(mesh_size, device=device, dtype=dtype)
+    kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+    integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
+    inv_cell = _inverse_3x3(cell.to(dtype=dtype))
+    k_cart = 2.0 * math.pi * torch.einsum("kd,dh->kh", integer_k, inv_cell.transpose(-1, -2))
+    k_norm = _safe_vector_norm(k_cart, dim=-1, floor=k_norm_floor)
+    k2 = k_norm.square()
+    volume = _det_3x3(cell.to(dtype=dtype)).abs().clamp_min(k_norm_floor)
+
+    window_1d = _assignment_window_1d(
+        mesh_size=mesh_size,
+        assignment=assignment,
+        device=device,
+        dtype=dtype,
+    )
+    wx, wy, wz = torch.meshgrid(window_1d, window_1d, window_1d, indexing="ij")
+    window = (wx * wy * wz).reshape(-1)
+    wdeconv = torch.reciprocal(window.clamp_min(assignment_window_floor).square())
+    real_cutoff = (0.5 * torch.linalg.vector_norm(cell.to(dtype=dtype), dim=-1).min()).clamp_min(k_norm_floor)
+    ewald_alpha = real_cutoff.new_tensor(float(ewald_alpha_prefactor)) / real_cutoff
+    spectral = (4.0 * math.pi / volume) * wdeconv * torch.exp(-k2 / (4.0 * ewald_alpha.square()))
+    spectral = torch.where(k_norm > k_norm_floor, spectral, torch.zeros_like(spectral))
+    return k_cart, k2, spectral
+
+
+def build_periodic_dipole_pme_kernel_batched(
+    *,
+    cell: torch.Tensor,
+    mesh_size: int,
+    assignment: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    k_norm_floor: float = 1.0e-6,
+    assignment_window_floor: float = 1.0e-6,
+    ewald_alpha_prefactor: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched variant of :func:`build_periodic_dipole_pme_kernel` for multi-graph FFTs."""
+    mesh_size = int(mesh_size)
+    if mesh_size <= 0:
+        raise ValueError("mesh_size must be positive")
+
+    cell_b = cell.reshape(-1, 3, 3).to(device=device, dtype=dtype)
+    freq = _fft_integer_frequencies(mesh_size, device=device, dtype=dtype)
+    kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
+    integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
+    inv_cell = _inverse_3x3(cell_b)
+    k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
+    k_norm = _safe_vector_norm(k_cart, dim=-1, floor=k_norm_floor)
+    k2 = k_norm.square()
+    volume = _det_3x3(cell_b).abs().clamp_min(k_norm_floor)
+
+    window_1d = _assignment_window_1d(
+        mesh_size=mesh_size,
+        assignment=assignment,
+        device=device,
+        dtype=dtype,
+    )
+    wx, wy, wz = torch.meshgrid(window_1d, window_1d, window_1d, indexing="ij")
+    window = (wx * wy * wz).reshape(1, -1)
+    wdeconv = torch.reciprocal(window.clamp_min(assignment_window_floor).square())
+    real_cutoff = (0.5 * torch.linalg.vector_norm(cell_b, dim=-1).min(dim=-1).values).clamp_min(k_norm_floor)
+    ewald_alpha = real_cutoff.new_tensor(float(ewald_alpha_prefactor)) / real_cutoff
+    spectral = (4.0 * math.pi / volume).unsqueeze(-1) * wdeconv
+    spectral = spectral * torch.exp(-k2 / (4.0 * ewald_alpha.unsqueeze(-1).square()))
+    spectral = torch.where(k_norm > k_norm_floor, spectral, torch.zeros_like(spectral))
+    return k_cart, k2, spectral
+
+
+def apply_periodic_dipole_pme_field(
+    frac: torch.Tensor,
+    dipoles: torch.Tensor,
+    *,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    k_cart: torch.Tensor,
+    k2: torch.Tensor,
+    spectral: torch.Tensor,
+    k_norm_floor: float = 1.0e-6,
+) -> torch.Tensor:
+    """Apply a precomputed periodic PME dipole-tensor kernel to vector dipoles."""
+    if dipoles.dim() != 3 or dipoles.size(-1) != 3:
+        raise ValueError("apply_periodic_dipole_pme_field expects dipoles with shape (N, C, 3)")
+    n_atoms, channels, _ = dipoles.shape
+    mesh = _spread_source_to_mesh(
+        frac,
+        dipoles.reshape(n_atoms, channels * 3),
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        boundary="periodic",
+    )
+    mesh_fft = torch.fft.fftn(mesh, dim=(0, 1, 2)).reshape(-1, channels, 3)
+    k_complex = k_cart.to(mesh_fft.dtype)
+    k_dot_m = (mesh_fft * k_complex.unsqueeze(1)).sum(dim=-1)
+    k2_safe = k2.clamp_min(float(k_norm_floor) * float(k_norm_floor)).to(mesh_fft.dtype).view(-1, 1)
+    field_fft = (
+        spectral.to(mesh_fft.dtype).view(-1, 1, 1)
+        * k_complex.unsqueeze(1)
+        * (k_dot_m / k2_safe).unsqueeze(-1)
+    )
+    field_mesh = torch.fft.ifftn(
+        field_fft.reshape(mesh_size, mesh_size, mesh_size, channels * 3),
+        dim=(0, 1, 2),
+    ).real * (float(mesh_size) ** 3)
+    gathered = _gather_source_from_mesh(
+        frac,
+        field_mesh,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        boundary="periodic",
+    )
+    return gathered.reshape(n_atoms, channels, 3)
+
+
+def apply_periodic_dipole_pme_field_batched(
+    frac: torch.Tensor,
+    batch: torch.Tensor,
+    dipoles: torch.Tensor,
+    *,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    k_cart: torch.Tensor,
+    k2: torch.Tensor,
+    spectral: torch.Tensor,
+    k_norm_floor: float = 1.0e-6,
+) -> torch.Tensor:
+    """Apply precomputed batched periodic PME dipole-tensor kernels."""
+    if dipoles.dim() != 3 or dipoles.size(-1) != 3:
+        raise ValueError("apply_periodic_dipole_pme_field_batched expects dipoles with shape (N, C, 3)")
+    n_atoms, channels, _ = dipoles.shape
+    num_graphs = int(k_cart.size(0))
+    mesh = _spread_source_to_mesh_batched(
+        frac,
+        batch,
+        dipoles.reshape(n_atoms, channels * 3),
+        num_graphs=num_graphs,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        boundary="periodic",
+    )
+    mesh_fft = torch.fft.fftn(mesh, dim=(1, 2, 3)).reshape(num_graphs, -1, channels, 3)
+    k_complex = k_cart.to(mesh_fft.dtype)
+    k_dot_m = (mesh_fft * k_complex.unsqueeze(2)).sum(dim=-1)
+    k2_safe = k2.clamp_min(float(k_norm_floor) * float(k_norm_floor)).to(mesh_fft.dtype).unsqueeze(-1)
+    field_fft = (
+        spectral.to(mesh_fft.dtype).unsqueeze(-1).unsqueeze(-1)
+        * k_complex.unsqueeze(2)
+        * (k_dot_m / k2_safe).unsqueeze(-1)
+    )
+    field_mesh = torch.fft.ifftn(
+        field_fft.reshape(num_graphs, mesh_size, mesh_size, mesh_size, channels * 3),
+        dim=(1, 2, 3),
+    ).real * (float(mesh_size) ** 3)
+    gathered = _gather_source_from_mesh_batched(
+        frac,
+        batch,
+        field_mesh,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        boundary="periodic",
+    )
+    return gathered.reshape(n_atoms, channels, 3)
+
+
+def periodic_dipole_pme_field(
+    frac: torch.Tensor,
+    dipoles: torch.Tensor,
+    *,
+    cell: torch.Tensor,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    k_norm_floor: float = 1.0e-6,
+    assignment_window_floor: float = 1.0e-6,
+    ewald_alpha_prefactor: float = 5.0,
+) -> torch.Tensor:
+    """Periodic PME dipole-tensor field shared by electrostatics and MBD prototypes.
+
+    ``dipoles`` has shape ``(N, C, 3)`` and the returned field has the same shape.
+    The helper intentionally covers only the periodic smooth reciprocal operator;
+    short-range damping, self terms, and SLQ/logdet logic remain with the caller.
+    """
+    if dipoles.dim() != 3 or dipoles.size(-1) != 3:
+        raise ValueError("periodic_dipole_pme_field expects dipoles with shape (N, C, 3)")
+    k_cart, k2, spectral = build_periodic_dipole_pme_kernel(
+        cell=cell,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        device=dipoles.device,
+        dtype=dipoles.dtype,
+        k_norm_floor=k_norm_floor,
+        assignment_window_floor=assignment_window_floor,
+        ewald_alpha_prefactor=ewald_alpha_prefactor,
+    )
+    return apply_periodic_dipole_pme_field(
+        frac,
+        dipoles,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        k_cart=k_cart,
+        k2=k2,
+        spectral=spectral,
+        k_norm_floor=k_norm_floor,
+    )
+
+
+def periodic_dipole_pme_field_batched(
+    frac: torch.Tensor,
+    batch: torch.Tensor,
+    dipoles: torch.Tensor,
+    *,
+    cell: torch.Tensor,
+    mesh_size: int,
+    assignment: str,
+    assignment_offsets: torch.Tensor,
+    k_norm_floor: float = 1.0e-6,
+    assignment_window_floor: float = 1.0e-6,
+    ewald_alpha_prefactor: float = 5.0,
+) -> torch.Tensor:
+    """Batched periodic PME dipole-tensor field for multi-graph long-range prototypes."""
+    if dipoles.dim() != 3 or dipoles.size(-1) != 3:
+        raise ValueError("periodic_dipole_pme_field_batched expects dipoles with shape (N, C, 3)")
+    k_cart, k2, spectral = build_periodic_dipole_pme_kernel_batched(
+        cell=cell,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        device=dipoles.device,
+        dtype=dipoles.dtype,
+        k_norm_floor=k_norm_floor,
+        assignment_window_floor=assignment_window_floor,
+        ewald_alpha_prefactor=ewald_alpha_prefactor,
+    )
+    return apply_periodic_dipole_pme_field_batched(
+        frac,
+        batch,
+        dipoles,
+        mesh_size=mesh_size,
+        assignment=assignment,
+        assignment_offsets=assignment_offsets,
+        k_cart=k_cart,
+        k2=k2,
+        spectral=spectral,
+        k_norm_floor=k_norm_floor,
+    )
 
 
 class FeatureSpectralFilterGrid(nn.Module):
@@ -263,16 +646,23 @@ class FeatureSpectralFilterGrid(nn.Module):
         kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
         effective_cell = self._effective_cell(cell, dtype=dtype)
-        inv_cell = torch.linalg.inv(effective_cell)
+        inv_cell = _inverse_3x3(effective_cell)
         # k = 2*pi * m @ inv(cell)^T (transpose required for O(3) equivariance on non-orthogonal
         # cells; without it |k| -- hence the radial filter -- is not rotation-invariant). No-op for
         # orthogonal cells. Matches the long-range build_k_norms / _build_k_cart_flat convention.
         k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
-        return torch.linalg.vector_norm(k_cart, dim=-1).reshape(self.mesh_size, self.mesh_size, self.mesh_size)
+        if cell.dim() == 2:
+            return _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor).reshape(
+                self.mesh_size, self.mesh_size, self.mesh_size
+            )
+        return _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor).reshape(
+            cell.size(0), self.mesh_size, self.mesh_size, self.mesh_size
+        )
 
     def forward(self, mesh: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         mesh_dtype = mesh.dtype
-        mesh_complex = torch.fft.fftn(mesh, dim=(0, 1, 2))
+        fft_dims = (0, 1, 2) if mesh.dim() == 4 else (1, 2, 3)
+        mesh_complex = torch.fft.fftn(mesh, dim=fft_dims)
         k_norms = self.build_k_norms(cell, dtype=mesh_dtype)
         spectral_weights = self.radial_filter(k_norms)
         if not self.include_k0:
@@ -282,10 +672,8 @@ class FeatureSpectralFilterGrid(nn.Module):
                 torch.zeros_like(spectral_weights),
             )
         channel_scale = torch.nn.functional.softplus(self.channel_scale_raw).to(dtype=mesh_dtype)
-        filtered = torch.fft.ifftn(
-            mesh_complex * spectral_weights.unsqueeze(-1) * channel_scale.view(1, 1, 1, -1),
-            dim=(0, 1, 2),
-        )
+        channel_view = channel_scale.view(*([1] * (mesh.dim() - 1)), -1)
+        filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1) * channel_view, dim=fft_dims)
         return filtered.real
 
 
@@ -332,55 +720,49 @@ class FeatureSpectralResidualBlock(nn.Module):
         assignment_offsets = _build_assignment_offsets(self.assignment)
         self.register_buffer("assignment_offsets", assignment_offsets, persistent=False)
 
-    def _neutralize_source(self, source: torch.Tensor) -> torch.Tensor:
+    def _neutralize_source_batched(self, source: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
         if not self.neutralize:
             return source
-        return source - source.mean(dim=0, keepdim=True)
+        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
+        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
+        counts = graph_mask.sum(dim=0).clamp_min(1.0).unsqueeze(-1)
+        graph_mean = torch.einsum("nb,nc->bc", graph_mask, source) / counts
+        return source - graph_mean.index_select(0, batch)
 
-    def _effective_cell(self, cell: torch.Tensor) -> torch.Tensor:
-        return _effective_cell_for_boundary(
-            cell,
-            boundary=self.boundary,
-            slab_padding_factor=self.slab_padding_factor,
-            dtype=cell.dtype,
-        )
-
-    def _prepare_frac(self, pos: torch.Tensor, cell: torch.Tensor) -> torch.Tensor:
-        return _prepare_frac_for_boundary(
+    def _filter_batched(
+        self,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
+        cell: torch.Tensor,
+        source: torch.Tensor,
+    ) -> torch.Tensor:
+        frac = _prepare_frac_for_boundary_batched(
             pos,
+            batch,
             cell,
             boundary=self.boundary,
             slab_padding_factor=self.slab_padding_factor,
         )
-
-    def _apply_boundary(self, idx: torch.Tensor) -> torch.Tensor:
-        return _apply_mesh_boundary(idx, mesh_size=self.mesh_size, boundary=self.boundary)
-
-    def _spread_to_mesh(self, frac: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-        return _spread_source_to_mesh(
+        mesh = _spread_source_to_mesh_batched(
             frac,
+            batch,
             source,
+            num_graphs=cell.size(0),
             mesh_size=self.mesh_size,
             assignment=self.assignment,
             assignment_offsets=self.assignment_offsets,
             boundary=self.boundary,
         )
-
-    def _gather_from_mesh(self, frac: torch.Tensor, mesh: torch.Tensor) -> torch.Tensor:
-        return _gather_source_from_mesh(
-            frac,
-            mesh,
-            mesh_size=self.mesh_size,
-            assignment=self.assignment,
-            assignment_offsets=self.assignment_offsets,
-            boundary=self.boundary,
-        )
-
-    def _filter_single_graph(self, pos: torch.Tensor, cell: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-        frac = self._prepare_frac(pos, cell)
-        mesh = self._spread_to_mesh(frac, source)
         filtered_mesh = self.mesh_filter(mesh, cell)
-        return self._gather_from_mesh(frac, filtered_mesh)
+        return _gather_source_from_mesh_batched(
+            frac,
+            batch,
+            filtered_mesh,
+            mesh_size=self.mesh_size,
+            assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets,
+            boundary=self.boundary,
+        )
 
     def forward(
         self,
@@ -390,21 +772,7 @@ class FeatureSpectralResidualBlock(nn.Module):
         cell: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         source = self.in_proj(self.input_norm(invariant_features))
-        filtered_source = torch.zeros_like(source)
-
-        for graph_idx in range(cell.size(0)):
-            node_index = torch.nonzero(batch == graph_idx, as_tuple=False).view(-1)
-            if node_index.numel() == 0:
-                continue
-            filtered_source.index_copy_(
-                0,
-                node_index,
-                self._filter_single_graph(
-                    pos.index_select(0, node_index),
-                    cell[graph_idx],
-                    self._neutralize_source(source.index_select(0, node_index)),
-                ),
-            )
+        filtered_source = self._filter_batched(pos, batch, cell, self._neutralize_source_batched(source, batch, cell))
 
         residual = self.out_proj(filtered_source)
         gated_residual = torch.tanh(self.gate).to(dtype=residual.dtype) * residual
@@ -493,11 +861,11 @@ class ReciprocalSpectralKernel3D(nn.Module):
         return int(self.integer_k_lattice.shape[0])
 
     def build_k_lattice(self, cell: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        inv_cells = torch.linalg.inv(cell)
+        inv_cells = _inverse_3x3(cell)
         k_lattice = self.integer_k_lattice.to(device=cell.device, dtype=cell.dtype)
         k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", k_lattice, inv_cells)
-        k_norms = torch.linalg.vector_norm(k_cart, dim=-1)
-        volumes = torch.abs(torch.linalg.det(cell)).clamp_min(self.k_norm_floor)
+        k_norms = _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor)
+        volumes = torch.abs(_det_3x3(cell)).clamp_min(self.k_norm_floor)
         return k_cart, k_norms, volumes
 
     def compute_structure_factor(
@@ -507,7 +875,7 @@ class ReciprocalSpectralKernel3D(nn.Module):
         cell: torch.Tensor,
         source: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        inv_cells = torch.linalg.inv(cell)
+        inv_cells = _inverse_3x3(cell)
         atom_inv_cells = inv_cells.index_select(0, batch)
         frac = torch.einsum("ni,nij->nj", pos, atom_inv_cells)
         k_lattice = self.integer_k_lattice.to(device=pos.device, dtype=pos.dtype)
@@ -608,12 +976,12 @@ class MeshLongRangeKernel3D(nn.Module):
         assignment_offsets = _build_assignment_offsets(self.assignment)
         self.register_buffer("assignment_offsets", assignment_offsets, persistent=False)
         self.register_buffer("real_space_shift_index", self._init_real_space_shifts(), persistent=False)
+        periodic_axis_index = torch.tensor(
+            [axis for axis, enabled in enumerate(self._periodic_axes()) if enabled],
+            dtype=torch.long,
+        )
+        self.register_buffer("periodic_axis_index", periodic_axis_index, persistent=False)
         self.register_buffer("_assignment_window_cache", torch.empty(0), persistent=False)
-        self.register_buffer("_cached_spectral_cell", torch.empty(0), persistent=False)
-        self.register_buffer("_cached_spectral_weights", torch.empty(0), persistent=False)
-        self.register_buffer("_cached_spectral_alpha", torch.empty(0), persistent=False)
-        self.register_buffer("_cached_spectral_volume", torch.empty(0), persistent=False)
-        self.register_buffer("_cached_spectral_real_cutoff", torch.empty(0), persistent=False)
 
     @property
     def num_k(self) -> int:
@@ -625,11 +993,10 @@ class MeshLongRangeKernel3D(nn.Module):
             return True, True, True
         return True, True, False
 
-    def _estimate_real_cutoff(self, cell: torch.Tensor) -> torch.Tensor:
-        periodic_axes = torch.tensor(self._periodic_axes(), device=cell.device, dtype=torch.bool)
-        periodic_vectors = cell[periodic_axes]
+    def _estimate_real_cutoff_batched(self, cell: torch.Tensor) -> torch.Tensor:
+        periodic_vectors = cell.index_select(1, self.periodic_axis_index.to(device=cell.device))
         periodic_lengths = torch.linalg.vector_norm(periodic_vectors, dim=-1)
-        return 0.5 * periodic_lengths.min().clamp_min(self.k_norm_floor)
+        return 0.5 * periodic_lengths.min(dim=-1).values.clamp_min(self.k_norm_floor)
 
     def _estimate_ewald_alpha(self, real_cutoff: torch.Tensor) -> torch.Tensor:
         return real_cutoff.new_tensor(self.ewald_alpha_prefactor) / real_cutoff.clamp_min(self.k_norm_floor)
@@ -657,7 +1024,7 @@ class MeshLongRangeKernel3D(nn.Module):
         self._assignment_window_cache = window
         return window
 
-    def build_k_norms(self, cell: torch.Tensor, *, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def build_k_norms_batched(self, cell: torch.Tensor, *, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         effective_cell = _effective_cell_for_boundary(
             cell,
             boundary=self.boundary,
@@ -667,36 +1034,36 @@ class MeshLongRangeKernel3D(nn.Module):
         freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
         kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
-        inv_cell = torch.linalg.inv(effective_cell)
-        # Physical reciprocal vector for integer index m is k = 2*pi * m @ inv(cell)^T (so that
-        # k.r == 2*pi * m . frac). The transpose is required for O(3) equivariance on non-orthogonal
-        # cells -- without it |k| is not rotation-invariant (matches _build_k_cart_flat and the C++
-        # build_local_k_cart). On orthogonal cells inv(cell) is symmetric so this is a no-op.
-        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
-        k_norms = torch.linalg.vector_norm(k_cart, dim=-1).reshape(self.mesh_size, self.mesh_size, self.mesh_size)
-        volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
+        inv_cell = _inverse_3x3(effective_cell)
+        k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
+        k_norms = _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor).reshape(
+            cell.size(0), self.mesh_size, self.mesh_size, self.mesh_size
+        )
+        volume = torch.abs(_det_3x3(effective_cell)).clamp_min(self.k_norm_floor)
         return k_norms, volume
 
-    def _build_k_cart_flat(self, cell: torch.Tensor, *, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Cartesian k-vectors (mesh^3, 3), their norms (mesh^3,), and the (effective) cell volume.
-
-        Same lattice/convention as build_k_norms, but keeps the k vectors (needed for the multipole
-        k.mu / k.Q.k terms)."""
+    def _build_k_cart_flat_batched(
+        self,
+        cell: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         effective_cell = _effective_cell_for_boundary(
             cell, boundary=self.boundary, slab_padding_factor=self.slab_padding_factor, dtype=dtype
         )
         freq = _fft_integer_frequencies(self.mesh_size, device=cell.device, dtype=dtype)
         kx, ky, kz = torch.meshgrid(freq, freq, freq, indexing="ij")
         integer_k = torch.stack([kx, ky, kz], dim=-1).reshape(-1, 3)
-        inv_cell = torch.linalg.inv(effective_cell)
-        # Physical reciprocal vector for integer index m is k = 2*pi * m @ inv(cell)^T, so that
-        # k.r == 2*pi * m . frac (frac = pos @ inv(cell)) -- matches the spread/FFT phase. Using
-        # inv(cell) (no transpose) only coincides for symmetric cells; a rotated cell breaks the
-        # k.mu / k.Q.k equivariance otherwise.
-        k_cart = 2.0 * math.pi * torch.matmul(integer_k, inv_cell.transpose(-1, -2))
-        k_norms = torch.linalg.vector_norm(k_cart, dim=-1)
-        volume = torch.abs(torch.linalg.det(effective_cell)).clamp_min(self.k_norm_floor)
+        inv_cell = _inverse_3x3(effective_cell)
+        k_cart = 2.0 * math.pi * torch.einsum("kd,bdh->bkh", integer_k, inv_cell.transpose(-1, -2))
+        k_norms = _safe_vector_norm(k_cart, dim=-1, floor=self.k_norm_floor)
+        volume = torch.abs(_det_3x3(effective_cell)).clamp_min(self.k_norm_floor)
         return k_cart, k_norms, volume
+
+    def _graph_counts(self, batch: torch.Tensor, cell: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
+        graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=dtype)
+        return graph_mask.sum(dim=0).clamp_min(1.0)
 
     def multipole_energy(
         self,
@@ -716,204 +1083,189 @@ class MeshLongRangeKernel3D(nn.Module):
         iFFT 1/N normalization that the potential route needs compensated, and it reduces to the
         plain reciprocal monopole sum when dipole/quadrupole are None. Per-graph, uniform partition.
         """
-        atom_energy = source.new_zeros((source.size(0), 1))
-        for graph_idx in range(cell.size(0)):
-            node_index = torch.nonzero(batch == graph_idx, as_tuple=False).view(-1)
-            n_local = int(node_index.numel())
-            if n_local == 0:
-                continue
-            local_pos = pos.index_select(0, node_index)
-            local_source = source.index_select(0, node_index)
-            src_c = int(local_source.size(1))
-            frac = _prepare_frac_for_boundary(
-                local_pos, cell[graph_idx], boundary=self.boundary, slab_padding_factor=self.slab_padding_factor
-            )
-            k_cart, k_norms_flat, volume = self._build_k_cart_flat(cell[graph_idx], dtype=local_pos.dtype)
-            green = self.green_kernel(k_norms_flat)
-            window = self._build_assignment_window(device=local_pos.device, dtype=local_pos.dtype).reshape(-1)
-            wdeconv = torch.reciprocal(window.clamp_min(self.assignment_window_floor).square())
-            spectral = green / volume * wdeconv
-            if self.full_ewald:
-                # Ewald Gaussian screening exp(-k^2/4a^2): band-limits the reciprocal sum so
-                # the coarse mesh can represent it -> accurate + (sub-grid) translation-stable.
-                # (Mirrors the monopole _build_reciprocal_spectral_weights path; without it the
-                # bare 4*pi/k^2 kernel has large CIC/mesh translation error.)
-                real_cutoff = self._estimate_real_cutoff(cell[graph_idx])
-                alpha = self._estimate_ewald_alpha(real_cutoff)
-                spectral = spectral * torch.exp(-(k_norms_flat.square()) / (4.0 * alpha * alpha))
-            spectral = torch.where(k_norms_flat > self.k_norm_floor, spectral, torch.zeros_like(spectral))
+        return self._multipole_energy_batched(pos, batch, cell, source, dipole, quadrupole)
 
-            def _spread_fft(field: torch.Tensor) -> torch.Tensor:
-                mesh = _spread_source_to_mesh(
-                    frac, field, mesh_size=self.mesh_size, assignment=self.assignment,
-                    assignment_offsets=self.assignment_offsets, boundary=self.boundary,
-                )
-                return torch.fft.fftn(mesh, dim=(0, 1, 2)).reshape(-1, field.size(1))
-
-            S = _spread_fft(local_source).reshape(-1, src_c)  # (K, src) complex
-            if dipole is not None:
-                mut = _spread_fft(dipole.index_select(0, node_index).reshape(n_local, src_c * 3)).reshape(-1, src_c, 3)
-                S = S + 1j * torch.einsum("kx,ksx->ks", k_cart.to(mut.dtype), mut)
-            if quadrupole is not None:
-                qt = _spread_fft(quadrupole.index_select(0, node_index).reshape(n_local, src_c * 9)).reshape(-1, src_c, 3, 3)
-                S = S - 0.5 * torch.einsum("kx,ksxy,ky->ks", k_cart.to(qt.dtype), qt, k_cart.to(qt.dtype))
-            e_graph = 0.5 * (spectral.unsqueeze(-1) * S.abs().square()).sum()
-            atom_energy.index_copy_(0, node_index, (e_graph / n_local).reshape(1, 1).expand(n_local, 1))
-        return atom_energy
-
-    def _can_use_spectral_cache(self, cell: torch.Tensor, *, dtype: torch.dtype) -> bool:
-        if self.green_mode != "poisson" or self.training or torch.is_grad_enabled():
-            return False
-        cached_cell = self._cached_spectral_cell
-        return (
-            cached_cell.numel() == cell.numel()
-            and cached_cell.device == cell.device
-            and cached_cell.dtype == dtype
-            and torch.equal(cached_cell, cell.to(dtype=dtype))
-        )
-
-    def _build_reciprocal_spectral_weights(
+    def _multipole_energy_batched(
         self,
+        pos: torch.Tensor,
+        batch: torch.Tensor,
         cell: torch.Tensor,
-        *,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-        if self._can_use_spectral_cache(cell, dtype=dtype):
-            alpha = self._cached_spectral_alpha if self.full_ewald and self._cached_spectral_alpha.numel() else None
-            real_cutoff = (
-                self._cached_spectral_real_cutoff
-                if self.full_ewald and self._cached_spectral_real_cutoff.numel()
-                else None
-            )
-            return self._cached_spectral_weights, alpha, self._cached_spectral_volume, real_cutoff
+        source: torch.Tensor,
+        dipole: torch.Tensor | None,
+        quadrupole: torch.Tensor | None,
+    ) -> torch.Tensor:
+        src_c = source.size(1)
+        frac = _prepare_frac_for_boundary_batched(
+            pos,
+            batch,
+            cell,
+            boundary=self.boundary,
+            slab_padding_factor=self.slab_padding_factor,
+        )
+        k_cart, k_norms_flat, volume = self._build_k_cart_flat_batched(cell, dtype=pos.dtype)
+        green = self.green_kernel(k_norms_flat)
+        window = self._build_assignment_window(device=pos.device, dtype=pos.dtype).reshape(1, -1)
+        wdeconv = torch.reciprocal(window.clamp_min(self.assignment_window_floor).square())
+        spectral = green / volume.unsqueeze(-1) * wdeconv
+        if self.full_ewald:
+            real_cutoff = self._estimate_real_cutoff_batched(cell.to(dtype=pos.dtype))
+            alpha = self._estimate_ewald_alpha(real_cutoff)
+            spectral = spectral * torch.exp(-(k_norms_flat.square()) / (4.0 * alpha.unsqueeze(-1).square()))
+        spectral = torch.where(k_norms_flat > self.k_norm_floor, spectral, torch.zeros_like(spectral))
 
+        def _spread_fft(field: torch.Tensor) -> torch.Tensor:
+            mesh = _spread_source_to_mesh_batched(
+                frac,
+                batch,
+                field,
+                num_graphs=cell.size(0),
+                mesh_size=self.mesh_size,
+                assignment=self.assignment,
+                assignment_offsets=self.assignment_offsets,
+                boundary=self.boundary,
+            )
+            return torch.fft.fftn(mesh, dim=(1, 2, 3)).reshape(cell.size(0), -1, field.size(1)).contiguous()
+
+        S = _spread_fft(source).reshape(cell.size(0), -1, src_c)
+        S_real = S.real
+        S_imag = S.imag
+        if dipole is not None:
+            mut = _spread_fft(dipole.reshape(source.size(0), src_c * 3)).reshape(cell.size(0), -1, src_c, 3)
+            dipole_term = torch.einsum("bkx,bksx->bks", k_cart.to(mut.dtype), mut)
+            S_real = S_real - dipole_term.imag
+            S_imag = S_imag + dipole_term.real
+        if quadrupole is not None:
+            qt = _spread_fft(quadrupole.reshape(source.size(0), src_c * 9)).reshape(cell.size(0), -1, src_c, 3, 3)
+            k_complex = k_cart.to(qt.dtype)
+            quadrupole_term = torch.einsum("bkx,bksxy,bky->bks", k_complex, qt, k_complex)
+            S_real = S_real - 0.5 * quadrupole_term.real
+            S_imag = S_imag - 0.5 * quadrupole_term.imag
+        e_graph = 0.5 * (spectral.unsqueeze(-1) * (S_real.square() + S_imag.square())).sum(dim=(1, 2))
+        counts = self._graph_counts(batch, cell, dtype=source.dtype)
+        return (e_graph.index_select(0, batch) / counts.index_select(0, batch)).unsqueeze(-1)
+
+    def apply_green_kernel_batched(
+        self,
+        mesh: torch.Tensor,
+        cell: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        mesh_dtype = mesh.dtype
+        mesh_complex = torch.fft.fftn(mesh, dim=(1, 2, 3))
+        k_norms, volume = self.build_k_norms_batched(cell, dtype=mesh_dtype)
+        spectral_weights = self.green_kernel(k_norms) / volume.view(-1, 1, 1, 1)
         real_cutoff = None
         alpha = None
-        k_norms, volume = self.build_k_norms(cell, dtype=dtype)
-        spectral_weights = self.green_kernel(k_norms) / volume
         if self.full_ewald:
-            real_cutoff = self._estimate_real_cutoff(cell.to(dtype=dtype))
+            real_cutoff = self._estimate_real_cutoff_batched(cell.to(dtype=mesh_dtype))
             alpha = self._estimate_ewald_alpha(real_cutoff)
-            spectral_weights = spectral_weights * torch.exp(-(k_norms.square()) / (4.0 * alpha * alpha))
+            spectral_weights = spectral_weights * torch.exp(
+                -(k_norms.square()) / (4.0 * alpha.view(-1, 1, 1, 1).square())
+            )
         if self.full_ewald or self.assignment != "cic":
-            assignment_window = self._build_assignment_window(device=cell.device, dtype=dtype)
+            assignment_window = self._build_assignment_window(device=cell.device, dtype=mesh_dtype)
             assignment_scale = torch.reciprocal(assignment_window.clamp_min(self.assignment_window_floor).square())
-            spectral_weights = spectral_weights * assignment_scale
+            spectral_weights = spectral_weights * assignment_scale.unsqueeze(0)
         if self.full_ewald or (not self.include_k0):
             spectral_weights = torch.where(
                 k_norms > self.k_norm_floor,
                 spectral_weights,
                 torch.zeros_like(spectral_weights),
             )
-        if self.green_mode == "poisson" and (not self.training) and (not torch.is_grad_enabled()):
-            self._cached_spectral_cell = cell.to(dtype=dtype).detach().clone()
-            self._cached_spectral_weights = spectral_weights.detach().clone()
-            self._cached_spectral_volume = volume.detach().clone()
-            if alpha is None:
-                self._cached_spectral_alpha = volume.new_empty((0,))
-                self._cached_spectral_real_cutoff = volume.new_empty((0,))
-            else:
-                self._cached_spectral_alpha = alpha.detach().clone().reshape(())
-                self._cached_spectral_real_cutoff = real_cutoff.detach().clone().reshape(())
-        return spectral_weights, alpha, volume, real_cutoff
-
-    def apply_green_kernel(
-        self,
-        mesh: torch.Tensor,
-        cell: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-        mesh_dtype = mesh.dtype
-        mesh_complex = torch.fft.fftn(mesh, dim=(0, 1, 2))
-        spectral_weights, alpha, volume, real_cutoff = self._build_reciprocal_spectral_weights(cell, dtype=mesh_dtype)
-        filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(0, 1, 2))
+        filtered = torch.fft.ifftn(mesh_complex * spectral_weights.unsqueeze(-1), dim=(1, 2, 3))
         # Compensate torch.fft.ifftn's 1/N normalization (N = mesh_size**3). The forward FFT of
         # the spread charges already yields the structure factor S(k), so the iFFT's 1/N factor
-        # is spurious here -- without it the reciprocal potential/energy comes out mesh_size**3
-        # too small (verified exactly: E_mesh * mesh_size**3 == the analytic bare reciprocal sum,
-        # and full_ewald reproduces the NaCl Madelung constant to ~0.1% only with this factor).
+        # is spurious here.
         filtered = filtered * (float(self.mesh_size) ** 3)
         return filtered.real, alpha, volume, real_cutoff
 
-    def _compute_real_space_potential(
+    def _compute_real_space_potential_batched(
         self,
         pos: torch.Tensor,
         source: torch.Tensor,
+        batch: torch.Tensor,
         cell: torch.Tensor,
         *,
         alpha: torch.Tensor,
         real_cutoff: torch.Tensor,
     ) -> torch.Tensor:
-        if pos.size(0) == 0:
-            return source.new_zeros(source.shape)
         shift_index = self.real_space_shift_index.to(device=cell.device)
-        shift_cart = torch.matmul(shift_index.to(dtype=pos.dtype), cell.to(dtype=pos.dtype))
-        disp = pos.unsqueeze(1).unsqueeze(2) - pos.unsqueeze(0).unsqueeze(2) - shift_cart.unsqueeze(0).unsqueeze(0)
-        distance = torch.linalg.vector_norm(disp, dim=-1)
-        kernel = torch.special.erfc(alpha * distance) / distance.clamp_min(self.k_norm_floor)
-        valid = distance <= real_cutoff
+        atom_cell = cell.index_select(0, batch).to(dtype=pos.dtype)
+        shift_cart = torch.einsum("sd,ndh->nsh", shift_index.to(dtype=pos.dtype), atom_cell)
+        disp = pos.unsqueeze(1).unsqueeze(2) - pos.unsqueeze(0).unsqueeze(2) - shift_cart.unsqueeze(1)
+        distance = _safe_vector_norm(disp, dim=-1, floor=self.k_norm_floor)
+        alpha_atom = alpha.index_select(0, batch).to(dtype=pos.dtype).view(-1, 1, 1)
+        cutoff_atom = real_cutoff.index_select(0, batch).to(dtype=pos.dtype).view(-1, 1, 1)
+        kernel = torch.special.erfc(alpha_atom * distance) / distance.clamp_min(self.k_norm_floor)
+        same_graph = (batch.unsqueeze(1) == batch.unsqueeze(0)).unsqueeze(-1)
+        valid = (distance <= cutoff_atom) & same_graph
+        atom_ids = torch.arange(pos.size(0), device=pos.device)
         zero_shift = (shift_index == 0).all(dim=1)
-        self_mask = torch.eye(pos.size(0), device=pos.device, dtype=torch.bool).unsqueeze(-1) & zero_shift.view(1, 1, -1)
+        self_mask = (atom_ids.unsqueeze(1) == atom_ids.unsqueeze(0)).unsqueeze(-1) & zero_shift.view(1, 1, -1)
         kernel = kernel * (valid & (~self_mask)).to(dtype=source.dtype)
         pair_kernel = kernel.sum(dim=-1)
         return torch.matmul(pair_kernel, source)
 
     def forward(self, pos: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
-        atom_energy = source.new_zeros((source.size(0), 1))
-        counts = torch.bincount(batch, minlength=cell.size(0)).to(dtype=source.dtype).clamp_min(1.0)
-        for graph_idx in range(cell.size(0)):
-            node_index = torch.nonzero(batch == graph_idx, as_tuple=False).view(-1)
-            if node_index.numel() == 0:
-                continue
-            local_pos = pos.index_select(0, node_index)
-            local_source = source.index_select(0, node_index)
-            local_frac = _prepare_frac_for_boundary(
-                local_pos,
-                cell[graph_idx],
-                boundary=self.boundary,
-                slab_padding_factor=self.slab_padding_factor,
+        return self._forward_batched(pos, batch, cell, source)
+
+    def _forward_batched(self, pos: torch.Tensor, batch: torch.Tensor, cell: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        frac = _prepare_frac_for_boundary_batched(
+            pos,
+            batch,
+            cell,
+            boundary=self.boundary,
+            slab_padding_factor=self.slab_padding_factor,
+        )
+        mesh = _spread_source_to_mesh_batched(
+            frac,
+            batch,
+            source,
+            num_graphs=cell.size(0),
+            mesh_size=self.mesh_size,
+            assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets,
+            boundary=self.boundary,
+        )
+        potential_mesh, alpha, effective_volume, real_cutoff = self.apply_green_kernel_batched(mesh, cell)
+        reciprocal_potential = _gather_source_from_mesh_batched(
+            frac,
+            batch,
+            potential_mesh,
+            mesh_size=self.mesh_size,
+            assignment=self.assignment,
+            assignment_offsets=self.assignment_offsets,
+            boundary=self.boundary,
+        )
+        total_potential = reciprocal_potential
+        if self.full_ewald and not self.reciprocal_only:
+            assert alpha is not None and real_cutoff is not None
+            real_space_potential = self._compute_real_space_potential_batched(
+                pos,
+                source,
+                batch,
+                cell,
+                alpha=alpha,
+                real_cutoff=real_cutoff,
             )
-            mesh = _spread_source_to_mesh(
-                local_frac,
-                local_source,
-                mesh_size=self.mesh_size,
-                assignment=self.assignment,
-                assignment_offsets=self.assignment_offsets,
-                boundary=self.boundary,
+            alpha_atom = alpha.index_select(0, batch).to(dtype=source.dtype).unsqueeze(-1)
+            self_potential = (-2.0 * alpha_atom / math.sqrt(math.pi)) * source
+            graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
+            graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
+            net_source = torch.einsum("nb,nc->bc", graph_mask, source)
+            background_graph = (
+                -math.pi
+                * net_source
+                / (alpha.to(dtype=source.dtype).square().unsqueeze(-1) * effective_volume.to(dtype=source.dtype).unsqueeze(-1))
             )
-            potential_mesh, alpha, effective_volume, real_cutoff = self.apply_green_kernel(mesh, cell[graph_idx])
-            reciprocal_potential = _gather_source_from_mesh(
-                local_frac,
-                potential_mesh,
-                mesh_size=self.mesh_size,
-                assignment=self.assignment,
-                assignment_offsets=self.assignment_offsets,
-                boundary=self.boundary,
-            )
-            total_potential = reciprocal_potential
-            if self.full_ewald and not self.reciprocal_only:
-                assert alpha is not None and real_cutoff is not None
-                real_space_potential = self._compute_real_space_potential(
-                    local_pos,
-                    local_source,
-                    cell[graph_idx],
-                    alpha=alpha.to(dtype=local_pos.dtype),
-                    real_cutoff=real_cutoff.to(dtype=local_pos.dtype),
-                )
-                self_potential = (
-                    -2.0 * alpha.to(dtype=local_source.dtype) / math.sqrt(math.pi)
-                ) * local_source
-                net_source = local_source.sum(dim=0, keepdim=True)
-                background_potential = (
-                    -math.pi
-                    * net_source
-                    / (alpha.to(dtype=local_source.dtype).square() * effective_volume.to(dtype=local_source.dtype))
-                )
-                total_potential = reciprocal_potential + real_space_potential + self_potential + background_potential
-            atom_energy_local = 0.5 * (local_source * total_potential).sum(dim=-1, keepdim=True)
-            if self.energy_partition == "uniform":
-                graph_total = atom_energy_local.sum()
-                atom_energy_local = graph_total.expand_as(atom_energy_local) / counts[graph_idx]
-            atom_energy.index_copy_(0, node_index, atom_energy_local)
+            background_potential = background_graph.index_select(0, batch)
+            total_potential = reciprocal_potential + real_space_potential + self_potential + background_potential
+        atom_energy = 0.5 * (source * total_potential).sum(dim=-1, keepdim=True)
+        if self.energy_partition == "uniform":
+            graph_ids = torch.arange(cell.size(0), device=batch.device, dtype=batch.dtype)
+            graph_mask = (batch.unsqueeze(1) == graph_ids.unsqueeze(0)).to(dtype=source.dtype)
+            graph_total = torch.einsum("nb,nc->bc", graph_mask, atom_energy).squeeze(-1)
+            counts = graph_mask.sum(dim=0).clamp_min(1.0)
+            atom_energy = (graph_total.index_select(0, batch) / counts.index_select(0, batch)).unsqueeze(-1)
         return atom_energy
 
 

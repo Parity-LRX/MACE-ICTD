@@ -3,6 +3,32 @@
 import torch
 
 
+_DISPERSION_EDGE_ALIASES = (
+    ("dispersion_edge_src", "disp_edge_src"),
+    ("dispersion_edge_dst", "disp_edge_dst"),
+    ("dispersion_edge_shifts", "disp_edge_shifts"),
+)
+
+
+def _get_first_present(mapping, names):
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return mapping[name]
+    return None
+
+
+def _append_dispersion_edges(out, mapping, node_offset):
+    values = [_get_first_present(mapping, names) for names in _DISPERSION_EDGE_ALIASES]
+    if not any(v is not None for v in values):
+        return False
+    if not all(v is not None for v in values):
+        raise ValueError("dispersion_edge_src, dispersion_edge_dst, and dispersion_edge_shifts must be provided together")
+    out.setdefault("dispersion_edge_src", []).append(values[0] + node_offset)
+    out.setdefault("dispersion_edge_dst", []).append(values[1] + node_offset)
+    out.setdefault("dispersion_edge_shifts", []).append(values[2])
+    return True
+
+
 def my_collate_fn(batch_list):
     """
     Collate function for CustomDataset.
@@ -61,8 +87,16 @@ def my_collate_fn(batch_list):
         
         num_nodes_accumulated += num_atoms
 
+        has_dispersion_edges = _append_dispersion_edges(extras_out, extras or {}, num_nodes_accumulated - num_atoms)
+
         # Graph-level extras (optional)
         for k, v in (extras or {}).items():
+            if has_dispersion_edges and k in {
+                "dispersion_edge_src", "disp_edge_src",
+                "dispersion_edge_dst", "disp_edge_dst",
+                "dispersion_edge_shifts", "disp_edge_shifts",
+            }:
+                continue
             extras_out.setdefault(k, []).append(v)
             extras_masks.setdefault(k, []).append(torch.tensor(True))
 
@@ -80,11 +114,14 @@ def my_collate_fn(batch_list):
     )
     extras_batch = {}
     for k, vs in extras_out.items():
-        try:
-            extras_batch[k] = torch.stack(vs, dim=0)
-        except Exception:
-            extras_batch[k] = torch.tensor(vs)
-        extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
+        if k in {"dispersion_edge_src", "dispersion_edge_dst", "dispersion_edge_shifts"}:
+            extras_batch[k] = torch.cat(vs, dim=0)
+        else:
+            try:
+                extras_batch[k] = torch.stack(vs, dim=0)
+            except Exception:
+                extras_batch[k] = torch.tensor(vs)
+            extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
     # 向后兼容：无 extras 时返回 10 元组，有 extras 时返回 11 元组
     return base + (extras_batch,) if extras_batch else base
 
@@ -140,6 +177,8 @@ def collate_fn_h5(batch_list):
         
         node_offset += num_nodes
 
+        _append_dispersion_edges(extras_lists, data, node_offset - num_nodes)
+
         # Optional extras (graph-level Cartesian labels / global tensors)
         for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in data:
@@ -168,7 +207,9 @@ def collate_fn_h5(batch_list):
     )
     extras_batch = {}
     for k, vs in extras_lists.items():
-        if k in per_node_keys:
+        if k in {"dispersion_edge_src", "dispersion_edge_dst", "dispersion_edge_shifts"}:
+            extras_batch[k] = torch.cat(vs, dim=0)
+        elif k in per_node_keys:
             extras_batch[k] = torch.cat(vs, dim=0)
             extras_batch[f"{k}_mask"] = torch.cat(extras_masks[k], dim=0).to(dtype=torch.bool)
         else:
@@ -220,6 +261,8 @@ def on_the_fly_collate(batch_list):
         
         num_nodes_accum += num_atoms
 
+        _append_dispersion_edges(extras_lists, item, num_nodes_accum - num_atoms)
+
         for k in ("charge", "fidelity_id", "dipole", "magnetic_moment", "polarizability", "quadrupole", "external_field", "magnetic_field"):
             if k in item:
                 extras_lists.setdefault(k, []).append(item[k])
@@ -239,10 +282,13 @@ def on_the_fly_collate(batch_list):
     )
     extras_batch = {}
     for k, vs in extras_lists.items():
-        try:
-            extras_batch[k] = torch.stack(vs, dim=0)
-        except Exception:
-            extras_batch[k] = torch.tensor(vs)
-        extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
+        if k in {"dispersion_edge_src", "dispersion_edge_dst", "dispersion_edge_shifts"}:
+            extras_batch[k] = torch.cat(vs, dim=0)
+        else:
+            try:
+                extras_batch[k] = torch.stack(vs, dim=0)
+            except Exception:
+                extras_batch[k] = torch.tensor(vs)
+            extras_batch[f"{k}_mask"] = torch.stack(extras_masks[k], dim=0).to(dtype=torch.bool)
     # 向后兼容：无 extras 时返回 10 元组，有 extras 时返回 11 元组
     return base + (extras_batch,) if extras_batch else base

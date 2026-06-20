@@ -80,6 +80,83 @@ inline int nearest_int(double x) {
   return (x >= 0.0) ? static_cast<int>(x + 0.5) : static_cast<int>(x - 0.5);
 }
 
+inline bool lexicographic_positive_shift(int sx, int sy, int sz) {
+  return sx > 0 || (sx == 0 && sy > 0) || (sx == 0 && sy == 0 && sz > 0);
+}
+
+inline bool keep_canonical_mbd_edge(int src, int dst, int sx, int sy, int sz) {
+  return src < dst || (src == dst && lexicographic_positive_shift(sx, sy, sz));
+}
+
+inline double norm3(double x, double y, double z) {
+  return std::sqrt(x * x + y * y + z * z);
+}
+
+inline double periodic_face_height(const CellGeom& geom, int axis) {
+  const double ax = geom.cell[0][0], ay = geom.cell[0][1], az = geom.cell[0][2];
+  const double bx = geom.cell[1][0], by = geom.cell[1][1], bz = geom.cell[1][2];
+  const double cx = geom.cell[2][0], cy = geom.cell[2][1], cz = geom.cell[2][2];
+  const double det = ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+  const double volume = std::abs(det);
+  if (axis == 0) return volume / std::max(norm3(by * cz - bz * cy, bz * cx - bx * cz, bx * cy - by * cx), 1.0e-12);
+  if (axis == 1) return volume / std::max(norm3(cy * az - cz * ay, cz * ax - cx * az, cx * ay - cy * ax), 1.0e-12);
+  return volume / std::max(norm3(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx), 1.0e-12);
+}
+
+void validate_mbd_dispersion_single_image_cutoff(
+    Error *error, const CellGeom& geom, double dispersion_cutoff, const char *style_name) {
+  const double tol = 1.0e-9 * std::max(1.0, dispersion_cutoff);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!geom.pbc[axis]) continue;
+    const double height = periodic_face_height(geom, axis);
+    if (2.0 * dispersion_cutoff > height + tol) {
+      error->all(
+          FLERR,
+          (std::string(style_name) +
+           " MBD dispersion cutoff is too large for the runtime nearest-image dispersion graph: "
+           "2*dispersion_cutoff=" + std::to_string(2.0 * dispersion_cutoff) +
+           " exceeds periodic face height " + std::to_string(height) +
+           ". LAMMPS mff/torch deployment cannot represent the exact multi-image/self-image "
+           "MBD graph used by the Python brute-force small-cell path; use a larger cell, a smaller "
+           "dispersion cutoff, or a future PME/cuFFT MBD backend.")
+              .c_str());
+    }
+  }
+}
+
+void sort_edge_vectors(std::vector<int64_t>& src, std::vector<int64_t>& dst, std::vector<float>& shifts) {
+  const size_t n = src.size();
+  if (n <= 1) return;
+  std::vector<size_t> order(n);
+  for (size_t i = 0; i < n; ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    if (dst[a] != dst[b]) return dst[a] < dst[b];
+    if (src[a] != src[b]) return src[a] < src[b];
+    for (int k = 0; k < 3; ++k) {
+      const float sa = shifts[3 * a + static_cast<size_t>(k)];
+      const float sb = shifts[3 * b + static_cast<size_t>(k)];
+      if (sa != sb) return sa < sb;
+    }
+    return a < b;
+  });
+  std::vector<int64_t> src_sorted;
+  std::vector<int64_t> dst_sorted;
+  std::vector<float> shifts_sorted;
+  src_sorted.reserve(n);
+  dst_sorted.reserve(n);
+  shifts_sorted.reserve(3 * n);
+  for (size_t idx : order) {
+    src_sorted.push_back(src[idx]);
+    dst_sorted.push_back(dst[idx]);
+    shifts_sorted.push_back(shifts[3 * idx + 0]);
+    shifts_sorted.push_back(shifts[3 * idx + 1]);
+    shifts_sorted.push_back(shifts[3 * idx + 2]);
+  }
+  src.swap(src_sorted);
+  dst.swap(dst_sorted);
+  shifts.swap(shifts_sorted);
+}
+
 mfftorch::ReciprocalInputs make_reciprocal_inputs(
     MPI_Comm world,
     const torch::Tensor& local_pos,
@@ -387,6 +464,25 @@ double PairMFFTorch::init_one(int i, int j) {
 void PairMFFTorch::validate_external_field_configuration() {
   if (!engine_) return;
 
+  const double model_dispersion_cutoff = engine_->dispersion_cutoff();
+  if (engine_->requires_mbd_dispersion_edges()) {
+    if (dispersion_cut_global_ <= 0.0) {
+      error->all(FLERR,
+                 "core.pt/.pt2 was trained/exported with MBD dispersion_cutoff > 0, but pair_style "
+                 "mff/torch was not given a dispersion neighbor list. Add 'dispersion <cutoff>' "
+                 "with the checkpoint dispersion_cutoff.");
+    }
+    const double tol = 1.0e-6 * std::max(1.0, std::abs(model_dispersion_cutoff));
+    if (std::abs(dispersion_cut_global_ - model_dispersion_cutoff) > tol) {
+      error->all(
+          FLERR,
+          ("pair_style mff/torch dispersion cutoff (" + std::to_string(dispersion_cut_global_) +
+           ") does not match the model MBD dispersion_cutoff (" + std::to_string(model_dispersion_cutoff) +
+           "); use the trained cutoff so deployment and training build the same dispersion graph rule.")
+              .c_str());
+    }
+  }
+
   if (use_external_field_) {
     if (!engine_->accepts_external_tensor()) {
       error->all(FLERR,
@@ -622,6 +718,9 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   }
 
   const CellGeom geom = build_cell_geom(domain);
+  if (engine_->requires_mbd_dispersion_edges()) {
+    validate_mbd_dispersion_single_image_cutoff(error, geom, dispersion_cut_global_, "pair_style mff/torch");
+  }
   float cell_cpu[9] = {
       static_cast<float>(geom.cell[0][0]), static_cast<float>(geom.cell[0][1]), static_cast<float>(geom.cell[0][2]),
       static_cast<float>(geom.cell[1][0]), static_cast<float>(geom.cell[1][1]), static_cast<float>(geom.cell[1][2]),
@@ -723,10 +822,11 @@ void PairMFFTorch::compute(int eflag, int vflag) {
           buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sy));
           buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sz));
         }
-        // MBD/SLQ-MBD consumes an undirected oscillator graph. Keep only one
-        // canonical orientation; the Python term would zero the reverse half
-        // anyway, and AOTI's dynamic sparse path is more stable with this form.
-        if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ && jl < i) {
+        // MBD/SLQ-MBD consumes one representative of
+        // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep the
+        // lexicographically positive shift half, matching the Python builder.
+        if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ &&
+            keep_canonical_mbd_edge(jl, i, out_sx, out_sy, out_sz)) {
           buf_disp_edge_src_cpu_.push_back(static_cast<int64_t>(jl));
           buf_disp_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
           buf_disp_edge_shifts_cpu_.push_back(static_cast<float>(out_sx));
@@ -821,10 +921,11 @@ void PairMFFTorch::compute(int eflag, int vflag) {
         buf_edge_shifts_cpu_.push_back(static_cast<float>(-sy));
         buf_edge_shifts_cpu_.push_back(static_cast<float>(-sz));
       }
-      // MBD/SLQ-MBD consumes an undirected oscillator graph. Keep only one
-      // canonical orientation; the Python term would zero the reverse half
-      // anyway, and AOTI's dynamic sparse path is more stable with this form.
-      if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ && j < i) {
+      // MBD/SLQ-MBD consumes one representative of
+      // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep the
+      // lexicographically positive shift half, matching the Python builder.
+      if (use_dispersion_edges && rsq <= dispersion_cutsq_global_ &&
+          keep_canonical_mbd_edge(j, i, -sx, -sy, -sz)) {
         buf_disp_edge_src_cpu_.push_back(static_cast<int64_t>(j));
         buf_disp_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
         buf_disp_edge_shifts_cpu_.push_back(static_cast<float>(-sx));
@@ -837,7 +938,13 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 
   const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
   const int64_t Edisp = use_dispersion_edges ? static_cast<int64_t>(buf_disp_edge_src_cpu_.size()) : 0;
-  if (E <= 1 && (!use_dispersion_edges || Edisp <= 1)) return;
+  // Do not skip one-edge graphs: canonical MBD/SLQ-MBD represents a two-atom
+  // oscillator coupling with exactly one undirected dispersion edge.
+  if (E == 0 && (!use_dispersion_edges || Edisp == 0)) return;
+  sort_edge_vectors(buf_edge_src_cpu_, buf_edge_dst_cpu_, buf_edge_shifts_cpu_);
+  if (use_dispersion_edges) {
+    sort_edge_vectors(buf_disp_edge_src_cpu_, buf_disp_edge_dst_cpu_, buf_disp_edge_shifts_cpu_);
+  }
   auto validate_edge_bounds = [&](const std::vector<int64_t>& src, const std::vector<int64_t>& dst,
                                   const char* label) {
     for (size_t k = 0; k < src.size(); ++k) {
@@ -968,7 +1075,6 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 	        reciprocal_out = use_tree_fmm ? tree_fmm_solver_->compute(reciprocal_inputs)
 	                                      : reciprocal_solver_->compute(reciprocal_inputs);
 	      }
-	      torch::GradMode::set_enabled(false);
 	      if (std::getenv("MFF_SYNC_AFTER_RECIPROCAL") && reciprocal_device.is_cuda()) {
 	        torch::cuda::synchronize();
 	      }

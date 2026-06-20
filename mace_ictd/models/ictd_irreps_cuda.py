@@ -57,15 +57,17 @@ def _exact_cuda_matmul_mode(sample: torch.Tensor):
     if sample.device.type != "cuda":
         yield
         return
-    old_matmul = torch.backends.cuda.matmul.allow_tf32
-    old_cudnn = torch.backends.cudnn.allow_tf32
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     try:
         yield
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_matmul
-        torch.backends.cudnn.allow_tf32 = old_cudnn
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 def grouped_tp_cuda_ext_support_reason(

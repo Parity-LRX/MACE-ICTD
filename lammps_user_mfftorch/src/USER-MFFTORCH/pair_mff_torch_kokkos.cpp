@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 using namespace LAMMPS_NS;
 
@@ -79,6 +80,85 @@ CellGeom build_cell_geom(const LAMMPS_NS::Domain* domain) {
 KOKKOS_INLINE_FUNCTION
 int nearest_int_device(const float x) {
   return (x >= 0.0f) ? static_cast<int>(x + 0.5f) : static_cast<int>(x - 0.5f);
+}
+
+KOKKOS_INLINE_FUNCTION
+bool lexicographic_positive_shift(const int sx, const int sy, const int sz) {
+  return sx > 0 || (sx == 0 && sy > 0) || (sx == 0 && sy == 0 && sz > 0);
+}
+
+KOKKOS_INLINE_FUNCTION
+bool keep_canonical_mbd_edge(const int src, const int dst, const int sx, const int sy, const int sz) {
+  return src < dst || (src == dst && lexicographic_positive_shift(sx, sy, sz));
+}
+
+double norm3_host(double x, double y, double z) {
+  return std::sqrt(x * x + y * y + z * z);
+}
+
+double periodic_face_height(const CellGeom& geom, int axis) {
+  const double ax = geom.cell[0][0], ay = geom.cell[0][1], az = geom.cell[0][2];
+  const double bx = geom.cell[1][0], by = geom.cell[1][1], bz = geom.cell[1][2];
+  const double cx = geom.cell[2][0], cy = geom.cell[2][1], cz = geom.cell[2][2];
+  const double det = ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+  const double volume = std::abs(det);
+  if (axis == 0) return volume / std::max(norm3_host(by * cz - bz * cy, bz * cx - bx * cz, bx * cy - by * cx), 1.0e-12);
+  if (axis == 1) return volume / std::max(norm3_host(cy * az - cz * ay, cz * ax - cx * az, cx * ay - cy * ax), 1.0e-12);
+  return volume / std::max(norm3_host(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx), 1.0e-12);
+}
+
+void validate_mbd_dispersion_single_image_cutoff(
+    Error *error, const CellGeom& geom, double dispersion_cutoff, const char *style_name) {
+  const double tol = 1.0e-9 * std::max(1.0, dispersion_cutoff);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!geom.pbc[axis]) continue;
+    const double height = periodic_face_height(geom, axis);
+    if (2.0 * dispersion_cutoff > height + tol) {
+      error->all(
+          FLERR,
+          (std::string(style_name) +
+           " MBD dispersion cutoff is too large for the runtime nearest-image dispersion graph: "
+           "2*dispersion_cutoff=" + std::to_string(2.0 * dispersion_cutoff) +
+           " exceeds periodic face height " + std::to_string(height) +
+           ". LAMMPS mff/torch deployment cannot represent the exact multi-image/self-image "
+           "MBD graph used by the Python brute-force small-cell path; use a larger cell, a smaller "
+           "dispersion cutoff, or a future PME/cuFFT MBD backend.")
+              .c_str());
+    }
+  }
+}
+
+void sort_edge_vectors(std::vector<int64_t>& src, std::vector<int64_t>& dst, std::vector<float>& shifts) {
+  const size_t n = src.size();
+  if (n <= 1) return;
+  std::vector<size_t> order(n);
+  for (size_t i = 0; i < n; ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    if (dst[a] != dst[b]) return dst[a] < dst[b];
+    if (src[a] != src[b]) return src[a] < src[b];
+    for (int k = 0; k < 3; ++k) {
+      const float sa = shifts[3 * a + static_cast<size_t>(k)];
+      const float sb = shifts[3 * b + static_cast<size_t>(k)];
+      if (sa != sb) return sa < sb;
+    }
+    return a < b;
+  });
+  std::vector<int64_t> src_sorted;
+  std::vector<int64_t> dst_sorted;
+  std::vector<float> shifts_sorted;
+  src_sorted.reserve(n);
+  dst_sorted.reserve(n);
+  shifts_sorted.reserve(3 * n);
+  for (size_t idx : order) {
+    src_sorted.push_back(src[idx]);
+    dst_sorted.push_back(dst[idx]);
+    shifts_sorted.push_back(shifts[3 * idx + 0]);
+    shifts_sorted.push_back(shifts[3 * idx + 1]);
+    shifts_sorted.push_back(shifts[3 * idx + 2]);
+  }
+  src.swap(src_sorted);
+  dst.swap(dst_sorted);
+  shifts.swap(shifts_sorted);
 }
 
 mfftorch::ReciprocalInputs make_reciprocal_inputs(
@@ -282,8 +362,12 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
   auto d_ilist = k_list->d_ilist;
 	  const int inum = list->inum;
 	  auto dev = engine_->device();
-	  const CellGeom geom = build_cell_geom(domain);
-	  const bool host_stage_aoti_dispersion =
+		  const CellGeom geom = build_cell_geom(domain);
+		  if (engine_->requires_mbd_dispersion_edges()) {
+		    validate_mbd_dispersion_single_image_cutoff(
+		        error, geom, dispersion_cut_global_, "pair_style mff/torch/kk");
+		  }
+		  const bool host_stage_aoti_dispersion =
 	      fold && engine_->is_aoti_mode() && engine_->aoti_takes_dispersion_edges() && dispersion_cut_global_ > 0.0;
 	  if (host_stage_aoti_dispersion) {
 	    Kokkos::fence();
@@ -368,7 +452,8 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 	          buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sy));
 	          buf_edge_shifts_cpu_.push_back(static_cast<float>(out_sz));
 	        }
-	        if (rsq <= dispersion_cutsq_global_ && jl < i) {
+	        if (rsq <= dispersion_cutsq_global_ &&
+	            keep_canonical_mbd_edge(jl, i, out_sx, out_sy, out_sz)) {
 	          buf_disp_edge_src_cpu_.push_back(static_cast<int64_t>(jl));
 	          buf_disp_edge_dst_cpu_.push_back(static_cast<int64_t>(i));
 	          buf_disp_edge_shifts_cpu_.push_back(static_cast<float>(out_sx));
@@ -380,7 +465,11 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 
 	    const int64_t E = static_cast<int64_t>(buf_edge_src_cpu_.size());
 	    const int64_t Edisp = static_cast<int64_t>(buf_disp_edge_src_cpu_.size());
-	    if (E <= 1 && Edisp <= 1) return;
+	    // Canonical MBD/SLQ-MBD can have exactly one dispersion edge for a
+	    // two-atom graph; that is a valid model call, not an empty system.
+	    if (E == 0 && Edisp == 0) return;
+	    sort_edge_vectors(buf_edge_src_cpu_, buf_edge_dst_cpu_, buf_edge_shifts_cpu_);
+	    sort_edge_vectors(buf_disp_edge_src_cpu_, buf_disp_edge_dst_cpu_, buf_disp_edge_shifts_cpu_);
 	    auto make_i64 = [](const std::vector<int64_t> &v) {
 	      auto t = torch::empty({static_cast<int64_t>(v.size())}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
 	      if (!v.empty()) std::memcpy(t.data_ptr<int64_t>(), v.data(), v.size() * sizeof(int64_t));
@@ -575,7 +664,7 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
       },
       Etotal);
   finish_segment(edge_count_ms);
-  if (Etotal <= 1) return;
+  if (Etotal == 0) return;
 
   // Exclusive-scan offsets on device; reuse cached view when inum unchanged.
   if (cached_inum_ != inum) {
@@ -729,10 +818,10 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
             edge_shifts_v(idx, 1) = 0.0f;
             edge_shifts_v(idx, 2) = 0.0f;
           }
-          // MBD/SLQ-MBD consumes an undirected oscillator graph. Keep only one
-          // canonical orientation; the Python term would zero the reverse half
-          // anyway, and AOTI's dynamic sparse path is more stable with this form.
-          const bool keep_disp = keep_disp_raw && src < i;
+          // MBD/SLQ-MBD consumes one representative of
+          // (src, dst, shift) ~ (dst, src, -shift).  Self-image couplings keep
+          // the lexicographically positive shift half, matching the Python builder.
+          const bool keep_disp = keep_disp_raw && keep_canonical_mbd_edge(src, i, -out_sx, -out_sy, -out_sz);
           if (keep_disp) {
             disp_edge_src_v(idx) = static_cast<int64_t>(src);
             disp_edge_dst_v(idx) = static_cast<int64_t>(i);
@@ -759,7 +848,8 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
     disp_valid_mask = buf_disp_edge_src_.ge(0);
     Edispfiltered = disp_valid_mask.sum().item<int64_t>();
   }
-  if (Efiltered <= 1 && (!use_dispersion_edges || Edispfiltered <= 1)) return;
+  // Keep one-edge graphs alive for canonical MBD/SLQ-MBD.
+  if (Efiltered == 0 && (!use_dispersion_edges || Edispfiltered == 0)) return;
   if (Efiltered != Etotal) {
     auto valid_idx = torch::nonzero(valid_mask).view({-1});
     buf_edge_src_ = buf_edge_src_.index_select(0, valid_idx);
@@ -775,17 +865,23 @@ void PairMFFTorchKokkos<DeviceType>::compute(int eflag_in, int vflag_in) {
 	    buf_disp_edge_shifts_ = buf_disp_edge_shifts_.index_select(0, disp_valid_idx);
 	    cached_Etotal_ = -1;
 	  }
-	  auto sort_edges_by_dst_src = [nmodel](torch::Tensor &src, torch::Tensor &dst, torch::Tensor &shifts) {
+	  auto sort_edges_by_dst_src_shift = [nmodel](torch::Tensor &src, torch::Tensor &dst, torch::Tensor &shifts) {
 	    if (!src.defined() || src.numel() <= 1) return;
+	    auto shift_i64 = shifts.to(torch::kInt64);
+	    const auto max_abs = shift_i64.abs().max().item<int64_t>();
+	    const int64_t base = 2 * max_abs + 1;
 	    auto key = dst * static_cast<int64_t>(nmodel) + src;
+	    key = key * base + (shift_i64.select(1, 0) + max_abs);
+	    key = key * base + (shift_i64.select(1, 1) + max_abs);
+	    key = key * base + (shift_i64.select(1, 2) + max_abs);
 	    auto order = torch::argsort(key);
 	    src = src.index_select(0, order).contiguous();
 	    dst = dst.index_select(0, order).contiguous();
 	    shifts = shifts.index_select(0, order).contiguous();
 	  };
-	  sort_edges_by_dst_src(buf_edge_src_, buf_edge_dst_, buf_edge_shifts_);
+	  sort_edges_by_dst_src_shift(buf_edge_src_, buf_edge_dst_, buf_edge_shifts_);
 	  if (use_dispersion_edges) {
-	    sort_edges_by_dst_src(buf_disp_edge_src_, buf_disp_edge_dst_, buf_disp_edge_shifts_);
+	    sort_edges_by_dst_src_shift(buf_disp_edge_src_, buf_disp_edge_dst_, buf_disp_edge_shifts_);
 	  }
 	  if (std::getenv("MFF_VALIDATE_GRAPH") || std::getenv("MFF_DUMP_GRAPH")) {
     auto edge_src_cpu = buf_edge_src_.to(torch::kCPU, torch::kInt64).contiguous();

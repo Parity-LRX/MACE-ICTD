@@ -2130,8 +2130,18 @@ class PureCartesianICTDFix(nn.Module):
         long_range_dispersion: bool = False,
         long_range_dispersion_mode: str | None = None,
         dispersion_cutoff: float = 10.0,
+        dispersion_max_num_neighbors: int | None = None,
+        dispersion_neighbor_method: str = "auto",
+        dispersion_bruteforce_threshold: int = 1024,
+        dispersion_allow_large_bruteforce_fallback: bool = False,
         dispersion_slq_num_probes: int = 8,
         dispersion_slq_lanczos_steps: int = 16,
+        mbd_operator_backend: str = "edge_sparse",
+        mbd_pme_mesh_size: int = 16,
+        mbd_pme_assignment: str = "cic",
+        mbd_pme_k_norm_floor: float = 1.0e-6,
+        mbd_pme_assignment_window_floor: float = 1.0e-6,
+        mbd_pme_ewald_alpha_prefactor: float = 5.0,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -2644,16 +2654,41 @@ class PureCartesianICTDFix(nn.Module):
         )
         self.long_range_dispersion = self.long_range_dispersion_mode != "none"
         self.dispersion_cutoff = float(dispersion_cutoff)
+        if dispersion_max_num_neighbors is not None and int(dispersion_max_num_neighbors) < 0:
+            raise ValueError("dispersion_max_num_neighbors must be >= 0 or None")
+        self.dispersion_max_num_neighbors = (
+            None if dispersion_max_num_neighbors is None or int(dispersion_max_num_neighbors) == 0
+            else int(dispersion_max_num_neighbors)
+        )
+        self.dispersion_neighbor_method = str(dispersion_neighbor_method)
+        self.dispersion_bruteforce_threshold = int(dispersion_bruteforce_threshold)
+        self.dispersion_allow_large_bruteforce_fallback = bool(dispersion_allow_large_bruteforce_fallback)
         self.dispersion_slq_num_probes = int(dispersion_slq_num_probes)
         self.dispersion_slq_lanczos_steps = int(dispersion_slq_lanczos_steps)
+        self.mbd_operator_backend = str(mbd_operator_backend)
+        self.mbd_pme_mesh_size = int(mbd_pme_mesh_size)
+        self.mbd_pme_assignment = str(mbd_pme_assignment)
+        self.mbd_pme_k_norm_floor = float(mbd_pme_k_norm_floor)
+        self.mbd_pme_assignment_window_floor = float(mbd_pme_assignment_window_floor)
+        self.mbd_pme_ewald_alpha_prefactor = float(mbd_pme_ewald_alpha_prefactor)
         self.dispersion_pbc = str(long_range_boundary) == "periodic"
         self.dispersion = build_long_range_dispersion(
             mode=self.long_range_dispersion_mode,
             feature_dim=self.channels,
             cutoff=self.dispersion_cutoff,
             pbc=self.dispersion_pbc,
+            neighbor_method=self.dispersion_neighbor_method,
+            bruteforce_threshold=self.dispersion_bruteforce_threshold,
+            allow_large_bruteforce_fallback=self.dispersion_allow_large_bruteforce_fallback,
             slq_num_probes=self.dispersion_slq_num_probes,
             slq_lanczos_steps=self.dispersion_slq_lanczos_steps,
+            max_num_neighbors=self.dispersion_max_num_neighbors,
+            mbd_operator_backend=self.mbd_operator_backend,
+            mbd_pme_mesh_size=self.mbd_pme_mesh_size,
+            mbd_pme_assignment=self.mbd_pme_assignment,
+            mbd_pme_k_norm_floor=self.mbd_pme_k_norm_floor,
+            mbd_pme_assignment_window_floor=self.mbd_pme_assignment_window_floor,
+            mbd_pme_ewald_alpha_prefactor=self.mbd_pme_ewald_alpha_prefactor,
         )
 
         # Optional fixed scale/shift on the network (short-range) per-atom interaction energy.

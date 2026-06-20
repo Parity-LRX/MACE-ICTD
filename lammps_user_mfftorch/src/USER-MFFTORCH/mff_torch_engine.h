@@ -85,6 +85,15 @@ class MFFTorchEngine {
   double long_range_energy_scale() const { return long_range_energy_scale_; }
   bool long_range_mesh_fft_full_ewald() const { return long_range_mesh_fft_full_ewald_; }
   double long_range_ewald_alpha_prefactor() const { return long_range_ewald_alpha_prefactor_; }
+  const std::string& long_range_dispersion_mode() const { return long_range_dispersion_mode_; }
+  const std::string& dispersion_training_graph_rule() const { return dispersion_training_graph_rule_; }
+  const std::string& dispersion_deployment_graph_rule() const { return dispersion_deployment_graph_rule_; }
+  const std::string& mbd_operator_backend() const { return mbd_operator_backend_; }
+  double dispersion_cutoff() const { return dispersion_cutoff_; }
+  bool requires_mbd_dispersion_edges() const {
+    return dispersion_deployment_graph_rule_ == "explicit_canonical_single_image_edge_sparse" &&
+           dispersion_cutoff_ > 0.0;
+  }
   const std::string& tensor_product_mode() const { return tensor_product_mode_; }
   bool prefers_kokkos_host_staging() const { return tensor_product_mode_ == "spherical-save-cue"; }
   bool is_aoti_mode() const { return aoti_mode_; }
@@ -143,6 +152,8 @@ class MFFTorchEngine {
   bool have_ts_fallback_ = false;   // core_ holds an N-flexible TorchScript core for ntotal > nmax_
   bool aoti_fallback_warned_ = false;
   bool aoti_takes_dispersion_edges_arg_ = false;
+  bool aoti_reload_warned_ = false;
+  std::string aoti_package_path_;
   bool loaded_ = false;
   bool bundle_mode_ = false;
   std::string bundle_manifest_path_;
@@ -186,6 +197,11 @@ class MFFTorchEngine {
   // MeshLongRangeKernel3D.multipole_energy full_ewald branch): alpha = prefactor / (0.5*Lmin).
   bool long_range_mesh_fft_full_ewald_ = false;
   double long_range_ewald_alpha_prefactor_ = 5.0;
+  std::string long_range_dispersion_mode_ = "none";
+  std::string dispersion_training_graph_rule_ = "none";
+  std::string dispersion_deployment_graph_rule_ = "none";
+  std::string mbd_operator_backend_ = "edge_sparse";
+  double dispersion_cutoff_ = 0.0;
   int64_t trace_num_nodes_ = 0;
   int64_t trace_num_edges_ = 0;
 

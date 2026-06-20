@@ -811,7 +811,9 @@ def main():
     device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', rank)}" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
     if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     def _infer_physical_tensor_outputs_from_state_dict(sd: dict) -> dict | None:
         per_name: dict[str, dict[int, int]] = {}

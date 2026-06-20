@@ -57,8 +57,21 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "long_range_dispersion_mode": "none",
     "long_range_dispersion": False,
     "dispersion_cutoff": 10.0,
+    "dispersion_max_num_neighbors": None,
+    "dispersion_neighbor_method": "auto",
+    "dispersion_bruteforce_threshold": 1024,
+    "dispersion_allow_large_bruteforce_fallback": False,
+    "dispersion_training_graph_rule": "none",
+    "dispersion_deployment_graph_rule": "none",
+    "dispersion_train_deploy_graph_compatibility": "none",
     "dispersion_slq_num_probes": 8,
     "dispersion_slq_lanczos_steps": 16,
+    "mbd_operator_backend": "edge_sparse",
+    "mbd_pme_mesh_size": 16,
+    "mbd_pme_assignment": "cic",
+    "mbd_pme_k_norm_floor": 1.0e-6,
+    "mbd_pme_assignment_window_floor": 1.0e-6,
+    "mbd_pme_ewald_alpha_prefactor": 5.0,
     "long_range_theta": 0.5,
     "long_range_leaf_size": 32,
     "long_range_multipole_order": 0,
@@ -93,6 +106,74 @@ DEFAULT_MODEL_ARCHITECTURE: dict[str, Any] = {
     "energy_output_shift": 0.0,
     "external_tensor_specs": None,
 }
+
+SUPPORTED_DISPERSION_NEIGHBOR_METHODS = {"auto", "cell", "bruteforce"}
+
+
+def validate_dispersion_deployment_graph_rule(
+    *,
+    long_range_dispersion_mode: str,
+    mbd_operator_backend: str,
+    raw_rule: Any | None,
+    source_label: str = "dispersion_deployment_graph_rule",
+) -> str:
+    """Return the expected deployment graph rule and reject inconsistent metadata."""
+    from mace_ictd.models.dispersion import dispersion_deployment_graph_rule
+
+    expected = dispersion_deployment_graph_rule(
+        long_range_dispersion_mode,
+        mbd_operator_backend=mbd_operator_backend,
+    )
+    if raw_rule is not None and str(raw_rule) != expected:
+        raise ValueError(
+            f"{source_label} {str(raw_rule)!r} does not match long_range_dispersion_mode="
+            f"{long_range_dispersion_mode!r} and mbd_operator_backend={mbd_operator_backend!r}"
+        )
+    return expected
+
+
+def validate_dispersion_training_graph_rule(
+    *,
+    long_range_dispersion_mode: str,
+    mbd_operator_backend: str,
+    raw_rule: Any | None,
+    source_label: str = "dispersion_training_graph_rule",
+) -> str:
+    """Return the expected training graph rule and reject inconsistent metadata."""
+    from mace_ictd.models.dispersion import dispersion_training_graph_rule
+
+    expected = dispersion_training_graph_rule(
+        long_range_dispersion_mode,
+        mbd_operator_backend=mbd_operator_backend,
+    )
+    if raw_rule is not None and str(raw_rule) != expected:
+        raise ValueError(
+            f"{source_label} {str(raw_rule)!r} does not match long_range_dispersion_mode="
+            f"{long_range_dispersion_mode!r} and mbd_operator_backend={mbd_operator_backend!r}"
+        )
+    return expected
+
+
+def validate_dispersion_train_deploy_graph_compatibility(
+    *,
+    long_range_dispersion_mode: str,
+    mbd_operator_backend: str,
+    raw_value: Any | None,
+    source_label: str = "dispersion_train_deploy_graph_compatibility",
+) -> str:
+    """Return the expected train/deploy graph compatibility label."""
+    from mace_ictd.models.dispersion import dispersion_train_deploy_graph_compatibility
+
+    expected = dispersion_train_deploy_graph_compatibility(
+        long_range_dispersion_mode,
+        mbd_operator_backend=mbd_operator_backend,
+    )
+    if raw_value is not None and str(raw_value) != expected:
+        raise ValueError(
+            f"{source_label} {str(raw_value)!r} does not match long_range_dispersion_mode="
+            f"{long_range_dispersion_mode!r} and mbd_operator_backend={mbd_operator_backend!r}"
+        )
+    return expected
 
 
 def resolve_save_multiple_mix_channels_default(
@@ -612,6 +693,53 @@ def resolve_model_architecture(
             DEFAULT_MODEL_ARCHITECTURE["dispersion_cutoff"],
         )
     )
+    dispersion_max_num_neighbors = _resolve_value(
+        overrides,
+        checkpoint,
+        arch_meta,
+        "dispersion_max_num_neighbors",
+        DEFAULT_MODEL_ARCHITECTURE["dispersion_max_num_neighbors"],
+    )
+    if dispersion_max_num_neighbors is not None and int(dispersion_max_num_neighbors) < 0:
+        raise ValueError("dispersion_max_num_neighbors must be >= 0 or None")
+    resolved["dispersion_max_num_neighbors"] = (
+        None
+        if dispersion_max_num_neighbors is None or int(dispersion_max_num_neighbors) == 0
+        else int(dispersion_max_num_neighbors)
+    )
+    dispersion_neighbor_method = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "dispersion_neighbor_method",
+            DEFAULT_MODEL_ARCHITECTURE["dispersion_neighbor_method"],
+        )
+    )
+    if dispersion_neighbor_method not in SUPPORTED_DISPERSION_NEIGHBOR_METHODS:
+        raise ValueError(
+            f"Unsupported dispersion_neighbor_method {dispersion_neighbor_method!r}; "
+            f"supported methods: {sorted(SUPPORTED_DISPERSION_NEIGHBOR_METHODS)}"
+        )
+    resolved["dispersion_neighbor_method"] = dispersion_neighbor_method
+    resolved["dispersion_bruteforce_threshold"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "dispersion_bruteforce_threshold",
+            DEFAULT_MODEL_ARCHITECTURE["dispersion_bruteforce_threshold"],
+        )
+    )
+    resolved["dispersion_allow_large_bruteforce_fallback"] = bool(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "dispersion_allow_large_bruteforce_fallback",
+            DEFAULT_MODEL_ARCHITECTURE["dispersion_allow_large_bruteforce_fallback"],
+        )
+    )
     resolved["dispersion_slq_num_probes"] = int(
         _resolve_value(
             overrides,
@@ -628,6 +756,92 @@ def resolve_model_architecture(
             arch_meta,
             "dispersion_slq_lanczos_steps",
             DEFAULT_MODEL_ARCHITECTURE["dispersion_slq_lanczos_steps"],
+        )
+    )
+    resolved["mbd_operator_backend"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_operator_backend",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_operator_backend"],
+        )
+    )
+    raw_dispersion_graph_rule = None
+    for source in (overrides, checkpoint, arch_meta):
+        if isinstance(source, Mapping) and source.get("dispersion_deployment_graph_rule") is not None:
+            raw_dispersion_graph_rule = str(source["dispersion_deployment_graph_rule"])
+            break
+    raw_dispersion_training_graph_rule = None
+    for source in (overrides, checkpoint, arch_meta):
+        if isinstance(source, Mapping) and source.get("dispersion_training_graph_rule") is not None:
+            raw_dispersion_training_graph_rule = str(source["dispersion_training_graph_rule"])
+            break
+    raw_dispersion_graph_compatibility = None
+    for source in (overrides, checkpoint, arch_meta):
+        if isinstance(source, Mapping) and source.get("dispersion_train_deploy_graph_compatibility") is not None:
+            raw_dispersion_graph_compatibility = str(source["dispersion_train_deploy_graph_compatibility"])
+            break
+    resolved["dispersion_training_graph_rule"] = validate_dispersion_training_graph_rule(
+        long_range_dispersion_mode=resolved["long_range_dispersion_mode"],
+        mbd_operator_backend=resolved["mbd_operator_backend"],
+        raw_rule=raw_dispersion_training_graph_rule,
+    )
+    resolved["dispersion_deployment_graph_rule"] = validate_dispersion_deployment_graph_rule(
+        long_range_dispersion_mode=resolved["long_range_dispersion_mode"],
+        mbd_operator_backend=resolved["mbd_operator_backend"],
+        raw_rule=raw_dispersion_graph_rule,
+    )
+    resolved["dispersion_train_deploy_graph_compatibility"] = (
+        validate_dispersion_train_deploy_graph_compatibility(
+            long_range_dispersion_mode=resolved["long_range_dispersion_mode"],
+            mbd_operator_backend=resolved["mbd_operator_backend"],
+            raw_value=raw_dispersion_graph_compatibility,
+        )
+    )
+    resolved["mbd_pme_mesh_size"] = int(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_pme_mesh_size",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_pme_mesh_size"],
+        )
+    )
+    resolved["mbd_pme_assignment"] = str(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_pme_assignment",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_pme_assignment"],
+        )
+    )
+    resolved["mbd_pme_k_norm_floor"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_pme_k_norm_floor",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_pme_k_norm_floor"],
+        )
+    )
+    resolved["mbd_pme_assignment_window_floor"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_pme_assignment_window_floor",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_pme_assignment_window_floor"],
+        )
+    )
+    resolved["mbd_pme_ewald_alpha_prefactor"] = float(
+        _resolve_value(
+            overrides,
+            checkpoint,
+            arch_meta,
+            "mbd_pme_ewald_alpha_prefactor",
+            DEFAULT_MODEL_ARCHITECTURE["mbd_pme_ewald_alpha_prefactor"],
         )
     )
     resolved["long_range_theta"] = float(

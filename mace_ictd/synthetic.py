@@ -44,6 +44,7 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 from mace_ictd.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
+from mace_ictd.training.train_loop import disable_tf32
 from mace_ictd.utils.config import ModelConfig
 
 SPECIES = (1, 6, 7, 8)
@@ -650,12 +651,15 @@ def run_compile(args) -> int:
     Gate numerics + equivariance; report graph breaks and speedup vs eager."""
     import torch._dynamo as dynamo
     dynamo.config.cache_size_limit = 256
+    if args.tf32:
+        raise ValueError("TF32 is not allowed; use full float32 precision")
     device = torch.device(args.device)
     if device.type != "cuda":
         print("[compile] requires CUDA"); return 1
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
-    torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
-    torch.backends.cudnn.allow_tf32 = bool(args.tf32)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(0)
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
@@ -813,8 +817,11 @@ def run_makefx(args) -> int:
     if do_compile:
         import torch._dynamo as dynamo
         dynamo.config.cache_size_limit = 256
-        torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
-        torch.backends.cudnn.allow_tf32 = bool(args.tf32)
+        if args.tf32:
+            raise ValueError("TF32 is not allowed; use full float32 precision")
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(0)
     model = build_model(
         channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
@@ -1114,7 +1121,7 @@ def main() -> int:
     p.add_argument("--fullgraph", action="store_true", help="torch.compile fullgraph=True")
     p.add_argument("--compiled-autograd", action="store_true", help="compile the backward via compiled-autograd")
     p.add_argument("--compile-mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
-    p.add_argument("--tf32", action="store_true", help="allow TF32 matmul (changes numerics)")
+    p.add_argument("--tf32", action="store_true", help="deprecated: TF32 is not allowed; passing this flag raises an error")
     p.add_argument("--makefx", action="store_true", help="make_fx-flatten the forward+force-autograd then torch.compile it (second-order via flat backward); compare+time")
     p.add_argument("--makefx-no-compile", dest="makefx_no_compile", action="store_true", help="with --makefx: skip Inductor, validate only the flatten+strip+rebuild stages vs eager (CPU-friendly)")
     p.add_argument("--func", action="store_true", help="compute train-step grads via torch.func (functional VJP); compare+time")
@@ -1146,6 +1153,9 @@ def main() -> int:
     p.add_argument("--save-ref", default=None)
     p.add_argument("--compare-ref", default=None)
     args = p.parse_args()
+    if args.tf32:
+        raise ValueError("TF32 is not allowed; use full float32 precision")
+    disable_tf32()
 
     if not (args.check or args.bench or args.cudagraph or args.cudagraph_train or args.do_compile or args.func or args.paths or args.makefx):
         args.check = True

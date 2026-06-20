@@ -44,6 +44,84 @@ from mace_ictd.training.makefx_compile import trace_and_compile_force
 SPECIES = (1, 6, 7, 8)
 
 
+def _long_range_deploy_metadata(
+    model,
+    *,
+    export_reciprocal_source: bool,
+    use_explicit_dispersion_edges: bool,
+) -> dict:
+    """Metadata consumed by mff/torch for reciprocal and MBD deployment paths."""
+    from mace_ictd.models.dispersion import (
+        dispersion_deployment_graph_rule,
+        dispersion_train_deploy_graph_compatibility,
+        dispersion_training_graph_rule,
+    )
+
+    lrm = getattr(model, "long_range_module", None)
+    es_attr = getattr(lrm, "energy_scale", None) if lrm is not None else None
+    s_chan = int(getattr(getattr(model, "multipole_readout", None), "source_channels", 1) or 1)
+    dispersion_mode = str(getattr(model, "long_range_dispersion_mode", "none"))
+    mbd_operator_backend = str(getattr(model, "mbd_operator_backend", "edge_sparse"))
+    return {
+        "export_reciprocal_source": bool(export_reciprocal_source),
+        "reciprocal_source_channels": s_chan,
+        "reciprocal_source_boundary": "periodic",
+        "reciprocal_source_slab_padding_factor": 2,
+        "long_range_runtime_backend": str(getattr(model, "long_range_runtime_backend", "mesh_fft")),
+        "long_range_mesh_size": int(getattr(model, "long_range_mesh_size", 16)),
+        "long_range_max_multipole_l": int(getattr(model, "long_range_max_multipole_l", 0)),
+        "long_range_source_kind": str(getattr(model, "long_range_runtime_source_kind", "latent_multipole")),
+        "long_range_source_channels": s_chan,
+        "long_range_source_layout": str(
+            getattr(model, "long_range_runtime_source_layout", "packed_q_dipole_quad")
+        ),
+        "long_range_boundary": str(getattr(model, "long_range_boundary", "periodic")),
+        "long_range_energy_partition": str(getattr(model, "long_range_energy_partition", "uniform")),
+        "long_range_neutralize": bool(getattr(model, "long_range_neutralize", True)),
+        "long_range_green_mode": str(getattr(model, "long_range_green_mode", "poisson")),
+        "long_range_mesh_fft_full_ewald": bool(getattr(model, "long_range_mesh_fft_full_ewald", False)),
+        "long_range_dispersion_mode": str(getattr(model, "long_range_dispersion_mode", "none")),
+        "long_range_dispersion": bool(getattr(model, "long_range_dispersion", False)),
+        "dispersion_cutoff": float(getattr(model, "dispersion_cutoff", 0.0)),
+        "dispersion_max_num_neighbors": getattr(model, "dispersion_max_num_neighbors", None),
+        "dispersion_neighbor_method": str(getattr(model, "dispersion_neighbor_method", "auto")),
+        "dispersion_bruteforce_threshold": int(getattr(model, "dispersion_bruteforce_threshold", 1024)),
+        "dispersion_allow_large_bruteforce_fallback": bool(
+            getattr(model, "dispersion_allow_large_bruteforce_fallback", False)
+        ),
+        "aoti_dispersion_edges": bool(use_explicit_dispersion_edges),
+        "dispersion_training_graph_rule": dispersion_training_graph_rule(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        ),
+        "dispersion_deployment_graph_rule": dispersion_deployment_graph_rule(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        ),
+        "dispersion_train_deploy_graph_compatibility": dispersion_train_deploy_graph_compatibility(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        ),
+        "dispersion_slq_num_probes": int(getattr(model, "dispersion_slq_num_probes", 8)),
+        "dispersion_slq_lanczos_steps": int(getattr(model, "dispersion_slq_lanczos_steps", 16)),
+        "mbd_operator_backend": mbd_operator_backend,
+        "mbd_pme_mesh_size": int(getattr(model, "mbd_pme_mesh_size", 16)),
+        "mbd_pme_assignment": str(getattr(model, "mbd_pme_assignment", "cic")),
+        "mbd_pme_k_norm_floor": float(getattr(model, "mbd_pme_k_norm_floor", 1.0e-6)),
+        "mbd_pme_assignment_window_floor": float(getattr(model, "mbd_pme_assignment_window_floor", 1.0e-6)),
+        "mbd_pme_ewald_alpha_prefactor": float(getattr(model, "mbd_pme_ewald_alpha_prefactor", 5.0)),
+        "long_range_ewald_alpha_prefactor": float(
+            getattr(getattr(lrm, "kernel", None), "ewald_alpha_prefactor", 5.0)
+        ),
+        "long_range_energy_scale": (float(es_attr.detach().cpu().item()) if es_attr is not None else 1.0),
+        "long_range_theta": 0.5,
+        "long_range_leaf_size": 32,
+        "long_range_multipole_order": 0,
+        "long_range_screening": 0.0,
+        "long_range_softening": 1.0e-6,
+    }
+
+
 def make_fixed_graph(*, num_nodes, avg_degree, dtype, device, seed: int = 42):
     """Deterministic single-molecule example graph (no self-loops) for tracing + numerics/equivariance
     checks. Big non-periodic box (edge_shifts=0); the real LAMMPS graph is supplied at runtime, this is
@@ -500,9 +578,7 @@ def main() -> int:
     p.add_argument("--dtype", default="float32", choices=["float32", "float64"])
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--allow-tf32", action="store_true",
-                   help="allow NVIDIA TF32 matmul/convolution for float32 export and validation. "
-                        "This can speed GEMM-heavy AOTI graphs but uses a lower-precision matmul format; "
-                        "the exporter still checks energy/force numerics before exiting. Default is off.")
+                   help="deprecated: TF32 is not allowed; passing this flag raises an error.")
     p.add_argument("--checkpoint", default=None,
                    help="path to a trained .pth checkpoint to export (via LAMMPS_MLIAP_MFF.from_checkpoint). "
                         "When set, the REAL trained weights/dtype/species are used instead of a random model, "
@@ -602,15 +678,12 @@ def main() -> int:
     device = torch.device(args.device)
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
     if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-        print("[aoti] TF32 enabled for float32 matmul/convolution (numerics will be checked)")
-    else:
-        # Hard-off TF32: keep full float32 matmul precision. TF32 would drop matmul
-        # to roughly 1e-3 on some models, so unchanged numerics remains the default.
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        raise ValueError("TF32 is not allowed; use full float32 precision")
+    # Hard-off TF32: keep full float32 matmul precision. TF32 would drop matmul
+    # to roughly 1e-3 on some models, so unchanged numerics remains the default.
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(0)
 
     if args.checkpoint:
@@ -697,7 +770,28 @@ def main() -> int:
     graph = _apply_species(make_fixed_graph(num_nodes=args.atoms, avg_degree=args.degree, dtype=dtype, device=device))
 
     def _with_dispersion_edges(g):
-        return (g[0],) + tuple(g[1:]) + (g[3], g[4], g[5])
+        from mace_ictd.models.dispersion import dispersion_neighbor_list, dispersion_mode_uses_canonical_edges
+
+        disp_src, disp_dst, disp_shifts = dispersion_neighbor_list(
+            g[0],
+            g[2],
+            g[6],
+            float(getattr(_bare, "dispersion_cutoff", 0.0)),
+            pbc=bool(getattr(_bare, "dispersion_pbc", True)),
+            canonical_undirected=dispersion_mode_uses_canonical_edges(dispersion_mode),
+            method=str(getattr(_bare, "dispersion_neighbor_method", "auto")),
+            bruteforce_threshold=int(getattr(_bare, "dispersion_bruteforce_threshold", 1024)),
+            max_num_neighbors=getattr(_bare, "dispersion_max_num_neighbors", None),
+            allow_large_bruteforce_fallback=bool(
+                getattr(_bare, "dispersion_allow_large_bruteforce_fallback", False)
+            ),
+        )
+        if disp_src.numel() < 1:
+            raise RuntimeError(
+                "AOTI MBD/SLQ-MBD export example graph produced no dispersion edges; "
+                "increase --atoms or --degree, or use a larger checkpoint dispersion_cutoff."
+            )
+        return (g[0],) + tuple(g[1:]) + (disp_src, disp_dst, disp_shifts.to(dtype=g[5].dtype))
 
     # Multipole long-range models emit a packed reciprocal_source as a 3rd graph output (E, force,
     # reciprocal_source); the C++ reciprocal solver does the sum at deploy time. Detect off the bare
@@ -707,11 +801,27 @@ def main() -> int:
     if emit_rs:
         print("[aoti] multipole long-range: exporting (E, force, reciprocal_source) 3-tuple")
     use_explicit_dispersion_edges = False
+    dispersion_mode = str(getattr(_bare, "long_range_dispersion_mode", "none"))
+    mbd_operator_backend = str(getattr(_bare, "mbd_operator_backend", "edge_sparse"))
+    from mace_ictd.models.dispersion import dispersion_mode_needs_deployment_edges
+
+    if (
+        getattr(_bare, "dispersion", None) is not None
+        and dispersion_mode == "mbd-slq"
+        and mbd_operator_backend == "pme_fft"
+    ):
+        raise NotImplementedError(
+            "AOTI/LAMMPS export does not yet support mbd_operator_backend=pme_fft; "
+            "the runtime cuFFT MBD dipole-tensor matvec backend is not implemented."
+        )
     # Pairwise C6 dispersion can ride on the deployment edge list. MBD/SLQ-MBD needs a second
     # explicit dispersion edge list so its cutoff can differ from the short-range MACE cutoff.
     if getattr(_bare, "dispersion", None) is not None and float(getattr(_bare, "dispersion_cutoff", 0.0) or 0.0) > 0.0:
-        if str(getattr(_bare, "long_range_dispersion_mode", "pairwise-c6")) in {"mbd", "mbd-slq"}:
-            if str(getattr(_bare, "long_range_dispersion_mode", "pairwise-c6")) == "mbd":
+        if dispersion_mode_needs_deployment_edges(
+            dispersion_mode,
+            mbd_operator_backend=mbd_operator_backend,
+        ):
+            if dispersion_mode == "mbd":
                 raise NotImplementedError(
                     "AOTI export still does not support dense MBD: torch.linalg.eigh on the dense "
                     "3N x 3N oscillator matrix is not a deployable AOTI path. Use mbd-slq for AOTI."
@@ -733,9 +843,10 @@ def main() -> int:
             _bare.dispersion_cutoff = 0.0
 
     example_inputs = _with_dispersion_edges(graph) if use_explicit_dispersion_edges else (graph[0],) + tuple(graph[1:])
+    example_disp_edges = int(example_inputs[-3].numel()) if use_explicit_dispersion_edges else 0
 
     print(f"[aoti] device={device} dtype={dtype} atoms={args.atoms} edges={args.atoms*args.degree} "
-          + (f"disp_edges={args.atoms*args.degree} " if use_explicit_dispersion_edges else "")
+          + (f"disp_edges={example_disp_edges} " if use_explicit_dispersion_edges else "")
           + f"route={args.route} attn_heads={args.attn_heads} torch={torch.__version__}")
 
     # ---- eager reference ----
@@ -777,7 +888,7 @@ def main() -> int:
         #                cell[M,3,3][, dispersion_edge_src[D], dispersion_edge_dst[D],
         #                dispersion_edge_shifts[D,3]])
         Edim = Dim("n_edges", min=2)
-        Ddim = Dim("n_dispersion_edges", min=2)
+        Ddim = Dim("n_dispersion_edges", min=1)
         if args.n_dynamic:
             # N-DYNAMIC: with e3nn jit_script_fx=False (set above) the make_fx flatten no longer bakes the
             # atom count -- N is a symbol -- so make N a Dim too. ONE .pt2 for ANY atom count AND any edge
@@ -822,14 +933,16 @@ def main() -> int:
     pad_z = int(species_z[0]) if species_z else 1
     with open(meta_path, "w") as mf:
         if args.n_dynamic:
-            # N-dynamic: the .pt2 accepts ANY atom count -> LAMMPS needs no padding/N_max/fallback.
-            # nmax 0 signals "no padding" to the engine (aoti_nmax_==0 -> legacy/dynamic path).
+            # N-dynamic: the .pt2 accepts ANY atom count -> LAMMPS needs no padding/N_max.
+            # A fallback can still be useful for unsupported AOTI/runtime combinations.
             mf.write("dynamic 1\n")
             mf.write("nmax 0\n")
             if use_explicit_dispersion_edges:
                 mf.write("dispersion_edges 1\n")
             if _model_uses_cueq_product(model):
                 mf.write("requires_torch_ops cuequivariance_ops_torch\n")
+            if args.fallback:
+                mf.write(f"fallback {args.fallback}\n")
         else:
             mf.write(f"nmax {args.atoms}\n")
             mf.write(f"pad_z {pad_z}\n")
@@ -842,41 +955,17 @@ def main() -> int:
     print(f"[aoti] wrote {meta_path}  ("
           + ("N-DYNAMIC (no padding)" if args.n_dynamic else f"nmax={args.atoms} pad_z={pad_z} fallback={args.fallback}") + ")")
 
-    # Long-range deploy metadata sidecar: engine reads "<core>.pt2.json" for the reciprocal solver
-    # config. Only written for multipole models (others have no .json -> engine uses defaults).
-    # Mirrors export_libtorch_core's meta dict so the C++ reproduces the in-model multipole_energy.
-    if emit_rs:
+    # Long-range/dispersion deploy metadata sidecar: engine reads "<core>.pt2.json" for the
+    # reciprocal solver config and for MBD dispersion deployment metadata.  Pure MBD-SLQ AOTI exports
+    # may not emit reciprocal_source, but still need this sidecar so C++ validates dispersion_cutoff
+    # and the single-image runtime graph guard against the trained MBD graph rule.
+    if emit_rs or use_explicit_dispersion_edges:
         import json as _json
-        lrm = getattr(_bare, "long_range_module", None)
-        es_attr = getattr(lrm, "energy_scale", None) if lrm is not None else None
-        s_chan = int(getattr(getattr(_bare, "multipole_readout", None), "source_channels", 1) or 1)
-        lr_meta = {
-            "export_reciprocal_source": True,
-            "reciprocal_source_channels": s_chan,
-            "reciprocal_source_boundary": "periodic",
-            "reciprocal_source_slab_padding_factor": 2,
-            "long_range_runtime_backend": str(getattr(_bare, "long_range_runtime_backend", "mesh_fft")),
-            "long_range_mesh_size": int(getattr(_bare, "long_range_mesh_size", 16)),
-            "long_range_max_multipole_l": int(getattr(_bare, "long_range_max_multipole_l", 0)),
-            "long_range_source_kind": str(getattr(_bare, "long_range_runtime_source_kind", "latent_multipole")),
-            "long_range_source_channels": s_chan,
-            "long_range_source_layout": str(getattr(_bare, "long_range_runtime_source_layout", "packed_q_dipole_quad")),
-            "long_range_boundary": str(getattr(_bare, "long_range_boundary", "periodic")),
-            "long_range_energy_partition": str(getattr(_bare, "long_range_energy_partition", "uniform")),
-            "long_range_neutralize": bool(getattr(_bare, "long_range_neutralize", True)),
-            "long_range_green_mode": str(getattr(_bare, "long_range_green_mode", "poisson")),
-            "long_range_mesh_fft_full_ewald": bool(getattr(_bare, "long_range_mesh_fft_full_ewald", False)),
-            "long_range_dispersion_mode": str(getattr(_bare, "long_range_dispersion_mode", "none")),
-            "long_range_dispersion": bool(getattr(_bare, "long_range_dispersion", False)),
-            "dispersion_cutoff": float(getattr(_bare, "dispersion_cutoff", 0.0)),
-            "aoti_dispersion_edges": bool(use_explicit_dispersion_edges),
-            "dispersion_slq_num_probes": int(getattr(_bare, "dispersion_slq_num_probes", 8)),
-            "dispersion_slq_lanczos_steps": int(getattr(_bare, "dispersion_slq_lanczos_steps", 16)),
-            "long_range_ewald_alpha_prefactor": float(getattr(getattr(lrm, "kernel", None), "ewald_alpha_prefactor", 5.0)),
-            "long_range_energy_scale": (float(es_attr.detach().cpu().item()) if es_attr is not None else 1.0),
-            "long_range_theta": 0.5, "long_range_leaf_size": 32, "long_range_multipole_order": 0,
-            "long_range_screening": 0.0, "long_range_softening": 1.0e-6,
-        }
+        lr_meta = _long_range_deploy_metadata(
+            _bare,
+            export_reciprocal_source=emit_rs,
+            use_explicit_dispersion_edges=use_explicit_dispersion_edges,
+        )
         json_path = str(args.out) + ".json"
         with open(json_path, "w") as jf:
             _json.dump(lr_meta, jf, indent=2)

@@ -38,7 +38,7 @@ from torch.utils.data.distributed import DistributedSampler
 from mace_ictd.data import H5Dataset, collate_fn_h5, BucketBatchSampler
 from mace_ictd.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
 from mace_ictd.utils.config import ModelConfig
-from mace_ictd.training.train_loop import ForceTrainer, _DEFAULT_E0_KEYS, _DEFAULT_E0_VALUES
+from mace_ictd.training.train_loop import ForceTrainer, _DEFAULT_E0_KEYS, _DEFAULT_E0_VALUES, disable_tf32
 
 
 def _env_int(name: str, default: int) -> int:
@@ -363,8 +363,18 @@ def build_baseline_model(
     long_range_max_multipole_l: int = 0,
     long_range_dispersion_mode: str = "none",
     dispersion_cutoff: float = 10.0,
+    dispersion_max_num_neighbors: int | None = None,
+    dispersion_neighbor_method: str = "auto",
+    dispersion_bruteforce_threshold: int = 1024,
+    dispersion_allow_large_bruteforce_fallback: bool = False,
     dispersion_slq_num_probes: int = 8,
     dispersion_slq_lanczos_steps: int = 16,
+    mbd_operator_backend: str = "edge_sparse",
+    mbd_pme_mesh_size: int = 16,
+    mbd_pme_assignment: str = "cic",
+    mbd_pme_k_norm_floor: float = 1.0e-6,
+    mbd_pme_assignment_window_floor: float = 1.0e-6,
+    mbd_pme_ewald_alpha_prefactor: float = 5.0,
 ) -> PureCartesianICTDFix:
     """Construct the model exactly the way from_checkpoint rebuilds it (so the saved
     weights reload into an identical module). All structural choices come from ``cfg``
@@ -427,8 +437,18 @@ def build_baseline_model(
         long_range_max_multipole_l=long_range_max_multipole_l,
         long_range_dispersion_mode=long_range_dispersion_mode,
         dispersion_cutoff=dispersion_cutoff,
+        dispersion_max_num_neighbors=dispersion_max_num_neighbors,
+        dispersion_neighbor_method=dispersion_neighbor_method,
+        dispersion_bruteforce_threshold=dispersion_bruteforce_threshold,
+        dispersion_allow_large_bruteforce_fallback=dispersion_allow_large_bruteforce_fallback,
         dispersion_slq_num_probes=dispersion_slq_num_probes,
         dispersion_slq_lanczos_steps=dispersion_slq_lanczos_steps,
+        mbd_operator_backend=mbd_operator_backend,
+        mbd_pme_mesh_size=mbd_pme_mesh_size,
+        mbd_pme_assignment=mbd_pme_assignment,
+        mbd_pme_k_norm_floor=mbd_pme_k_norm_floor,
+        mbd_pme_assignment_window_floor=mbd_pme_assignment_window_floor,
+        mbd_pme_ewald_alpha_prefactor=mbd_pme_ewald_alpha_prefactor,
         internal_compute_dtype=cfg.internal_compute_dtype,
         device=device,
     ).to(device=device, dtype=dtype)
@@ -521,10 +541,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Deprecated alias for --long-range-dispersion-mode pairwise-c6.")
     ap.add_argument("--dispersion-cutoff", type=float, default=10.0,
                     help="Cutoff for the long-range dispersion neighbor list. Use 0 to reuse the input edge list.")
+    ap.add_argument("--dispersion-max-num-neighbors", type=int, default=0,
+                    help="Optional max neighbors per atom for torch_cluster dispersion radius search. "
+                         "0 estimates a conservative cap from density and cutoff.")
+    ap.add_argument("--dispersion-neighbor-method", default="auto", choices=["auto", "cell", "bruteforce"],
+                    help="Dispersion neighbor-list builder used during training when explicit dispersion edges "
+                         "are absent. auto uses dense only below --dispersion-bruteforce-threshold and otherwise "
+                         "uses torch_cluster; cell is an exact sorted Python cell-list path for nearest-image cases.")
+    ap.add_argument("--dispersion-bruteforce-threshold", type=int, default=1024,
+                    help="Largest per-graph atom count that auto may send to the dense O(N^2) dispersion builder.")
+    ap.add_argument("--dispersion-allow-large-bruteforce-fallback", action="store_true",
+                    help="Allow auto to fall back to the dense O(N^2) dispersion builder when torch_cluster is "
+                         "missing above the threshold. Default is to fail loudly.")
     ap.add_argument("--dispersion-slq-num-probes", type=int, default=8,
                     help="Number of deterministic Hutchinson probes for --long-range-dispersion-mode mbd-slq.")
     ap.add_argument("--dispersion-slq-lanczos-steps", type=int, default=16,
                     help="Lanczos steps per probe for --long-range-dispersion-mode mbd-slq.")
+    ap.add_argument("--mbd-operator-backend", default="edge_sparse", choices=["edge_sparse", "pme_fft"],
+                    help="SLQ-MBD matrix-vector backend. edge_sparse uses the explicit dispersion graph; "
+                         "pme_fft is an experimental reciprocal-only torch.fft prototype for training/research; "
+                         "AOTI/LAMMPS export still refuses it until the cuFFT MBD matvec and corrections exist.")
+    ap.add_argument("--mbd-pme-mesh-size", type=int, default=16,
+                    help="Mesh size for experimental --mbd-operator-backend pme_fft.")
+    ap.add_argument("--mbd-pme-assignment", default="cic", choices=["ngp", "cic", "pcs"],
+                    help="Mesh assignment for experimental --mbd-operator-backend pme_fft.")
+    ap.add_argument("--mbd-pme-k-norm-floor", type=float, default=1.0e-6,
+                    help="Small-k floor for experimental MBD PME matvec.")
+    ap.add_argument("--mbd-pme-assignment-window-floor", type=float, default=1.0e-6,
+                    help="Assignment deconvolution floor for experimental MBD PME matvec.")
+    ap.add_argument("--mbd-pme-ewald-alpha-prefactor", type=float, default=5.0,
+                    help="Ewald alpha prefactor for experimental MBD PME matvec.")
     # atomic-energy E0 offset
     ap.add_argument("--atomic-energy-keys", default=None, help='e.g. "1,6,7,8"')
     ap.add_argument("--atomic-energy-values", default=None, help='e.g. "-430.5,-821.0,-1488.2,-2044.4"')
@@ -637,6 +683,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = build_arg_parser().parse_args(argv)
+    disable_tf32()
 
     ddp_info = _setup_distributed(args)
     if not ddp_info["is_main"]:
@@ -736,11 +783,29 @@ def main(argv=None):
                 raise ValueError("--long-range-max-multipole-l > 0 requires --long-range-mesh-fft-full-ewald")
     if args.long_range_dispersion_mode != "none" and args.dispersion_cutoff < 0:
         raise ValueError("--dispersion-cutoff must be >= 0")
+    if int(args.dispersion_max_num_neighbors) < 0:
+        raise ValueError("--dispersion-max-num-neighbors must be >= 0")
+    if int(args.dispersion_bruteforce_threshold) < 0:
+        raise ValueError("--dispersion-bruteforce-threshold must be >= 0")
     if args.long_range_dispersion_mode == "mbd-slq":
         if int(args.dispersion_slq_num_probes) <= 0:
             raise ValueError("--dispersion-slq-num-probes must be > 0")
         if int(args.dispersion_slq_lanczos_steps) <= 0:
             raise ValueError("--dispersion-slq-lanczos-steps must be > 0")
+        if args.mbd_operator_backend == "pme_fft":
+            if int(args.mbd_pme_mesh_size) <= 0:
+                raise ValueError("--mbd-pme-mesh-size must be > 0")
+            if float(args.mbd_pme_k_norm_floor) <= 0.0:
+                raise ValueError("--mbd-pme-k-norm-floor must be > 0")
+            if float(args.mbd_pme_assignment_window_floor) <= 0.0:
+                raise ValueError("--mbd-pme-assignment-window-floor must be > 0")
+            if float(args.mbd_pme_ewald_alpha_prefactor) <= 0.0:
+                raise ValueError("--mbd-pme-ewald-alpha-prefactor must be > 0")
+            logging.warning(
+                "--mbd-operator-backend pme_fft is an experimental reciprocal-only torch.fft "
+                "training backend; AOTI/LAMMPS export remains disabled until the cuFFT MBD "
+                "matvec and short-range/self corrections are implemented."
+            )
     energy_output_scale_enabled = args.scaling != "no_scaling" or args.atomic_inter_scale is not None
     energy_output_shift_enabled = (
         (args.scaling != "no_scaling" and not args.no_atomic_inter_shift)
@@ -806,8 +871,20 @@ def main(argv=None):
         long_range_max_multipole_l=args.long_range_max_multipole_l,
         long_range_dispersion_mode=args.long_range_dispersion_mode,
         dispersion_cutoff=args.dispersion_cutoff,
+        dispersion_max_num_neighbors=(
+            int(args.dispersion_max_num_neighbors) if int(args.dispersion_max_num_neighbors) > 0 else None
+        ),
+        dispersion_neighbor_method=args.dispersion_neighbor_method,
+        dispersion_bruteforce_threshold=int(args.dispersion_bruteforce_threshold),
+        dispersion_allow_large_bruteforce_fallback=bool(args.dispersion_allow_large_bruteforce_fallback),
         dispersion_slq_num_probes=args.dispersion_slq_num_probes,
         dispersion_slq_lanczos_steps=args.dispersion_slq_lanczos_steps,
+        mbd_operator_backend=args.mbd_operator_backend,
+        mbd_pme_mesh_size=args.mbd_pme_mesh_size,
+        mbd_pme_assignment=args.mbd_pme_assignment,
+        mbd_pme_k_norm_floor=args.mbd_pme_k_norm_floor,
+        mbd_pme_assignment_window_floor=args.mbd_pme_assignment_window_floor,
+        mbd_pme_ewald_alpha_prefactor=args.mbd_pme_ewald_alpha_prefactor,
         device=device, dtype=dtype,
     )
     if args.mace_compatible_random_init:
@@ -928,8 +1005,20 @@ def main(argv=None):
         long_range_dispersion_mode=args.long_range_dispersion_mode,
         long_range_dispersion=bool(args.long_range_dispersion_mode != "none"),
         dispersion_cutoff=float(args.dispersion_cutoff),
+        dispersion_max_num_neighbors=(
+            int(args.dispersion_max_num_neighbors) if int(args.dispersion_max_num_neighbors) > 0 else None
+        ),
+        dispersion_neighbor_method=args.dispersion_neighbor_method,
+        dispersion_bruteforce_threshold=int(args.dispersion_bruteforce_threshold),
+        dispersion_allow_large_bruteforce_fallback=bool(args.dispersion_allow_large_bruteforce_fallback),
         dispersion_slq_num_probes=int(args.dispersion_slq_num_probes),
         dispersion_slq_lanczos_steps=int(args.dispersion_slq_lanczos_steps),
+        mbd_operator_backend=args.mbd_operator_backend,
+        mbd_pme_mesh_size=int(args.mbd_pme_mesh_size),
+        mbd_pme_assignment=args.mbd_pme_assignment,
+        mbd_pme_k_norm_floor=float(args.mbd_pme_k_norm_floor),
+        mbd_pme_assignment_window_floor=float(args.mbd_pme_assignment_window_floor),
+        mbd_pme_ewald_alpha_prefactor=float(args.mbd_pme_ewald_alpha_prefactor),
     )
 
     trainer = ForceTrainer(

@@ -50,7 +50,7 @@ from mace_ictd.cli.export_aoti_core import (
 )
 from mace_ictd.models.pure_cartesian_ictd_fix import PureCartesianICTDFix
 from mace_ictd.training.makefx_compile import trace_and_compile_force
-from mace_ictd.training.train_loop import ForceTrainer
+from mace_ictd.training.train_loop import ForceTrainer, disable_tf32
 
 
 SPECIES = (1, 6, 7, 8)
@@ -1109,7 +1109,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", default="float32", choices=["float32", "fp32", "float64", "fp64", "bfloat16", "bf16"])
-    p.add_argument("--matmul-precision", default="high", choices=["highest", "high", "medium"])
+    p.add_argument("--matmul-precision", default="highest", choices=["highest", "high", "medium"],
+                   help="float32 matmul precision. Only 'highest' is allowed; TF32 is disallowed.")
     p.add_argument("--configs", default="1:1,1:2,2:2,2:3", help="comma list hidden_lmax:max_ell")
     p.add_argument("--atoms", type=int, default=64)
     p.add_argument("--atoms-list", default="", help="comma list of atom counts; overrides --atoms")
@@ -1132,7 +1133,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    torch.set_float32_matmul_precision(args.matmul_precision)
+    if args.matmul_precision != "highest":
+        raise ValueError("TF32 is not allowed; use --matmul-precision highest")
+    disable_tf32()
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)

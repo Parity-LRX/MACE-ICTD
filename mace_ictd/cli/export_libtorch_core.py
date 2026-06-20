@@ -717,6 +717,24 @@ def _export_single_core(
 
     model_eager = obj.wrapper.model
     metadata_model = model_eager
+    from mace_ictd.models.dispersion import (
+        dispersion_deployment_graph_rule,
+        dispersion_mode_uses_cutoff_edges,
+        dispersion_train_deploy_graph_compatibility,
+        dispersion_training_graph_rule,
+    )
+
+    if (
+        getattr(metadata_model, "dispersion", None) is not None
+        and not dispersion_mode_uses_cutoff_edges(
+            str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
+            mbd_operator_backend=str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
+        )
+    ):
+        raise NotImplementedError(
+            "LibTorch/LAMMPS export does not yet support mbd_operator_backend=pme_fft; "
+            "the runtime cuFFT MBD dipole-tensor matvec backend is not implemented."
+        )
     # Multipole/long-range models flag themselves as exporting a packed reciprocal_source; honor that
     # automatically so the core .pt always includes the source slot even without the explicit CLI flag.
     if getattr(metadata_model, "long_range_exports_reciprocal_source", False):
@@ -890,8 +908,32 @@ def _export_single_core(
         "long_range_dispersion_mode": str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
         "long_range_dispersion": bool(getattr(metadata_model, "long_range_dispersion", False)),
         "dispersion_cutoff": float(getattr(metadata_model, "dispersion_cutoff", 0.0)),
+        "dispersion_max_num_neighbors": getattr(metadata_model, "dispersion_max_num_neighbors", None),
+        "dispersion_neighbor_method": str(getattr(metadata_model, "dispersion_neighbor_method", "auto")),
+        "dispersion_bruteforce_threshold": int(getattr(metadata_model, "dispersion_bruteforce_threshold", 1024)),
+        "dispersion_allow_large_bruteforce_fallback": bool(
+            getattr(metadata_model, "dispersion_allow_large_bruteforce_fallback", False)
+        ),
+        "dispersion_training_graph_rule": dispersion_training_graph_rule(
+            str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
+            mbd_operator_backend=str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
+        ),
+        "dispersion_deployment_graph_rule": dispersion_deployment_graph_rule(
+            str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
+            mbd_operator_backend=str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
+        ),
+        "dispersion_train_deploy_graph_compatibility": dispersion_train_deploy_graph_compatibility(
+            str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
+            mbd_operator_backend=str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
+        ),
         "dispersion_slq_num_probes": int(getattr(metadata_model, "dispersion_slq_num_probes", 8)),
         "dispersion_slq_lanczos_steps": int(getattr(metadata_model, "dispersion_slq_lanczos_steps", 16)),
+        "mbd_operator_backend": str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
+        "mbd_pme_mesh_size": int(getattr(metadata_model, "mbd_pme_mesh_size", 16)),
+        "mbd_pme_assignment": str(getattr(metadata_model, "mbd_pme_assignment", "cic")),
+        "mbd_pme_k_norm_floor": float(getattr(metadata_model, "mbd_pme_k_norm_floor", 1.0e-6)),
+        "mbd_pme_assignment_window_floor": float(getattr(metadata_model, "mbd_pme_assignment_window_floor", 1.0e-6)),
+        "mbd_pme_ewald_alpha_prefactor": float(getattr(metadata_model, "mbd_pme_ewald_alpha_prefactor", 5.0)),
         # Ewald screening prefactor: alpha = prefactor / (0.5 * min periodic box length). The C++
         # multipole_reciprocal_energy applies exp(-k^2/4 alpha^2) when full_ewald is set, matching the
         # in-model MeshLongRangeKernel3D.multipole_energy (kernel.ewald_alpha_prefactor, default 5.0).
