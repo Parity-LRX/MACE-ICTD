@@ -229,6 +229,11 @@ int main() {
   MFFMBDSolver solver; solver.set_config(cfg);
   auto f = solver.dipole_field(pos, mu, cell, /*alpha=*/1.0, src, dst, sh, torch::kCPU);
   std::printf("CPP_FIELD_SUM %.10f\nCPP_FIELD_SQ %.10f\n", f.sum().item<double>(), (f * f).sum().item<double>());
+  // full solver end-to-end: source [N,2] = (omega, alpha); power-iter bounds + Chebyshev energy.
+  auto source = torch::tensor({{1.0, 0.3}, {1.1, 0.3}}, o);  // (omega, alpha_pol)
+  cfg.cheb_degree = 20; cfg.num_probes = 64; solver.set_config(cfg);
+  auto E = solver.mbd_energy(pos, source, cell, src, dst, sh, torch::kCPU);
+  std::printf("CPP_E_MBD %.8f (finite=%d)\n", E.item<double>(), (int)std::isfinite(E.item<double>()));
   return 0;
 }
 #endif
