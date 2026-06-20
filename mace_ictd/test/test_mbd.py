@@ -56,8 +56,162 @@ def test_isolated_pair_matches_point_dipole():
     )
 
 
+def test_lanczos_quadform_exact():
+    """Lanczos quadrature for z^T sqrt(A) z is exact at full Krylov depth (vs dense sqrt(A))."""
+    torch.set_default_dtype(torch.float64)
+    from mace_ictd.models.mbd import lanczos_sqrt_quadform
+
+    n = 12
+    g = torch.Generator().manual_seed(3)
+    M = torch.randn(n, n, generator=g, dtype=torch.float64)
+    A = M @ M.T + n * torch.eye(n, dtype=torch.float64)  # SPD
+    z = torch.randn(n, generator=g, dtype=torch.float64)
+    lam, U = torch.linalg.eigh(A)
+    sqrtA = U @ torch.diag(lam.sqrt()) @ U.T
+    exact = z @ (sqrtA @ z)
+    approx = lanczos_sqrt_quadform(lambda v: A @ v, z, n)
+    assert (approx - exact).abs() / exact.abs() < 1e-9, f"{approx} vs {exact}"
+
+
+def test_slq_trace_sqrt_matches_dense():
+    """The SLQ primitive Tr[sqrt C] (no eigendecomposition of C) reproduces the dense Sum sqrt(lambda).
+    This validates the spectral-solver machinery; E_MBD = 1/2 Tr[sqrt C] - 3/2 sum w is a small
+    difference of large numbers, so its RELATIVE error is a deploy-time probe-count / control-variate
+    concern (and the diagonal self-image / rsSCS range-separation physics is deferred to task 5)."""
+    torch.set_default_dtype(torch.float64)
+    from mace_ictd.models.mbd import coupled_dipole_matvec, make_probes, slq_trace_sqrt
+
+    be = ReciprocalBackend(mesh_size=32, assignment="pcs")
+    sp = 2.6
+    L = 2 * sp
+    coords = [(i, j, k) for i in range(2) for j in range(2) for k in range(2)]
+    pos = torch.tensor(coords, dtype=torch.float64) * sp + 0.13
+    N = pos.size(0)
+    n = 3 * N
+    cell = torch.eye(3, dtype=torch.float64) * L
+    batch = torch.zeros(N, dtype=torch.long)
+    src, dst, sh = dispersion_neighbor_list(pos, batch, cell.reshape(1, 3, 3), L / 2 - 1e-6, pbc=True)
+
+    def field_fn(mu):
+        return dipole_field(be, pos, mu, cell, alpha=1.0, src=src, dst=dst, shifts=sh)
+
+    g = torch.Generator().manual_seed(1)
+    omega = 0.9 + 0.3 * torch.rand(N, generator=g, dtype=torch.float64)
+    alpha_pol = torch.full((N,), 0.3, dtype=torch.float64)
+
+    def mv(v):
+        return coupled_dipole_matvec(v.view(N, 3), omega, alpha_pol, field_fn).reshape(-1)
+
+    # dense reference
+    C = torch.stack([mv(torch.eye(n, dtype=torch.float64)[j]) for j in range(n)], dim=1)
+    lam = torch.linalg.eigvalsh(0.5 * (C + C.T))
+    tr_dense = lam.clamp_min(0).sqrt().sum()
+    assert (lam > 0).all(), "C not PD"
+
+    probes = make_probes(n, 800, device=omega.device, dtype=omega.dtype, seed=0)
+    tr_slq = slq_trace_sqrt(mv, n, probes, steps=n)
+    rel = (tr_slq - tr_dense).abs() / tr_dense
+    assert rel < 1.5e-2, f"Tr[sqrt C] SLQ {tr_slq.item():.5f} vs dense {tr_dense.item():.5f} rel {rel.item():.2e}"
+
+
+def test_chebyshev_trace_sqrt_matches_dense():
+    """Deployment path: Chebyshev Tr[sqrt C] (pure matvec + fixed-degree polynomial, NO eigensolve)
+    reproduces dense Sum sqrt(lambda); spectral bounds from matvec-only power iteration. Differentiable."""
+    torch.set_default_dtype(torch.float64)
+    from mace_ictd.models.mbd import (
+        chebyshev_trace_sqrt,
+        coupled_dipole_matvec,
+        make_probes,
+        power_iter_lambda_max,
+    )
+
+    be = ReciprocalBackend(mesh_size=32, assignment="pcs")
+    sp = 2.6
+    L = 2 * sp
+    coords = [(i, j, k) for i in range(2) for j in range(2) for k in range(2)]
+    pos = torch.tensor(coords, dtype=torch.float64) * sp + 0.13
+    N = pos.size(0)
+    n = 3 * N
+    cell = torch.eye(3, dtype=torch.float64) * L
+    batch = torch.zeros(N, dtype=torch.long)
+    src, dst, sh = dispersion_neighbor_list(pos, batch, cell.reshape(1, 3, 3), L / 2 - 1e-6, pbc=True)
+
+    def field_fn(mu):
+        return dipole_field(be, pos, mu, cell, alpha=1.0, src=src, dst=dst, shifts=sh)
+
+    g = torch.Generator().manual_seed(1)
+    omega = (0.9 + 0.3 * torch.rand(N, generator=g, dtype=torch.float64)).requires_grad_(True)
+    alpha = torch.full((N,), 0.3, dtype=torch.float64)
+
+    def mv(v):
+        return coupled_dipole_matvec(v.view(N, 3), omega, alpha, field_fn).reshape(-1)
+
+    with torch.no_grad():
+        C = torch.stack([mv(torch.eye(n, dtype=torch.float64)[j]) for j in range(n)], dim=1)
+        lam = torch.linalg.eigvalsh(0.5 * (C + C.T))
+        tr_dense = lam.clamp_min(0).sqrt().sum()
+        lmax = float(power_iter_lambda_max(mv, n, steps=30, device="cpu", dtype=torch.float64, seed=1)) * 1.05
+        gap = float(power_iter_lambda_max(lambda v: lmax * v - mv(v), n, steps=30, device="cpu", dtype=torch.float64, seed=2))
+        lmin = max((lmax - gap) * 0.95, 1e-6)
+    # bounds bracket the spectrum
+    assert lmin <= lam.min() and lam.max() <= lmax, f"bounds [{lmin:.3f},{lmax:.3f}] vs spectrum [{lam.min():.3f},{lam.max():.3f}]"
+
+    probes = make_probes(n, 800, device="cpu", dtype=torch.float64, seed=0)
+    tr_cheb = chebyshev_trace_sqrt(mv, n, probes, degree=30, lmin=lmin, lmax=lmax)
+    rel = (tr_cheb - tr_dense).abs() / tr_dense
+    assert rel < 1.5e-2, f"Chebyshev Tr {tr_cheb.item():.5f} vs dense {tr_dense.item():.5f} rel {rel.item():.2e}"
+    (go,) = torch.autograd.grad(tr_cheb, omega)
+    assert torch.isfinite(go).all() and go.abs().sum() > 0
+
+
+def test_slq_energy_conservative_gradient():
+    """The fixed-probe SLQ energy is a deterministic surrogate -> autograd gradient is exact
+    (conservative forces). Finite-difference confirms. The custom-backward low-mem variant runs and
+    is finite (a different unbiased estimator -- documented as non-exactly-conservative)."""
+    torch.set_default_dtype(torch.float64)
+    from mace_ictd.models.mbd import mbd_energy_slq, mbd_energy_slq_lowmem
+
+    be = ReciprocalBackend(mesh_size=20, assignment="pcs")
+    sp = 2.6
+    L = 2 * sp
+    coords = [(i, j, k) for i in range(2) for j in range(2) for k in range(2)]
+    pos = torch.tensor(coords, dtype=torch.float64) * sp + 0.13
+    N = pos.size(0)
+    cell = torch.eye(3, dtype=torch.float64) * L
+    batch = torch.zeros(N, dtype=torch.long)
+    src, dst, sh = dispersion_neighbor_list(pos, batch, cell.reshape(1, 3, 3), L / 2 - 1e-6, pbc=True)
+
+    def field_fn(mu):
+        return dipole_field(be, pos, mu, cell, alpha=1.0, src=src, dst=dst, shifts=sh)
+
+    g = torch.Generator().manual_seed(1)
+    omega = (0.9 + 0.3 * torch.rand(N, generator=g, dtype=torch.float64)).requires_grad_(True)
+    alpha = torch.full((N,), 0.3, dtype=torch.float64)
+    E = mbd_energy_slq(omega, alpha, field_fn, num_probes=48, lanczos_steps=18, seed=0)
+    (ga,) = torch.autograd.grad(E, omega)
+    eps = 1e-6
+    op = omega.detach().clone(); op[0] += eps
+    om = omega.detach().clone(); om[0] -= eps
+    fd = (mbd_energy_slq(op, alpha, field_fn, num_probes=48, lanczos_steps=18, seed=0)
+          - mbd_energy_slq(om, alpha, field_fn, num_probes=48, lanczos_steps=18, seed=0)) / (2 * eps)
+    assert (ga[0] - fd).abs() / fd.abs() < 1e-6, f"autograd not the exact surrogate gradient: {ga[0]} vs {fd}"
+
+    om2 = omega.detach().clone().requires_grad_(True)
+    E2 = mbd_energy_slq_lowmem(om2, alpha, field_fn, num_probes=48, lanczos_steps=18, seed=0)
+    (g2,) = torch.autograd.grad(E2, om2)
+    assert torch.isfinite(g2).all() and (E2 - E.detach()).abs() < 1e-10  # forward identical, grad finite
+
+
 if __name__ == "__main__":
     test_alpha_independence()
     print("OK: dipole-field Ewald is alpha-independent (SR+LR+self split exact)")
     test_isolated_pair_matches_point_dipole()
     print("OK: isolated-pair field == analytic (3 rr - I)/r^3 point-dipole tensor")
+    test_lanczos_quadform_exact()
+    print("OK: Lanczos quadrature z^T sqrt(A) z exact at full depth")
+    test_slq_trace_sqrt_matches_dense()
+    print("OK: SLQ Tr[sqrt C] (no eigendecomp) == dense Sum sqrt(lambda)")
+    test_chebyshev_trace_sqrt_matches_dense()
+    print("OK: Chebyshev Tr[sqrt C] (no eigensolve, AOTI-path) == dense; bounds bracket spectrum; differentiable")
+    test_slq_energy_conservative_gradient()
+    print("OK: SLQ energy autograd = exact surrogate gradient (conservative); low-mem backward runs")
