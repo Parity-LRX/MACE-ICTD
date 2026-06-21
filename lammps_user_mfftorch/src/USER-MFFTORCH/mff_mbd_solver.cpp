@@ -40,60 +40,54 @@ static std::vector<torch::Tensor> axis_weights(const torch::Tensor& f, int a) {
 
 torch::Tensor MFFMBDSolver::k_grid_cart(const torch::Tensor& eff_cell, const torch::Device& device) const {
   const int M = config_.mesh_size;
-  auto cpu = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
-  auto freq = fft_freqs(M, cpu);
+  auto opt = torch::TensorOptions().dtype(eff_cell.scalar_type()).device(device);  // on-device, input dtype
+  auto freq = fft_freqs(M, opt);
   auto grids = torch::meshgrid({freq, freq, freq}, "ij");
   auto ik = torch::stack({grids[0], grids[1], grids[2]}, -1).reshape({-1, 3});  // [K,3]
-  auto inv = torch::linalg_inv(eff_cell.to(torch::kCPU, torch::kFloat64));
-  return (2.0 * M_PI * torch::matmul(ik, inv.transpose(0, 1))).to(device);     // [K,3]
+  auto inv = torch::linalg_inv(eff_cell.to(device));
+  return 2.0 * M_PI * torch::matmul(ik, inv.transpose(0, 1));                 // [K,3]
 }
 
-// spread atoms [N,C] -> mesh [M,M,M,C]. S^3 stencil (S=2 cic / 4 pcs); matches Python _spread_source_to_mesh.
-torch::Tensor MFFMBDSolver::spread_to_mesh(const torch::Tensor& frac, const torch::Tensor& source,
-                                           const std::array<int, 3>&) const {
-  const int M = config_.mesh_size, C = source.size(1), a = config_.assignment, S = assignment_stencil(a);
-  auto mesh = torch::zeros({M * M * M, C}, source.options());
+// flat mesh indices [N,S^3] + stencil weights [N,S^3] in one shot (mirrors Python; one outer product +
+// one cartesian-prod offset add -> no S^3 launch loop). weights inherit the frac dtype (f32 or f64).
+void MFFMBDSolver::assignment_idx_weights(const torch::Tensor& frac, torch::Tensor& flat_idx,
+                                          torch::Tensor& weights) const {
+  const int M = config_.mesh_size, a = config_.assignment, S = assignment_stencil(a);
+  const int64_t N = frac.size(0);
   auto scaled = frac * (double)M;
   auto floor_scaled = torch::floor(scaled);
   auto f = scaled - floor_scaled;                                          // [N,3] in [0,1)
   auto base = floor_scaled.to(torch::kLong) - (a == 1 ? 1 : 0);           // pcs base = floor-1
-  std::vector<torch::Tensor> WX = axis_weights(f.select(1, 0), a), WY = axis_weights(f.select(1, 1), a),
-                             WZ = axis_weights(f.select(1, 2), a);
-  for (int ox = 0; ox < S; ++ox)
-    for (int oy = 0; oy < S; ++oy)
-      for (int oz = 0; oz < S; ++oz) {
-        auto w = (WX[ox] * WY[oy] * WZ[oz]).unsqueeze(-1);                 // [N,1]
-        auto ix = torch::remainder(base.select(1, 0) + ox, M);
-        auto iy = torch::remainder(base.select(1, 1) + oy, M);
-        auto iz = torch::remainder(base.select(1, 2) + oz, M);
-        auto flat = (ix * M + iy) * M + iz;                               // [N]
-        mesh.scatter_add_(0, flat.unsqueeze(-1).expand({-1, C}), source * w);
-      }
+  auto WX = axis_weights(f.select(1, 0), a), WY = axis_weights(f.select(1, 1), a),
+       WZ = axis_weights(f.select(1, 2), a);
+  auto wx = torch::stack(WX, 1), wy = torch::stack(WY, 1), wz = torch::stack(WZ, 1);  // [N,S]
+  weights = (wx.view({N, S, 1, 1}) * wy.view({N, 1, S, 1}) * wz.view({N, 1, 1, S})).reshape({N, S * S * S});
+  auto rng = torch::arange(S, torch::TensorOptions().dtype(torch::kLong).device(frac.device()));
+  auto offs = torch::cartesian_prod({rng, rng, rng});                      // [S^3,3], (ix slow .. iz fast)
+  auto idx = torch::remainder(base.unsqueeze(1) + offs.unsqueeze(0), M);   // [N,S^3,3]
+  flat_idx = (idx.select(2, 0) * M + idx.select(2, 1)) * M + idx.select(2, 2);  // [N,S^3]
+}
+
+torch::Tensor MFFMBDSolver::spread_to_mesh(const torch::Tensor& frac, const torch::Tensor& source,
+                                           const std::array<int, 3>&) const {
+  const int M = config_.mesh_size, C = source.size(1);
+  torch::Tensor flat_idx, weights;
+  assignment_idx_weights(frac, flat_idx, weights);                        // [N,S^3],[N,S^3]
+  auto mesh = torch::zeros({M * M * M, C}, source.options());
+  auto vals = (source.unsqueeze(1) * weights.unsqueeze(-1)).reshape({-1, C});  // [N*S^3, C]
+  mesh.scatter_add_(0, flat_idx.reshape({-1, 1}).expand({-1, C}), vals);  // ONE scatter_add
   return mesh.view({M, M, M, C});
 }
 
 torch::Tensor MFFMBDSolver::gather_from_mesh(const torch::Tensor& frac, const torch::Tensor& mesh,
                                              const std::array<int, 3>&) const {
-  const int M = config_.mesh_size, C = mesh.size(-1), a = config_.assignment, S = assignment_stencil(a);
+  const int M = config_.mesh_size, C = mesh.size(-1), S = assignment_stencil(config_.assignment);
+  const int64_t N = frac.size(0);
+  torch::Tensor flat_idx, weights;
+  assignment_idx_weights(frac, flat_idx, weights);
   auto flat_mesh = mesh.view({-1, C});
-  auto scaled = frac * (double)M;
-  auto floor_scaled = torch::floor(scaled);
-  auto f = scaled - floor_scaled;
-  auto base = floor_scaled.to(torch::kLong) - (a == 1 ? 1 : 0);
-  std::vector<torch::Tensor> WX = axis_weights(f.select(1, 0), a), WY = axis_weights(f.select(1, 1), a),
-                             WZ = axis_weights(f.select(1, 2), a);
-  auto out = torch::zeros({frac.size(0), C}, mesh.options());
-  for (int ox = 0; ox < S; ++ox)
-    for (int oy = 0; oy < S; ++oy)
-      for (int oz = 0; oz < S; ++oz) {
-        auto w = (WX[ox] * WY[oy] * WZ[oz]).unsqueeze(-1);
-        auto ix = torch::remainder(base.select(1, 0) + ox, M);
-        auto iy = torch::remainder(base.select(1, 1) + oy, M);
-        auto iz = torch::remainder(base.select(1, 2) + oz, M);
-        auto flat = (ix * M + iy) * M + iz;
-        out = out + flat_mesh.index_select(0, flat) * w;
-      }
-  return out;
+  auto gathered = flat_mesh.index_select(0, flat_idx.reshape(-1)).view({N, S * S * S, C});  // ONE gather
+  return (gathered * weights.unsqueeze(-1)).sum(1);                       // [N,C]
 }
 
 torch::Tensor MFFMBDSolver::dipole_field(
@@ -101,7 +95,7 @@ torch::Tensor MFFMBDSolver::dipole_field(
     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
     const torch::Device& device, const torch::Tensor& alpha_pol, double beta, bool damping) const {
   const int M = config_.mesh_size;
-  auto eff = cell.to(torch::kFloat64);
+  auto eff = cell.to(device);  // inherit input dtype (float32 on GPU; float64 in the tests)
   auto inv = torch::linalg_inv(eff);
   auto frac = torch::matmul(pos, inv);
   frac = frac - torch::floor(frac);
@@ -115,8 +109,8 @@ torch::Tensor MFFMBDSolver::dipole_field(
   auto kdotmu = (kc * mu_k).sum(-1);                                        // [K] complex
   auto screen = torch::exp(-k2 / (4.0 * alpha * alpha));
   // assignment-window deconvolution 1/|W|^2, W = prod_axes sinc(m/M)^exp (exp=2 cic / 4 pcs; Python backend).
-  auto cpu2 = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
-  auto sinc1d = torch::sinc(fft_freqs(M, cpu2) / (double)M).pow(assignment_stencil(config_.assignment)).to(device);  // [M]
+  auto dopt = torch::TensorOptions().dtype(eff.scalar_type()).device(device);  // on-device, input dtype
+  auto sinc1d = torch::sinc(fft_freqs(M, dopt) / (double)M).pow(assignment_stencil(config_.assignment));  // [M]
   auto win = (sinc1d.view({M, 1, 1}) * sinc1d.view({1, M, 1}) * sinc1d.view({1, 1, M})).reshape({-1});
   auto wdeconv = torch::reciprocal(win.clamp_min(1e-6).square());                // [K]
   auto scale = -(4.0 * M_PI) / volume * screen * wdeconv / k2;              // [K]  (-4pi/V k k/k^2 / |W|^2)
@@ -129,7 +123,7 @@ torch::Tensor MFFMBDSolver::dipole_field(
   field = field + (4.0 * a3 / (3.0 * SQRT_PI)) * mu;                        // self term
 
   if (src.numel() > 0) {
-    auto shift_cart = torch::matmul(shifts.to(torch::kFloat64), eff);
+    auto shift_cart = torch::matmul(shifts.to(eff.scalar_type()), eff);
     auto rvec = pos.index_select(0, dst) - pos.index_select(0, src) + shift_cart;  // [E,3]
     auto r = torch::linalg_vector_norm(rvec, 2, -1).clamp_min(1e-12);
     auto r2 = r * r;
@@ -212,7 +206,7 @@ torch::Tensor MFFMBDSolver::mbd_energy(
   };
 
   // --- spectral bounds: fixed (config) for conservative MD, else matvec-only power iteration ---
-  auto opt = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+  auto opt = torch::TensorOptions().dtype(global_pos.scalar_type()).device(device);  // inherit f32/f64
   double lmax, lmin;
   if (config_.cheb_lmax > 0.0) {
     lmin = config_.cheb_lmin; lmax = config_.cheb_lmax;  // E becomes a smooth fn of p -> conservative
@@ -220,13 +214,13 @@ torch::Tensor MFFMBDSolver::mbd_energy(
     torch::NoGradGuard ng;
     // deterministic inits (CPU generator -> device) so bounds, hence E, are reproducible across calls.
     auto g1 = at::detail::createCPUGenerator(12345);
-    auto v = torch::randn({n}, g1, torch::TensorOptions().dtype(torch::kFloat64)).to(device);
+    auto v = torch::randn({n}, g1, torch::TensorOptions().dtype(torch::kFloat64)).to(opt);
     v = v / v.norm();
     double lam = 0;
     for (int i = 0; i < config_.power_steps; ++i) { auto w = mv(v); lam = (v * w).sum().item<double>(); v = w / w.norm().clamp_min(1e-30); }
     lmax = lam * (1.0 + config_.bound_pad);
     auto g2 = at::detail::createCPUGenerator(67890);
-    v = torch::randn({n}, g2, torch::TensorOptions().dtype(torch::kFloat64)).to(device); v = v / v.norm();
+    v = torch::randn({n}, g2, torch::TensorOptions().dtype(torch::kFloat64)).to(opt); v = v / v.norm();
     double mu = 0;
     for (int i = 0; i < config_.power_steps; ++i) { auto w = lmax * v - mv(v); mu = (v * w).sum().item<double>(); v = w / w.norm().clamp_min(1e-30); }
     lmin = std::max((lmax - mu) * (1.0 - config_.bound_pad), 1e-6);
@@ -249,7 +243,7 @@ torch::Tensor MFFMBDSolver::mbd_energy(
 
   // --- Hutchinson + Chebyshev recurrence (fixed Rademacher probes) ---
   auto gen = at::detail::createCPUGenerator(0);
-  auto probes = (2.0 * torch::randint(0, 2, {config_.num_probes, n}, gen, torch::TensorOptions().dtype(torch::kFloat64)) - 1.0).to(device);
+  auto probes = (2.0 * torch::randint(0, 2, {config_.num_probes, n}, gen, torch::TensorOptions().dtype(torch::kFloat64)) - 1.0).to(opt);
   auto tr = torch::zeros({}, opt);
   for (int r = 0; r < config_.num_probes; ++r) {
     auto z = probes[r];
@@ -306,9 +300,9 @@ MBDOutputs MFFMBDSolver::run_autograd(const torch::Tensor& pos, const torch::Ten
                                       double alpha_ewald, const torch::Device& device) const {
   const int N = pos.size(0);
   torch::AutoGradMode grad_on(true);
-  auto p = pos.to(device, torch::kFloat64).clone().detach().set_requires_grad(true);
-  auto cellf = cell.to(device, torch::kFloat64);
-  auto src_ = source.to(device, torch::kFloat64);
+  auto p = pos.to(device).clone().detach().set_requires_grad(true);  // inherit input dtype (f32 on GPU)
+  auto cellf = cell.to(device);
+  auto src_ = source.to(device);
   double bl = 0.0, bu = 0.0;
   auto E = mbd_energy(p, src_, cellf, src, dst, shift, device, alpha_ewald, &bl, &bu);
   auto grads = torch::autograd::grad({E}, {p}, /*grad_outputs=*/{}, /*retain_graph=*/false,
@@ -317,8 +311,8 @@ MBDOutputs MFFMBDSolver::run_autograd(const torch::Tensor& pos, const torch::Ten
   out.lmin = bl; out.lmax = bu;
   out.energy = E.item<double>();
   out.forces = grads[0].defined() ? (-grads[0]).detach()
-                                  : torch::zeros({N, 3}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
-  out.atom_energy = torch::full({N}, out.energy / N, torch::TensorOptions().dtype(torch::kFloat64).device(device));
+                                  : torch::zeros({N, 3}, torch::TensorOptions().dtype(p.scalar_type()).device(device));
+  out.atom_energy = torch::full({N}, out.energy / N, torch::TensorOptions().dtype(p.scalar_type()).device(device));
   return out;
 }
 

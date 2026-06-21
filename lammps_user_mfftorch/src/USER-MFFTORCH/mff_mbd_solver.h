@@ -112,6 +112,10 @@ class MFFMBDSolver {
       const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
       const torch::Device& device) const;
 
+  // vectorized assignment: flat mesh indices [N,S^3] (long) + stencil weights [N,S^3] for one
+  // scatter_add/gather (instead of an S^3 launch loop) -- the GPU hot-path win.
+  void assignment_idx_weights(const torch::Tensor& frac, torch::Tensor& flat_idx, torch::Tensor& weights) const;
+
   // shared grid ops (mirror mff_reciprocal_solver) -- spread [N,C]->mesh, gather mesh->[N,C].
   torch::Tensor spread_to_mesh(const torch::Tensor& frac, const torch::Tensor& source, const std::array<int,3>& pbc) const;
   torch::Tensor gather_from_mesh(const torch::Tensor& frac, const torch::Tensor& mesh, const std::array<int,3>& pbc) const;
