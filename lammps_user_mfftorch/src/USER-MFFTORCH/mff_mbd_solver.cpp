@@ -99,7 +99,7 @@ torch::Tensor MFFMBDSolver::gather_from_mesh(const torch::Tensor& frac, const to
 torch::Tensor MFFMBDSolver::dipole_field(
     const torch::Tensor& pos, const torch::Tensor& mu, const torch::Tensor& cell, double alpha,
     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
-    const torch::Device& device) const {
+    const torch::Device& device, const torch::Tensor& alpha_pol, double beta, bool damping) const {
   const int M = config_.mesh_size;
   auto eff = cell.to(torch::kFloat64);
   auto inv = torch::linalg_inv(eff);
@@ -141,6 +141,17 @@ torch::Tensor MFFMBDSolver::dipole_field(
     auto rdotmu = (rvec * mu_src).sum(-1);
     auto contrib = -b1.unsqueeze(-1) * mu_src + b2.unsqueeze(-1) * rvec * rdotmu.unsqueeze(-1);
     field = field.index_add(0, dst, contrib);
+    if (damping && alpha_pol.defined()) {
+      // rsSCS range separation: the coupling must carry damp*T = T - (1-damp)*T_bare. The Ewald field
+      // above is the full (undamped) periodic T; subtract the real-space (1-damp)*T_bare here.
+      // T_bare = (3 rr - I)/r^3 (the BARE tensor, not erfc): T_bare.mu = 3(r.mu)r/r^5 - mu/r^3.
+      auto r3 = r2 * r, r5 = r3 * r2;
+      auto t_bare = 3.0 * rdotmu.unsqueeze(-1) * rvec / r5.unsqueeze(-1) - mu_src / r3.unsqueeze(-1);
+      auto radius = (alpha_pol.index_select(0, src).clamp_min(0.0).pow(1.0 / 3.0)
+                     + alpha_pol.index_select(0, dst).clamp_min(0.0).pow(1.0 / 3.0)).clamp_min(1e-6);
+      auto one_minus_damp = torch::exp(-torch::pow((r / (beta * radius)).clamp_min(0.0), 6));  // = 1-damp
+      field = field.index_add(0, dst, -(one_minus_damp.unsqueeze(-1)) * t_bare);
+    }
   }
   return field;
 }
@@ -151,8 +162,35 @@ torch::Tensor MFFMBDSolver::coupled_matvec(
     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
     const torch::Device& device) const {
   auto wsa = (omega * alpha.clamp_min(0).sqrt()).unsqueeze(-1);             // [N,1]
-  auto fld = dipole_field(pos, wsa * x, cell, alpha_ewald, src, dst, shifts, device);
-  return (omega.unsqueeze(-1) * omega.unsqueeze(-1)) * x + wsa * fld;
+  // off-diagonal C_ij = coupling_scale * w_i w_j sqrt(a_i a_j) damp(r) T_ij ; damp via dipole_field.
+  auto fld = dipole_field(pos, wsa * x, cell, alpha_ewald, src, dst, shifts, device,
+                          alpha, config_.mbd_beta, config_.damping);
+  return (omega.unsqueeze(-1) * omega.unsqueeze(-1)) * x + config_.coupling_scale * wsa * fld;
+}
+
+double MFFMBDSolver::mbd_energy_dense(
+    const torch::Tensor& global_pos, const torch::Tensor& mbd_source, const torch::Tensor& cell,
+    const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
+    const torch::Device& device, double alpha_ewald, double* min_eig) const {
+  torch::NoGradGuard ng;
+  const int N = global_pos.size(0), n = 3 * N;
+  auto omega = mbd_source.select(1, 0).contiguous();
+  auto alpha = mbd_source.select(1, 1).contiguous();
+  double Lmin = torch::linalg_vector_norm(cell.to(torch::kFloat64), 2, 1).min().item<double>();
+  double alpha_ew = (alpha_ewald > 0.0) ? alpha_ewald : config_.ewald_alpha_prefactor / (0.5 * Lmin);
+  auto opt = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+  std::vector<torch::Tensor> cols;
+  for (int i = 0; i < n; ++i) {
+    auto e = torch::zeros({n}, opt); e[i] = 1.0;
+    cols.push_back(coupled_matvec(e.view({N, 3}), omega, alpha, global_pos, cell, alpha_ew, src, dst, shifts, device)
+                       .reshape({-1}));
+  }
+  auto C = torch::stack(cols, 1);                  // [n,n], column i = C.e_i
+  C = 0.5 * (C + C.transpose(0, 1));               // symmetrize numerical asymmetry
+  auto eig_raw = torch::linalg_eigvalsh(C);
+  if (min_eig) *min_eig = eig_raw.min().item<double>();   // <0 -> C indefinite (QHO unphysical)
+  auto eig = eig_raw.clamp_min(1e-10);
+  return (0.5 * eig.sqrt().sum() - 1.5 * omega.sum()).item<double>();
 }
 
 torch::Tensor MFFMBDSolver::mbd_energy(
@@ -397,6 +435,37 @@ int main() {
     std::printf("assignment=%s mesh=%d (atoms ON cell boundaries): E=%.8f worst conservativity rel err = %.2e  %s\n",
                 names[asg], cfg.mesh_min, out.energy, worst, worst < 1e-3 ? "CONSERVATIVE" : "DISCONTINUOUS-FORCE");
   }
+  return 0;
+}
+#endif
+
+#ifdef MBD_PHYS_TEST
+#include <cstdio>
+// Validates the rsSCS damping fixes the E_MBD physicality (the "sign"). A CLOSE pair (r=1.2, inside the
+// damping radius): the UNDAMPED dipole tensor over-couples and makes the coupled-dipole matrix C
+// INDEFINITE (min eigenvalue < 0 -> imaginary QHO frequency, unphysical, the E_MBD pathology). The
+// rsSCS damping keeps C positive-definite (min eigenvalue > 0) -> physical, E_MBD <= 0. Compared to the
+// Python dense reference (/tmp/mbd_phys_ref.py).
+int main() {
+  using namespace mfftorch;
+  auto o = torch::TensorOptions().dtype(torch::kFloat64);
+  auto lo = torch::TensorOptions().dtype(torch::kLong);
+  auto pos = torch::tensor({{0.0, 0.0, 0.0}, {1.2, 0.0, 0.0}}, o);
+  const double L = 40.0;
+  auto cell = torch::eye(3, o) * L;
+  auto source = torch::tensor({{1.0, 1.0}, {1.0, 1.0}}, o);  // (omega, alpha) -> radius = 1+1 = 2
+  auto src = torch::tensor({1, 0}, lo);
+  auto dst = torch::tensor({0, 1}, lo);
+  auto sh = torch::zeros({2, 3}, o);
+  MBDConfig cfg; cfg.mesh_size = 48; cfg.coupling_scale = 1.0; cfg.mbd_beta = 1.5;
+  MFFMBDSolver solver;
+  double me_u = 0.0, me_d = 0.0;
+  cfg.damping = false; solver.set_config(cfg);
+  double Eu = solver.mbd_energy_dense(pos, source, cell, src, dst, sh, torch::kCPU, -1.0, &me_u);
+  cfg.damping = true; solver.set_config(cfg);
+  double Ed = solver.mbd_energy_dense(pos, source, cell, src, dst, sh, torch::kCPU, -1.0, &me_d);
+  std::printf("CPP_UNDAMPED min_eig=%.6f E=%.6f  (%s)\n", me_u, Eu, me_u < 0 ? "INDEFINITE-UNPHYSICAL" : "PD");
+  std::printf("CPP_DAMPED   min_eig=%.6f E=%.6f  (%s)\n", me_d, Ed, me_d > 0 ? "POSITIVE-DEFINITE-OK" : "INDEFINITE");
   return 0;
 }
 #endif

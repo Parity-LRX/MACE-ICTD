@@ -37,6 +37,9 @@ struct MBDConfig {
   double bound_pad = 0.05;             // pad on [lmin, lmax]
   double cheb_lmin = 0.0;              // fixed spectral bounds for the Chebyshev (0 -> auto power-iter).
   double cheb_lmax = 0.0;              // FIX these over an MD trajectory -> conservative forces.
+  bool damping = true;                 // rsSCS-style range separation: coupling *= 1-exp(-(r/(beta*R))^6)
+  double mbd_beta = 1.0;               //   damping length scale (R = alpha_i^1/3 + alpha_j^1/3)
+  double coupling_scale = 1.0;         //   overall coupling prefactor (learned in the real model)
   double real_cutoff = 0.0;            // real-space T_SR cutoff (0 -> derive from alpha)
   std::array<int, 3> pbc{{1, 1, 1}};
 };
@@ -70,6 +73,13 @@ class MFFMBDSolver {
       double alpha_ewald = -1.0,   // Ewald split parameter; <=0 -> box-tied prefactor/(0.5*Lmin)
       double* used_lmin = nullptr, double* used_lmax = nullptr) const;
 
+  // Dense O(N^3) reference (builds C via 3N matvecs + eigvalsh) for validating the E_MBD sign/magnitude
+  // against the Python ManyBodyDispersion. E_MBD = 1/2 sum sqrt(lambda) - 3/2 sum omega.
+  double mbd_energy_dense(
+      const torch::Tensor& global_pos, const torch::Tensor& mbd_source, const torch::Tensor& cell,
+      const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
+      const torch::Device& device, double alpha_ewald = -1.0, double* min_eig = nullptr) const;
+
   // Deployment entry point: reuse a LAMMPS-provided real-space neighbour list (src,dst,shifts) at
   // `real_cutoff` (e.g. the pair_style 'dispersion <cutoff>' ghost list). The Ewald split parameter is
   // TIED TO THE CUTOFF (alpha = ewald_bound/real_cutoff) so the erfc near field fits inside the list,
@@ -86,10 +96,13 @@ class MFFMBDSolver {
                      const torch::Device& device);
 
   // T.mu Ewald dipole field [N,3]  (reciprocal PME + real-space T_SR + self). Public for parity tests.
+  // damping (rsSCS): when on, subtract the real-space (1-damp)*T_bare so the field carries damp*T, where
+  // damp = 1-exp(-(r/(beta*R))^6), R = alpha_pol_i^1/3 + alpha_pol_j^1/3. Default off -> bare Ewald T.
   torch::Tensor dipole_field(
       const torch::Tensor& pos, const torch::Tensor& mu, const torch::Tensor& cell,
       double alpha, const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
-      const torch::Device& device) const;
+      const torch::Device& device,
+      const torch::Tensor& alpha_pol = torch::Tensor(), double beta = 1.0, bool damping = false) const;
 
  private:
   // C.x coupled-dipole matvec [N,3] -> [N,3].
