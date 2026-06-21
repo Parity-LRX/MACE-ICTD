@@ -724,17 +724,9 @@ def _export_single_core(
         dispersion_training_graph_rule,
     )
 
-    if (
-        getattr(metadata_model, "dispersion", None) is not None
-        and not dispersion_mode_uses_cutoff_edges(
-            str(getattr(metadata_model, "long_range_dispersion_mode", "none")),
-            mbd_operator_backend=str(getattr(metadata_model, "mbd_operator_backend", "edge_sparse")),
-        )
-    ):
-        raise NotImplementedError(
-            "LibTorch/LAMMPS export does not yet support mbd_operator_backend=pme_fft; "
-            "the runtime cuFFT MBD dipole-tensor matvec backend is not implemented."
-        )
+    # pme_fft (reciprocal-only, no cutoff dispersion edges) IS supported: like edge_sparse, the deploy core
+    # only traces emit_source (the omega/alpha heads) and DEFERS the coupled-dipole energy to the C++ MBD
+    # solver, which runs the matching reciprocal PME operator (use_fft) from the metadata. No edge list needed.
     # Multipole/long-range models flag themselves as exporting a packed reciprocal_source; honor that
     # automatically so the core .pt always includes the source slot even without the explicit CLI flag.
     if getattr(metadata_model, "long_range_exports_reciprocal_source", False):

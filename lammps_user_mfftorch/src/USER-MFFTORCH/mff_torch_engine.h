@@ -94,6 +94,12 @@ class MFFTorchEngine {
   int64_t long_range_mbd_source_offset() const { return long_range_mbd_source_offset_; }
   double long_range_mbd_beta() const { return long_range_mbd_beta_; }
   double long_range_mbd_coupling_scale() const { return long_range_mbd_coupling_scale_; }
+  // pme_fft deploy: the MBD solver runs the reciprocal-only PME operator (use_fft) with the SAME mesh/
+  // assignment/alpha-prefactor the model trained with, so deploy == train.
+  bool long_range_mbd_use_fft() const { return mbd_operator_backend_ == "pme_fft"; }
+  int mbd_pme_mesh_size() const { return mbd_pme_mesh_size_; }
+  const std::string& mbd_pme_assignment() const { return mbd_pme_assignment_; }
+  double mbd_pme_ewald_alpha_prefactor() const { return mbd_pme_ewald_alpha_prefactor_; }
   bool requires_mbd_dispersion_edges() const {
     return dispersion_deployment_graph_rule_ == "explicit_canonical_single_image_edge_sparse" &&
            dispersion_cutoff_ > 0.0;
@@ -211,6 +217,9 @@ class MFFTorchEngine {
   int64_t long_range_mbd_source_offset_ = 0;
   double long_range_mbd_beta_ = 1.0;
   double long_range_mbd_coupling_scale_ = 1.0;
+  int mbd_pme_mesh_size_ = 16;
+  std::string mbd_pme_assignment_ = "cic";
+  double mbd_pme_ewald_alpha_prefactor_ = 5.0;
   int64_t trace_num_nodes_ = 0;
   int64_t trace_num_edges_ = 0;
 

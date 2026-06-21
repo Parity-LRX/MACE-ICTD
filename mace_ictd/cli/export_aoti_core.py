@@ -623,6 +623,10 @@ def main() -> int:
                    help="synthetic combined export: dispersion cutoff")
     p.add_argument("--lr-mesh-size", dest="lr_mesh_size_arg", type=int, default=16,
                    help="synthetic combined export: long-range/MBD PME mesh size")
+    p.add_argument("--mbd-operator-backend", dest="mbd_operator_backend_arg", default=None,
+                   choices=["edge_sparse", "pme_fft"],
+                   help="synthetic combined export: MBD-SLQ operator backend (edge_sparse=direct cutoff sum; "
+                        "pme_fft=reciprocal-only PME). Deploy runs the matching C++ MBD operator.")
     p.add_argument("--out", default="/tmp/fscetp_aoti.pt2")
     p.add_argument("--fallback", default=None,
                    help="path to an N-flexible TorchScript core (.pt) the LAMMPS engine should fall back to "
@@ -759,6 +763,8 @@ def main() -> int:
         if args.dispersion_mode_arg:
             _lr_extra.update(long_range_dispersion_mode=args.dispersion_mode_arg,
                              dispersion_cutoff=args.dispersion_cutoff_arg, mbd_pme_mesh_size=args.lr_mesh_size_arg)
+            if args.mbd_operator_backend_arg:
+                _lr_extra.update(mbd_operator_backend=args.mbd_operator_backend_arg)
         if _lr_extra:
             print(f"[aoti] synthetic combined export extras: {sorted(_lr_extra)}")
         model = build_model(
@@ -844,10 +850,18 @@ def main() -> int:
         and dispersion_mode == "mbd-slq"
         and mbd_operator_backend == "pme_fft"
     ):
-        raise NotImplementedError(
-            "AOTI/LAMMPS export does not yet support mbd_operator_backend=pme_fft; "
-            "the runtime cuFFT MBD dipole-tensor matvec backend is not implemented."
-        )
+        # pme_fft is reciprocal-only (no real-space dispersion edges): the model emits (omega, alpha) and the
+        # C++ MBD solver runs the matching reciprocal PME operator (use_fft) with the same mesh/assignment/
+        # alpha-prefactor (carried in the metadata). It still needs the AOTI-friendly SLQ quadrature, since
+        # eigh on the Lanczos tridiagonal is not a deployable AOTI path.
+        term = getattr(getattr(_bare, "dispersion", None), "term", None)
+        if term is not None and hasattr(term, "quadrature"):
+            term.quadrature = "newton-schulz"
+            if hasattr(term, "probe_mode"):
+                term.probe_mode = "atom-rademacher"
+            if hasattr(term, "sqrt_iterations"):
+                term.sqrt_iterations = max(int(getattr(term, "sqrt_iterations", 8)), 8)
+            print("[aoti] dispersion pme_fft: SLQ atom-rademacher + newton-schulz quadrature for AOTI")
     # Pairwise C6 dispersion can ride on the deployment edge list. MBD/SLQ-MBD needs a second
     # explicit dispersion edge list so its cutoff can differ from the short-range MACE cutoff.
     if getattr(_bare, "dispersion", None) is not None and float(getattr(_bare, "dispersion_cutoff", 0.0) or 0.0) > 0.0:

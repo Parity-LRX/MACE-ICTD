@@ -451,6 +451,13 @@ void PairMFFTorch::init_style() {
         mcfg.mbd_beta = engine_->long_range_mbd_beta();
         mcfg.coupling_scale = engine_->long_range_mbd_coupling_scale();
       }
+      if (engine_->long_range_mbd_use_fft()) {  // pme_fft: reciprocal-only PME, match the TRAINED operator
+        mcfg.use_fft = true;
+        mcfg.mesh_size = engine_->mbd_pme_mesh_size();          // FIXED training mesh (not adaptive)
+        mcfg.mesh_max = std::max(mcfg.mesh_max, engine_->mbd_pme_mesh_size());
+        mcfg.assignment = (engine_->mbd_pme_assignment() == "pcs") ? 1 : 0;
+        mcfg.ewald_alpha_prefactor = engine_->mbd_pme_ewald_alpha_prefactor();  // box-tied alpha = prefactor/(0.5 Lmin)
+      }
       mbd_solver_->set_config(mcfg);
     }
     if (tree_fmm_solver_) {

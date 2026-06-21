@@ -630,6 +630,9 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
         (void)parse_int64_from_metadata(content, "\"long_range_mbd_source_offset\"", long_range_mbd_source_offset_);
         (void)parse_double_from_metadata(content, "\"long_range_mbd_beta\"", long_range_mbd_beta_);
         (void)parse_double_from_metadata(content, "\"long_range_mbd_coupling_scale\"", long_range_mbd_coupling_scale_);
+        { int64_t _mpm = mbd_pme_mesh_size_; (void)parse_int64_from_metadata(content, "\"mbd_pme_mesh_size\"", _mpm); mbd_pme_mesh_size_ = static_cast<int>(_mpm); }
+        (void)parse_string_from_metadata(content, "\"mbd_pme_assignment\"", mbd_pme_assignment_);
+        (void)parse_double_from_metadata(content, "\"mbd_pme_ewald_alpha_prefactor\"", mbd_pme_ewald_alpha_prefactor_);
         reconcile_dispersion_training_graph_rule(
             has_dispersion_training_graph_rule,
             dispersion_training_graph_rule_,
@@ -640,11 +643,8 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
             dispersion_deployment_graph_rule_,
             long_range_dispersion_mode_,
             mbd_operator_backend_);
-        if (long_range_dispersion_mode_ == "mbd-slq" && mbd_operator_backend_ == "pme_fft") {
-          throw std::runtime_error(
-              "mff/torch does not yet support mbd_operator_backend=pme_fft at deployment; "
-              "the required cuFFT MBD dipole-tensor matvec backend is not implemented.");
-        }
+        // mbd_operator_backend=pme_fft IS supported at deployment now: the MBD solver runs the reciprocal-only
+        // PME operator (use_fft) mirroring the trained apply_periodic_dipole_pme_field. (No throw.)
         if (long_range_source_channels_ <= 0) long_range_source_channels_ = reciprocal_source_channels_;
         if (long_range_runtime_backend_ == "none" && core_exports_reciprocal_source_ && reciprocal_source_channels_ > 0) {
           long_range_runtime_backend_ = "mesh_fft";
@@ -763,6 +763,9 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
       (void)parse_int64_from_metadata(content, "\"long_range_mbd_source_offset\"", long_range_mbd_source_offset_);
       (void)parse_double_from_metadata(content, "\"long_range_mbd_beta\"", long_range_mbd_beta_);
       (void)parse_double_from_metadata(content, "\"long_range_mbd_coupling_scale\"", long_range_mbd_coupling_scale_);
+      { int64_t _mpm = mbd_pme_mesh_size_; (void)parse_int64_from_metadata(content, "\"mbd_pme_mesh_size\"", _mpm); mbd_pme_mesh_size_ = static_cast<int>(_mpm); }
+      (void)parse_string_from_metadata(content, "\"mbd_pme_assignment\"", mbd_pme_assignment_);
+      (void)parse_double_from_metadata(content, "\"mbd_pme_ewald_alpha_prefactor\"", mbd_pme_ewald_alpha_prefactor_);
       reconcile_dispersion_training_graph_rule(
           has_dispersion_training_graph_rule,
           dispersion_training_graph_rule_,
@@ -773,11 +776,8 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
           dispersion_deployment_graph_rule_,
           long_range_dispersion_mode_,
           mbd_operator_backend_);
-      if (long_range_dispersion_mode_ == "mbd-slq" && mbd_operator_backend_ == "pme_fft") {
-        throw std::runtime_error(
-            "mff/torch does not yet support mbd_operator_backend=pme_fft at deployment; "
-            "the required cuFFT MBD dipole-tensor matvec backend is not implemented.");
-      }
+      // mbd_operator_backend=pme_fft IS supported at deployment now: the MBD solver runs the reciprocal-only
+      // PME operator (use_fft) mirroring the trained apply_periodic_dipole_pme_field. (No throw.)
       (void)parse_int64_from_metadata(content, "\"trace_num_nodes\"", trace_num_nodes_);
       (void)parse_int64_from_metadata(content, "\"trace_num_edges\"", trace_num_edges_);
       (void)parse_string_from_metadata(content, "\"external_tensor_irrep\"", external_tensor_irrep_);
