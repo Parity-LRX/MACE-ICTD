@@ -145,7 +145,7 @@ torch::Tensor MFFMBDSolver::coupled_matvec(
 torch::Tensor MFFMBDSolver::mbd_energy(
     const torch::Tensor& global_pos, const torch::Tensor& mbd_source, const torch::Tensor& cell,
     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
-    const torch::Device& device) const {
+    const torch::Device& device, double* used_lmin, double* used_lmax) const {
   const int N = global_pos.size(0);
   const int n = 3 * N;
   auto omega = mbd_source.select(1, 0).contiguous();   // [N]
@@ -160,21 +160,28 @@ torch::Tensor MFFMBDSolver::mbd_energy(
         .reshape({-1});
   };
 
-  // --- spectral bounds via matvec-only power iteration (no eigh) ---
+  // --- spectral bounds: fixed (config) for conservative MD, else matvec-only power iteration ---
   auto opt = torch::TensorOptions().dtype(torch::kFloat64).device(device);
   double lmax, lmin;
-  {
+  if (config_.cheb_lmax > 0.0) {
+    lmin = config_.cheb_lmin; lmax = config_.cheb_lmax;  // E becomes a smooth fn of p -> conservative
+  } else {
     torch::NoGradGuard ng;
-    auto v = torch::randn({n}, opt);
+    // deterministic inits (CPU generator -> device) so bounds, hence E, are reproducible across calls.
+    auto g1 = at::detail::createCPUGenerator(12345);
+    auto v = torch::randn({n}, g1, torch::TensorOptions().dtype(torch::kFloat64)).to(device);
     v = v / v.norm();
     double lam = 0;
     for (int i = 0; i < config_.power_steps; ++i) { auto w = mv(v); lam = (v * w).sum().item<double>(); v = w / w.norm().clamp_min(1e-30); }
     lmax = lam * (1.0 + config_.bound_pad);
-    v = torch::randn({n}, opt); v = v / v.norm();
+    auto g2 = at::detail::createCPUGenerator(67890);
+    v = torch::randn({n}, g2, torch::TensorOptions().dtype(torch::kFloat64)).to(device); v = v / v.norm();
     double mu = 0;
     for (int i = 0; i < config_.power_steps; ++i) { auto w = lmax * v - mv(v); mu = (v * w).sum().item<double>(); v = w / w.norm().clamp_min(1e-30); }
     lmin = std::max((lmax - mu) * (1.0 - config_.bound_pad), 1e-6);
   }
+  if (used_lmin) *used_lmin = lmin;
+  if (used_lmax) *used_lmax = lmax;
 
   // --- Chebyshev coeffs of sqrt on [lmin,lmax] ---
   const int deg = config_.cheb_degree, Mc = deg + 1;
@@ -209,6 +216,68 @@ torch::Tensor MFFMBDSolver::mbd_energy(
   return 0.5 * tr - 1.5 * omega.sum();
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> MFFMBDSolver::build_periodic_neighbors(
+    const torch::Tensor& pos, const torch::Tensor& cell, double cutoff) const {
+  auto opt = torch::TensorOptions().dtype(torch::kFloat64).device(pos.device());
+  auto cellf = cell.to(torch::kFloat64);
+  auto rownorm = torch::linalg_vector_norm(cellf, 2, 1);  // [3]
+  int na = config_.pbc[0] ? (int)std::ceil(cutoff / rownorm[0].item<double>()) : 0;
+  int nb = config_.pbc[1] ? (int)std::ceil(cutoff / rownorm[1].item<double>()) : 0;
+  int nc = config_.pbc[2] ? (int)std::ceil(cutoff / rownorm[2].item<double>()) : 0;
+  std::vector<torch::Tensor> vsrc, vdst, vshift;
+  auto pi = pos.unsqueeze(1);  // [N,1,3]
+  auto pj = pos.unsqueeze(0);  // [1,N,3]
+  for (int i = -na; i <= na; ++i)
+    for (int j = -nb; j <= nb; ++j)
+      for (int k = -nc; k <= nc; ++k) {
+        auto shift_int = torch::tensor({(double)i, (double)j, (double)k}, opt);     // [3]
+        auto shift_cart = torch::matmul(shift_int, cellf);                          // [3]
+        auto rij = pj + shift_cart - pi;                                            // [N,N,3]  pos[q]+s-pos[p]
+        auto dist = torch::linalg_vector_norm(rij, 2, -1);                          // [N,N]
+        auto within = dist < cutoff;
+        if (i == 0 && j == 0 && k == 0) within = within & (dist > 1e-8);            // drop self
+        auto idx = torch::nonzero(within);                                          // [E,2] (p,q)
+        if (idx.size(0) == 0) continue;
+        vsrc.push_back(idx.select(1, 0));
+        vdst.push_back(idx.select(1, 1));
+        vshift.push_back(shift_int.unsqueeze(0).expand({idx.size(0), 3}).contiguous());
+      }
+  if (vsrc.empty()) {
+    auto e = torch::empty({0}, torch::TensorOptions().dtype(torch::kLong).device(pos.device()));
+    return {e, e, torch::empty({0, 3}, opt)};
+  }
+  return {torch::cat(vsrc), torch::cat(vdst), torch::cat(vshift)};
+}
+
+MBDOutputs MFFMBDSolver::compute(const torch::Tensor& pos, const torch::Tensor& source,
+                                 const torch::Tensor& cell, const torch::Device& device) const {
+  const int N = pos.size(0);
+  torch::AutoGradMode grad_on(true);
+  auto p = pos.to(device, torch::kFloat64).clone().detach().set_requires_grad(true);
+  auto cellf = cell.to(device, torch::kFloat64);
+  auto src_ = source.to(device, torch::kFloat64);
+  double Lmin = torch::linalg_vector_norm(cellf, 2, 1).min().item<double>();
+  double alpha_ew = config_.ewald_alpha_prefactor / (0.5 * Lmin);
+  double cutoff = config_.real_cutoff > 0.0 ? config_.real_cutoff : 5.0 / alpha_ew;  // erfc(5)~1e-12
+
+  torch::Tensor src, dst, shift;
+  {
+    torch::NoGradGuard ng;
+    std::tie(src, dst, shift) = build_periodic_neighbors(p.detach(), cellf, cutoff);
+  }
+  double bl = 0.0, bu = 0.0;
+  auto E = mbd_energy(p, src_, cellf, src, dst, shift, device, &bl, &bu);
+  auto grads = torch::autograd::grad({E}, {p}, /*grad_outputs=*/{}, /*retain_graph=*/false,
+                                     /*create_graph=*/false, /*allow_unused=*/true);
+  MBDOutputs out;
+  out.lmin = bl; out.lmax = bu;
+  out.energy = E.item<double>();
+  out.forces = grads[0].defined() ? (-grads[0]).detach()
+                                  : torch::zeros({N, 3}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
+  out.atom_energy = torch::full({N}, out.energy / N, torch::TensorOptions().dtype(torch::kFloat64).device(device));
+  return out;
+}
+
 }  // namespace mfftorch
 
 #ifdef MBD_STANDALONE_TEST
@@ -234,6 +303,64 @@ int main() {
   cfg.cheb_degree = 20; cfg.num_probes = 64; solver.set_config(cfg);
   auto E = solver.mbd_energy(pos, source, cell, src, dst, sh, torch::kCPU);
   std::printf("CPP_E_MBD %.8f (finite=%d)\n", E.item<double>(), (int)std::isfinite(E.item<double>()));
+  return 0;
+}
+#endif
+
+#ifdef MBD_MD_TEST
+#include <cstdio>
+#include <vector>
+// End-to-end driver mimicking the pair-style contract: a real periodic crystal -> compute() ->
+// energy + autograd forces; verifies forces are CONSERVATIVE (-dE/dx == central finite difference)
+// and that a velocity-Verlet MD step advances and stays finite.
+int main() {
+  using namespace mfftorch;
+  auto o = torch::TensorOptions().dtype(torch::kFloat64);
+  const int nx = 3; const double a = 3.0; const double L = nx * a;       // simple-cubic 3x3x3, box 9 A
+  std::vector<std::array<double, 3>> P;
+  // global non-commensurate offset (0.137,0.241,0.073) keeps every atom OFF the mesh-cell boundaries,
+  // where 2nd-order CIC has a known force discontinuity (one-sided autograd vs centred FD). Production
+  // MD needs a higher-order (PCS) assignment for everywhere-smooth forces.
+  for (int i = 0; i < nx; ++i) for (int j = 0; j < nx; ++j) for (int k = 0; k < nx; ++k)
+    P.push_back({i * a + 0.15 * ((i + j + k) % 2) + 0.137, j * a + 0.1 * (k % 2) + 0.241, k * a + 0.073});
+  const int N = (int)P.size();
+  auto pos = torch::zeros({N, 3}, o);
+  for (int n = 0; n < N; ++n) { pos[n][0] = P[n][0]; pos[n][1] = P[n][1]; pos[n][2] = P[n][2]; }
+  auto cell = torch::eye(3, o) * L;
+  auto source = torch::zeros({N, 2}, o);                                 // (omega, alpha_pol), 2 sublattices
+  for (int n = 0; n < N; ++n) { source[n][0] = (n % 2 ? 1.1 : 1.0); source[n][1] = 0.30; }
+
+  MBDConfig cfg; cfg.mesh_size = 24; cfg.cheb_degree = 20; cfg.num_probes = 48; cfg.ewald_alpha_prefactor = 5.0;
+  MFFMBDSolver solver; solver.set_config(cfg);
+  auto out = solver.compute(pos, source, cell, torch::kCPU);
+  // FIX the spectral bounds (derived once, padded) over the trajectory -> E smooth in p -> conservative.
+  cfg.cheb_lmin = out.lmin / 1.2; cfg.cheb_lmax = out.lmax * 1.2; solver.set_config(cfg);
+  out = solver.compute(pos, source, cell, torch::kCPU);
+  std::printf("N=%d  E_MBD=%.8f  bounds=[%.3f,%.3f]  |F|max=%.3e  Fsum=(%.1e,%.1e,%.1e)\n", N, out.energy,
+              cfg.cheb_lmin, cfg.cheb_lmax, out.forces.abs().max().item<double>(),
+              out.forces.select(1, 0).sum().item<double>(), out.forces.select(1, 1).sum().item<double>(),
+              out.forces.select(1, 2).sum().item<double>());
+
+  const double h = 1e-5; double worst = 0.0;
+  auto Eat = [&](int atom, int comp, double dh) { auto pp = pos.clone(); pp[atom][comp] += dh;
+                                                  return solver.compute(pp, source, cell, torch::kCPU).energy; };
+  for (int atom : {0, N / 2, N - 1})
+    for (int comp = 0; comp < 3; ++comp) {
+      double fd = -(Eat(atom, comp, h) - Eat(atom, comp, -h)) / (2 * h);
+      double fa = out.forces[atom][comp].item<double>();
+      double rel = std::abs(fa - fd) / (std::abs(fd) + 1e-6);
+      worst = std::max(worst, rel);
+      std::printf("  atom %2d comp %d: F_analytic=% .6e  F_fd=% .6e  rel=%.2e\n", atom, comp, fa, fd, rel);
+    }
+  std::printf("worst conservativity rel err = %.2e %s\n", worst, worst < 1e-3 ? "(CONSERVATIVE)" : "(CHECK)");
+
+  const double dt = 0.5;                                                 // velocity-Verlet, unit mass
+  auto vel = torch::zeros({N, 3}, o);
+  auto x = pos.clone() + dt * vel + 0.5 * dt * dt * out.forces;
+  auto out1 = solver.compute(x, source, cell, torch::kCPU);
+  vel = vel + 0.5 * dt * (out.forces + out1.forces);
+  std::printf("after 1 Verlet step: E=%.8f finite=%d  max disp=%.4f\n", out1.energy,
+              (int)std::isfinite(out1.energy), (x - pos).abs().max().item<double>());
   return 0;
 }
 #endif

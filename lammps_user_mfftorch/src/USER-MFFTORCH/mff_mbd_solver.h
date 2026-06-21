@@ -29,8 +29,19 @@ struct MBDConfig {
   int num_probes = 64;                 // Hutchinson trace probes (fixed Rademacher seed)
   int power_steps = 20;                // power-iteration steps for the spectral bounds
   double bound_pad = 0.05;             // pad on [lmin, lmax]
+  double cheb_lmin = 0.0;              // fixed spectral bounds for the Chebyshev (0 -> auto power-iter).
+  double cheb_lmax = 0.0;              // FIX these over an MD trajectory -> conservative forces.
   double real_cutoff = 0.0;            // real-space T_SR cutoff (0 -> derive from alpha)
   std::array<int, 3> pbc{{1, 1, 1}};
+};
+
+// Deployment output -- mirrors mff_reciprocal_solver's ReciprocalOutputs so the pair style consumes
+// MBD identically to the electrostatics path (energy + per-atom conservative forces).
+struct MBDOutputs {
+  double energy = 0.0;
+  torch::Tensor forces;       // [N,3] = -dE/dpos (autograd)
+  torch::Tensor atom_energy;  // [N] (equal split for now)
+  double lmin = 0.0, lmax = 0.0;  // spectral bounds used (fix these across a trajectory -> conservative)
 };
 
 class MFFMBDSolver {
@@ -49,7 +60,14 @@ class MFFMBDSolver {
       const torch::Tensor& src,
       const torch::Tensor& dst,
       const torch::Tensor& shifts,
-      const torch::Device& device) const;
+      const torch::Device& device,
+      double* used_lmin = nullptr, double* used_lmax = nullptr) const;
+
+  // Deployment entry point (what the pair style calls). pos [N,3], source [N,2]=(omega, alpha_pol),
+  // cell [3,3]. Derives the Ewald alpha + the T_SR cutoff from the box, builds the periodic neighbour
+  // list internally, runs mbd_energy under autograd, and returns energy + conservative forces.
+  MBDOutputs compute(const torch::Tensor& pos, const torch::Tensor& source, const torch::Tensor& cell,
+                     const torch::Device& device) const;
 
   // T.mu Ewald dipole field [N,3]  (reciprocal PME + real-space T_SR + self). Public for parity tests.
   torch::Tensor dipole_field(
@@ -69,6 +87,10 @@ class MFFMBDSolver {
   torch::Tensor spread_to_mesh(const torch::Tensor& frac, const torch::Tensor& source, const std::array<int,3>& pbc) const;
   torch::Tensor gather_from_mesh(const torch::Tensor& frac, const torch::Tensor& mesh, const std::array<int,3>& pbc) const;
   torch::Tensor k_grid_cart(const torch::Tensor& eff_cell, const torch::Device& device) const;  // [K,3]
+
+  // periodic neighbour list within `cutoff` -> (src, dst, shift_int [E,3]) for T_SR (single rank).
+  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> build_periodic_neighbors(
+      const torch::Tensor& pos, const torch::Tensor& cell, double cutoff) const;
 
   MBDConfig config_;
 };
