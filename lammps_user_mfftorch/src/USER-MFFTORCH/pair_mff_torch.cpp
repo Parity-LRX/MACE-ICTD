@@ -16,6 +16,7 @@
 
 #include "mff_periodic_table.h"
 #include "mff_reciprocal_solver.h"
+#include "mff_mbd_solver.h"
 #include "mff_tree_fmm_solver.h"
 #include "mff_torch_engine.h"
 
@@ -415,6 +416,7 @@ void PairMFFTorch::init_style() {
   try {
     if (!engine_) engine_ = std::make_unique<mfftorch::MFFTorchEngine>();
     if (!reciprocal_solver_) reciprocal_solver_ = std::make_unique<mfftorch::MFFReciprocalSolver>();
+    if (!mbd_solver_) mbd_solver_ = std::make_unique<mfftorch::MFFMBDSolver>();
     if (!tree_fmm_solver_) tree_fmm_solver_ = std::make_unique<mfftorch::MFFTreeFmmSolver>();
     engine_->load_core(core_pt_path_, device_str_);
     if (reciprocal_solver_) {
@@ -435,6 +437,16 @@ void PairMFFTorch::init_style() {
       cfg.ewald_alpha_prefactor = engine_->long_range_ewald_alpha_prefactor();
       cfg.energy_scale = engine_->long_range_energy_scale();
       reciprocal_solver_->set_config(cfg);
+    }
+    if (mbd_solver_) {
+      mfftorch::MBDConfig mcfg;
+      mcfg.mesh_size = std::max(16, static_cast<int>(engine_->long_range_mesh_size()));
+      mcfg.ewald_alpha_prefactor = engine_->long_range_ewald_alpha_prefactor();
+      mcfg.cheb_degree = 20;
+      mcfg.num_probes = 48;
+      mcfg.cheb_lmin = 0.3;  // fixed spectral bounds -> E smooth in pos -> conservative MD forces
+      mcfg.cheb_lmax = 3.0;
+      mbd_solver_->set_config(mcfg);
     }
     if (tree_fmm_solver_) {
       mfftorch::TreeFmmConfig cfg;
@@ -1083,8 +1095,30 @@ void PairMFFTorch::compute(int eflag, int vflag) {
 	    }
   }
 
+  // --- many-body dispersion (MBD) add-on. Env-gated demo (MFF_MBD_TEST): the per-atom source
+  // (omega, alpha) is synthesized from atom types -- a placeholder for a trained Hirshfeld-rescaled
+  // MBD head / source_kind=="mbd". compute() runs autograd internally (conservative forces); it sits
+  // outside the reciprocal InferenceMode guard so autograd is live. NOTE build_periodic_neighbors is
+  // O(N^2) -> demo / small-cell scale; production should reuse the LAMMPS neighbour list.
+  mfftorch::MBDOutputs mbd_out;
+  const bool use_mbd = mbd_solver_ && (std::getenv("MFF_MBD_TEST") || engine_->long_range_source_kind() == "mbd");
+  if (use_mbd) {
+    try {
+      int *type = atom->type;
+      auto mbd_source = torch::zeros({nlocal, 2}, torch::TensorOptions().dtype(torch::kFloat64));
+      auto sa = mbd_source.accessor<double, 2>();
+      for (int i = 0; i < nlocal; i++) { sa[i][0] = 1.0 + 0.05 * (type[i] - 1); sa[i][1] = 0.30; }
+      auto mbd_pos = cached_pos_t_.narrow(0, 0, nlocal).to(torch::kCPU, torch::kFloat64).contiguous();
+      auto mbd_cell = cell_t.to(torch::kCPU, torch::kFloat64).contiguous().view({3, 3});
+      mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, torch::kCPU);
+    } catch (const std::exception &e) {
+      error->all(FLERR, (std::string("mff/torch MBD solver failed: ") + e.what()).c_str());
+    }
+  }
+
   if (eflag) eng_vdwl += out.energy;
   if (use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
+  if (use_mbd) eng_vdwl += mbd_out.energy;
 
   // When virial is needed, ghost forces must be in f[] for virial_fdotr_compute()
   // to produce correct results (it sums over nall = nlocal + nghost). In fold mode the model has no
@@ -1104,6 +1138,15 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       f[i][0] += rfp[i * 3 + 0];
       f[i][1] += rfp[i * 3 + 1];
       f[i][2] += rfp[i * 3 + 2];
+    }
+  }
+  if (use_mbd && mbd_out.forces.defined()) {
+    auto mbd_forces_cpu = mbd_out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *mfp = mbd_forces_cpu.data_ptr<double>();
+    for (int i = 0; i < nlocal; i++) {
+      f[i][0] += mfp[i * 3 + 0];
+      f[i][1] += mfp[i * 3 + 1];
+      f[i][2] += mfp[i * 3 + 2];
     }
   }
 

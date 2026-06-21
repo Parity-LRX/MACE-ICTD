@@ -19,6 +19,7 @@ PairStyle(mff/torch,PairMFFTorch);
 namespace mfftorch {
 class MFFTorchEngine;
 class MFFReciprocalSolver;
+class MFFMBDSolver;
 class MFFTreeFmmSolver;
 struct MFFOutputs;
 }
@@ -94,6 +95,7 @@ class PairMFFTorch : public Pair {
 
   std::unique_ptr<mfftorch::MFFTorchEngine> engine_;
   std::unique_ptr<mfftorch::MFFReciprocalSolver> reciprocal_solver_;
+  std::unique_ptr<mfftorch::MFFMBDSolver> mbd_solver_;
   std::unique_ptr<mfftorch::MFFTreeFmmSolver> tree_fmm_solver_;
   bool engine_loaded_ = false;
 
