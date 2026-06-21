@@ -25,6 +25,7 @@ from mace_ictd.models.long_range import (
     build_periodic_dipole_pme_kernel,
     build_periodic_dipole_pme_kernel_batched,
 )
+from mace_ictd.models.ictd_irreps import ictd_l2_to_rank2
 from mace_ictd.utils.graph_utils import pbc_image_nmax
 
 
@@ -913,6 +914,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         pme_k_norm_floor: float = 1.0e-6,
         pme_assignment_window_floor: float = 1.0e-6,
         pme_ewald_alpha_prefactor: float = 5.0,
+        anisotropic_polarizability: bool = False,
     ) -> None:
         super().__init__()
         if probe_mode not in {"rademacher", "atom-rademacher", "basis"}:
@@ -945,6 +947,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         self.pme_k_norm_floor = float(pme_k_norm_floor)
         self.pme_assignment_window_floor = float(pme_assignment_window_floor)
         self.pme_ewald_alpha_prefactor = float(pme_ewald_alpha_prefactor)
+        self.anisotropic_polarizability = bool(anisotropic_polarizability)
         self.register_buffer(
             "pme_assignment_offsets",
             _build_assignment_offsets(self.pme_assignment),
@@ -956,16 +959,41 @@ class ManyBodyDispersionSLQ(nn.Module):
         self.omega_head = nn.Sequential(
             nn.Linear(self.feature_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
         )
+        if self.anisotropic_polarizability:
+            # equivariant l=2 readout: channel-mix the l=2 node block -> one l=2 tensor (5D), then
+            # ictd_l2_to_rank2 -> 3x3 traceless symmetric anisotropy; an l=0 gate bounds it for PD.
+            self.l2_mix = nn.Linear(self.feature_dim, 1, bias=False)
+            self.l2_gate = nn.Linear(self.feature_dim, 1)
         self.coupling_scale = nn.Parameter(torch.tensor(0.03))
         self.beta_raw = nn.Parameter(torch.tensor(1.0))
 
-    def emit_source(self, node_feats: torch.Tensor) -> torch.Tensor:
-        """Deploy path: per-atom MBD source (omega, alpha) [N,2] for the C++ MBD solver. Only the heads
-        run here -- the coupled-dipole energy is DEFERRED to the C++ backend (no double count). The
-        (omega, alpha) mirror forward() so the deployed source matches training."""
-        alpha = F.softplus(self.alpha_head(node_feats)).squeeze(-1) + self.alpha_floor
+    def polarizability_factor(self, node_feats: torch.Tensor, l2_feats: torch.Tensor | None) -> torch.Tensor:
+        """Per-atom symmetric positive-definite 3x3 factor B = alpha^{1/2} from the ICTD features.
+        Isotropic: B = sqrt(alpha) * I (l=0 only). Anisotropic: B = b0 * (I + D), D = gate * (l=2 -> 3x3
+        traceless) bounded so ||D|| < gate < 1 (PD guaranteed). Equivariant: B(R) = R B R^T."""
+        # b0 = sqrt(alpha_iso): the isotropic code uses wsa=omega*sqrt(alpha), so the factor B=sqrt(alpha)*I.
+        b0 = (F.softplus(self.alpha_head(node_feats)).squeeze(-1) + self.alpha_floor).sqrt()  # [N]
+        eye = torch.eye(3, dtype=node_feats.dtype, device=node_feats.device)
+        if not self.anisotropic_polarizability or l2_feats is None:
+            return b0.view(-1, 1, 1) * eye                                            # [N,3,3] isotropic
+        t = self.l2_mix(l2_feats.transpose(1, 2)).squeeze(-1)                          # [N,5] one l=2 tensor
+        d_raw = ictd_l2_to_rank2(t)                                                    # [N,3,3] traceless sym, equivariant
+        gate = 0.9 * torch.sigmoid(self.l2_gate(node_feats)).squeeze(-1)              # [N] in (0, 0.9)
+        dn = d_raw.flatten(1).norm(dim=1).clamp_min(1e-9)                              # [N]
+        D = (gate / (1.0 + dn)).view(-1, 1, 1) * d_raw                                 # ||D||_F < gate < 1
+        return b0.view(-1, 1, 1) * (eye + D)                                           # [N,3,3] sym PD
+
+    def emit_source(self, node_feats: torch.Tensor, l2_feats: torch.Tensor | None = None) -> torch.Tensor:
+        """Deploy path: per-atom MBD source for the C++ solver; the coupled-dipole energy is DEFERRED to
+        C++ (no double count). Isotropic: [omega, alpha] [N,2]. Anisotropic: [omega, Bxx,Byy,Bzz,Bxy,Bxz,Byz]
+        [N,7] -- the 6 unique components of the symmetric factor B=alpha^{1/2}. Mirrors forward()."""
         omega = F.softplus(self.omega_head(node_feats)).squeeze(-1) + self.omega_floor
-        return torch.stack([omega, alpha], dim=-1)
+        if not self.anisotropic_polarizability:
+            alpha = F.softplus(self.alpha_head(node_feats)).squeeze(-1) + self.alpha_floor
+            return torch.stack([omega, alpha], dim=-1)                                    # [N,2]
+        b = self.polarizability_factor(node_feats, l2_feats)                              # [N,3,3] sym B
+        return torch.stack([omega, b[:, 0, 0], b[:, 1, 1], b[:, 2, 2],
+                            b[:, 0, 1], b[:, 0, 2], b[:, 1, 2]], dim=-1)                  # [N,7]
 
     def mbd_beta(self) -> float:
         return float(F.softplus(self.beta_raw) + 1.0e-6)
@@ -1004,6 +1032,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         omega_local: torch.Tensor,
         coupling_scale: torch.Tensor,
         pme_kernel: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        w_local: torch.Tensor | None = None,
     ):
         if self.pme_mesh_size <= 0:
             raise ValueError("pme_mesh_size must be positive")
@@ -1014,7 +1043,9 @@ class ManyBodyDispersionSLQ(nn.Module):
             slab_padding_factor=1,
         )
         mesh_size = int(self.pme_mesh_size)
-        local_scale = omega_local * alpha_local.clamp_min(0.0).sqrt()
+        if w_local is None:  # isotropic fallback: W = omega*sqrt(alpha)*I
+            local_scale = omega_local * alpha_local.clamp_min(0.0).sqrt()
+            w_local = local_scale.view(-1, 1, 1) * torch.eye(3, dtype=pos_local.dtype, device=pos_local.device)
         if pme_kernel is None:
             k_cart, k2, spectral = build_periodic_dipole_pme_kernel(
                 cell=cell,
@@ -1035,9 +1066,9 @@ class ManyBodyDispersionSLQ(nn.Module):
         self_coef = 4.0 * (float(self.pme_ewald_alpha_prefactor) / _rc).pow(3) / (3.0 * 1.7724538509055159)
 
         def matvec(v: torch.Tensor) -> torch.Tensor:
-            n_probe = int(v.size(0))
             y = omega_local.square().view(1, -1, 1) * v
-            dipoles = (local_scale.view(1, -1, 1) * v).permute(1, 0, 2)
+            # dipoles_i = W_i v_i  (3x3 factor; isotropic W=omega*sqrt(alpha)*I reproduces the scalar form)
+            dipoles = torch.einsum("mab,pmb->pma", w_local, v).permute(1, 0, 2)
             field = apply_periodic_dipole_pme_field(
                 frac,
                 dipoles,
@@ -1051,7 +1082,7 @@ class ManyBodyDispersionSLQ(nn.Module):
             )
             field = field - self_coef * dipoles    # remove the spurious mesh self-interaction (Ewald self)
             field = field.permute(1, 0, 2)
-            return y + coupling_scale * local_scale.view(1, -1, 1) * field
+            return y + coupling_scale * torch.einsum("mab,pmb->pma", w_local, field)
 
         return matvec
 
@@ -1067,6 +1098,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         cell: torch.Tensor | None,
         coupling_scale: torch.Tensor,
         pme_kernel: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        w_local: torch.Tensor | None = None,
     ):
         if self.operator_backend == "edge_sparse":
             return self._build_edge_sparse_matvec(
@@ -1085,6 +1117,7 @@ class ManyBodyDispersionSLQ(nn.Module):
                 omega_local=omega_local,
                 coupling_scale=coupling_scale,
                 pme_kernel=pme_kernel,
+                w_local=w_local,
             )
         raise RuntimeError(f"Unhandled SLQ-MBD operator backend {self.operator_backend!r}")
 
@@ -1147,6 +1180,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         num_graphs: int | None = None,
         pos: torch.Tensor | None = None,
         cell: torch.Tensor | None = None,
+        l2_feats: torch.Tensor | None = None,
     ) -> torch.Tensor:
         n_atoms = node_feats.shape[0]
         per_atom = node_feats.new_zeros(n_atoms)
@@ -1155,6 +1189,9 @@ class ManyBodyDispersionSLQ(nn.Module):
 
         alpha = F.softplus(self.alpha_head(node_feats)).squeeze(-1) + self.alpha_floor
         omega = F.softplus(self.omega_head(node_feats)).squeeze(-1) + self.omega_floor
+        # per-atom 3x3 coupling factor W = omega * alpha^{1/2}.  Isotropic: W = omega*sqrt(alpha)*I.
+        # Anisotropic: W carries the l=2 polarizability tensor -> off-diagonal block W_i T_ij W_j.
+        W_factor = omega.view(-1, 1, 1) * self.polarizability_factor(node_feats, l2_feats)  # [N,3,3]
         beta = F.softplus(self.beta_raw) + 1.0e-6
         coupling_scale = self.coupling_scale
         eye3 = torch.eye(3, dtype=node_feats.dtype, device=node_feats.device)
@@ -1223,10 +1260,13 @@ class ManyBodyDispersionSLQ(nn.Module):
                 tensor = (3.0 * rhat.unsqueeze(-1) * rhat.unsqueeze(-2) - eye3) / r.pow(3).view(-1, 1, 1)
                 radius = alpha[es].pow(1.0 / 3.0) + alpha[ed].pow(1.0 / 3.0) + 1.0e-6
                 damp = 1.0 - torch.exp(-((r / (beta * radius)).clamp_min(0.0)).pow(6))
-                pref = coupling_scale * omega[es] * omega[ed] * torch.sqrt((alpha[es] * alpha[ed]).clamp_min(0.0)) * damp
+                scal = coupling_scale * damp
                 if edge_weight is not None:
-                    pref = pref * edge_weight
-                blocks = pref.view(-1, 1, 1) * tensor
+                    scal = scal * edge_weight
+                # off-diagonal block_ij = coupling_scale * damp * W_{ed} T_ij W_{es}  (W = omega*alpha^{1/2};
+                # reduces EXACTLY to the scalar pref*T when isotropic W = omega*sqrt(alpha)*I). The matvec
+                # maps v[es] -> contribution at ed, so the block sandwiches T between the two atoms' factors.
+                blocks = scal.view(-1, 1, 1) * torch.matmul(torch.matmul(W_factor[ed], tensor), W_factor[es])
 
             omega_local = omega[idx]
             pme_kernel_g = None
@@ -1246,6 +1286,7 @@ class ManyBodyDispersionSLQ(nn.Module):
                 cell=None if cell is None else cell[g],
                 coupling_scale=coupling_scale,
                 pme_kernel=pme_kernel_g,
+                w_local=W_factor.index_select(0, idx),
             )
 
             probes = self._make_probes(m, device=node_feats.device, dtype=node_feats.dtype)
@@ -1330,6 +1371,7 @@ class LongRangeDispersion(nn.Module):
         mbd_pme_k_norm_floor: float = 1.0e-6,
         mbd_pme_assignment_window_floor: float = 1.0e-6,
         mbd_pme_ewald_alpha_prefactor: float = 5.0,
+        mbd_anisotropic_polarizability: bool = False,
     ) -> None:
         super().__init__()
         self.mode = str(mode)
@@ -1359,6 +1401,7 @@ class LongRangeDispersion(nn.Module):
         self.mbd_pme_k_norm_floor = float(mbd_pme_k_norm_floor)
         self.mbd_pme_assignment_window_floor = float(mbd_pme_assignment_window_floor)
         self.mbd_pme_ewald_alpha_prefactor = float(mbd_pme_ewald_alpha_prefactor)
+        self.mbd_anisotropic_polarizability = bool(mbd_anisotropic_polarizability)
         if self.mode == "pairwise-c6":
             self.term = PairwiseDispersion(feature_dim=feature_dim, hidden_dim=hidden_dim)
         elif self.mode == "mbd":
@@ -1375,6 +1418,7 @@ class LongRangeDispersion(nn.Module):
                 pme_k_norm_floor=self.mbd_pme_k_norm_floor,
                 pme_assignment_window_floor=self.mbd_pme_assignment_window_floor,
                 pme_ewald_alpha_prefactor=self.mbd_pme_ewald_alpha_prefactor,
+                anisotropic_polarizability=self.mbd_anisotropic_polarizability,
             )
         else:  # pragma: no cover - guarded above; future modes land here explicitly.
             raise ValueError(f"Unsupported long-range dispersion mode {self.mode!r}")
@@ -1395,9 +1439,10 @@ class LongRangeDispersion(nn.Module):
         backend (the mbd-slq head). The model defers the coupled-dipole energy to C++ when it emits."""
         return self.mode == "mbd-slq" and hasattr(self.term, "emit_source")
 
-    def emit_source(self, node_feats: torch.Tensor) -> torch.Tensor:
-        """Deploy: per-atom MBD (omega, alpha) [N,2] from the SLQ head, for the C++ MBD solver."""
-        return self.term.emit_source(node_feats)
+    def emit_source(self, node_feats: torch.Tensor, l2_feats: torch.Tensor | None = None) -> torch.Tensor:
+        """Deploy: per-atom MBD source from the SLQ head for the C++ solver. Isotropic [N,2]=(omega,alpha);
+        anisotropic [N,7]=(omega, 6 components of B=alpha^{1/2}) when l2_feats is supplied."""
+        return self.term.emit_source(node_feats, l2_feats)
 
     def mbd_beta(self) -> float:
         return float(self.term.mbd_beta())
@@ -1418,6 +1463,7 @@ class LongRangeDispersion(nn.Module):
         edge_vec: torch.Tensor | None = None,
         cutoff: float | None = None,
         pbc: bool | None = None,
+        l2_feats: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cutoff_value = self.cutoff if cutoff is None else float(cutoff)
         pbc_value = self.pbc if pbc is None else bool(pbc)
@@ -1464,6 +1510,7 @@ class LongRangeDispersion(nn.Module):
                 num_graphs=int(cell.shape[0]),
                 pos=pos,
                 cell=cell,
+                l2_feats=l2_feats,
             )
         raise ValueError(f"Unsupported long-range dispersion mode {self.mode!r}")
 
@@ -1598,6 +1645,7 @@ def build_long_range_dispersion(
     mbd_pme_k_norm_floor: float = 1.0e-6,
     mbd_pme_assignment_window_floor: float = 1.0e-6,
     mbd_pme_ewald_alpha_prefactor: float = 5.0,
+    mbd_anisotropic_polarizability: bool = False,
 ) -> LongRangeDispersion | None:
     mode = str(mode)
     if mode == "none":
@@ -1620,4 +1668,5 @@ def build_long_range_dispersion(
         mbd_pme_k_norm_floor=mbd_pme_k_norm_floor,
         mbd_pme_assignment_window_floor=mbd_pme_assignment_window_floor,
         mbd_pme_ewald_alpha_prefactor=mbd_pme_ewald_alpha_prefactor,
+        mbd_anisotropic_polarizability=mbd_anisotropic_polarizability,
     )

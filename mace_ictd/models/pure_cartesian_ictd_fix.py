@@ -2142,6 +2142,7 @@ class PureCartesianICTDFix(nn.Module):
         mbd_pme_k_norm_floor: float = 1.0e-6,
         mbd_pme_assignment_window_floor: float = 1.0e-6,
         mbd_pme_ewald_alpha_prefactor: float = 5.0,
+        mbd_anisotropic_polarizability: bool = False,
         long_range_theta: float = 0.5,
         long_range_leaf_size: int = 32,
         long_range_multipole_order: int = 0,
@@ -2671,6 +2672,7 @@ class PureCartesianICTDFix(nn.Module):
         self.mbd_pme_k_norm_floor = float(mbd_pme_k_norm_floor)
         self.mbd_pme_assignment_window_floor = float(mbd_pme_assignment_window_floor)
         self.mbd_pme_ewald_alpha_prefactor = float(mbd_pme_ewald_alpha_prefactor)
+        self.mbd_anisotropic_polarizability = bool(mbd_anisotropic_polarizability)
         self.dispersion_pbc = str(long_range_boundary) == "periodic"
         self.dispersion = build_long_range_dispersion(
             mode=self.long_range_dispersion_mode,
@@ -2689,6 +2691,7 @@ class PureCartesianICTDFix(nn.Module):
             mbd_pme_k_norm_floor=self.mbd_pme_k_norm_floor,
             mbd_pme_assignment_window_floor=self.mbd_pme_assignment_window_floor,
             mbd_pme_ewald_alpha_prefactor=self.mbd_pme_ewald_alpha_prefactor,
+            mbd_anisotropic_polarizability=self.mbd_anisotropic_polarizability,
         )
 
         # MBD-source packing metadata (read by the exporter -> .json -> C++ engine/pair-style). When the
@@ -3085,18 +3088,27 @@ class PureCartesianICTDFix(nn.Module):
         # --- pairwise dispersion additive term (invariant) ---
         if self.dispersion is not None:
             last_state = layer_states[-1]
+            disp_l2 = None
             if last_state.shape[-1] == self.channels:
                 disp_feat = last_state
             else:
                 disp_feat = _split_irreps(last_state, self.channels, self.lmax)[0].reshape(
                     last_state.shape[0], self.channels
                 )
+            # ANISOTROPIC MBD: feed the equivariant l=2 node block to the dispersion head (ICTD l=2 -> 3x3
+            # anisotropic polarizability). The baseline route's FINAL state is invariant, so search back for
+            # the last layer state that still carries the full irreps (l>=1).
+            if self.mbd_anisotropic_polarizability and self.lmax >= 2:
+                for _st in reversed(layer_states):
+                    if _st.shape[-1] != self.channels:
+                        disp_l2 = _split_irreps(_st, self.channels, self.lmax)[2]  # [N, channels, 5]
+                        break
             if return_reciprocal_source and self.dispersion.exports_mbd_source():
                 # Deploy: emit the head's (omega, alpha) as the MBD source and DEFER the coupled-dipole
                 # energy to the C++ MBD solver (no double count). PACK after any electrostatic source so
                 # a COMBINED model carries both: [elec | omega, alpha]. The C++ reciprocal solver ignores
                 # the trailing channels; the MBD solver reads source[:, mbd_offset:mbd_offset+2].
-                mbd_source = self.dispersion.emit_source(disp_feat)
+                mbd_source = self.dispersion.emit_source(disp_feat, disp_l2)
                 reciprocal_source = (
                     mbd_source if reciprocal_source is None
                     else torch.cat([reciprocal_source, mbd_source], dim=1)
@@ -3137,6 +3149,7 @@ class PureCartesianICTDFix(nn.Module):
                     edge_vec=disp_edge_vec,
                     cutoff=disp_cutoff,
                     pbc=self.dispersion_pbc,
+                    l2_feats=disp_l2,
                 )
 
         if return_combined_features:
