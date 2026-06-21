@@ -613,6 +613,16 @@ def main() -> int:
     p.add_argument("--embed-e0", dest="embed_e0", action="store_true",
                    help="add E0(Z) atomic reference energies into the exported per-atom energy, so the .pt2 returns "
                         "ABSOLUTE energy (a drop-in for an E0-embedded TorchScript core). Forces are unaffected.")
+    p.add_argument("--long-range-mode", dest="long_range_mode_arg", default=None,
+                   help="synthetic combined export: long-range electrostatics mode (e.g. reciprocal-spectral-v1)")
+    p.add_argument("--long-range-multipole-l", dest="long_range_multipole_l_arg", type=int, default=0,
+                   help="synthetic combined export: electrostatic multipole order l (0=monopole)")
+    p.add_argument("--dispersion-mode", dest="dispersion_mode_arg", default=None,
+                   help="synthetic combined export: long-range dispersion mode (e.g. mbd-slq)")
+    p.add_argument("--dispersion-cutoff", dest="dispersion_cutoff_arg", type=float, default=4.0,
+                   help="synthetic combined export: dispersion cutoff")
+    p.add_argument("--lr-mesh-size", dest="lr_mesh_size_arg", type=int, default=16,
+                   help="synthetic combined export: long-range/MBD PME mesh size")
     p.add_argument("--out", default="/tmp/fscetp_aoti.pt2")
     p.add_argument("--fallback", default=None,
                    help="path to an N-flexible TorchScript core (.pt) the LAMMPS engine should fall back to "
@@ -738,10 +748,23 @@ def main() -> int:
         # synthetic no-checkpoint path (testing/benchmarking only) -- lazy-import the synthetic
         # model builder so the real --checkpoint export path has ZERO dependency on it
         from mace_ictd.synthetic import build_model
+        _lr_extra = {}
+        if args.long_range_mode_arg:
+            _lr_extra.update(
+                long_range_mode=args.long_range_mode_arg, long_range_reciprocal_backend="mesh_fft",
+                long_range_boundary="periodic", long_range_mesh_size=args.lr_mesh_size_arg,
+                long_range_assignment="pcs", long_range_mesh_fft_full_ewald=True,
+                long_range_max_multipole_l=args.long_range_multipole_l_arg,
+            )
+        if args.dispersion_mode_arg:
+            _lr_extra.update(long_range_dispersion_mode=args.dispersion_mode_arg,
+                             dispersion_cutoff=args.dispersion_cutoff_arg, mbd_pme_mesh_size=args.lr_mesh_size_arg)
+        if _lr_extra:
+            print(f"[aoti] synthetic combined export extras: {sorted(_lr_extra)}")
         model = build_model(
             channels=args.channels, lmax=args.lmax, num_interaction=args.num_interaction,
             route=args.route, product_backend=args.product_backend, dtype=dtype, device=device,
-            correlation=args.contraction_order, attn_heads=args.attn_heads,
+            correlation=args.contraction_order, attn_heads=args.attn_heads, **_lr_extra,
         )
         model.assume_edges_within_radius = bool(args.assume_cutoff_edges)
         model.preserve_edge_order = bool(args.preserve_edge_order)
