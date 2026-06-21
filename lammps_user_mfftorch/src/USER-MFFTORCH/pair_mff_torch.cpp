@@ -1098,8 +1098,11 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   // --- many-body dispersion (MBD) add-on. Env-gated demo (MFF_MBD_TEST): the per-atom source
   // (omega, alpha) is synthesized from atom types -- a placeholder for a trained Hirshfeld-rescaled
   // MBD head / source_kind=="mbd". compute() runs autograd internally (conservative forces); it sits
-  // outside the reciprocal InferenceMode guard so autograd is live. NOTE build_periodic_neighbors is
-  // O(N^2) -> demo / small-cell scale; production should reuse the LAMMPS neighbour list.
+  // outside the reciprocal InferenceMode guard so autograd is live.
+  // When pair_style was given 'dispersion <cutoff>', reuse the SAME ghost real-space list already built
+  // for the model (cached_disp_edge_*_t_) as the MBD T_SR list -- alpha is tied to that cutoff and the
+  // reciprocal mesh handles the long-range tail, so the dispersion range may exceed r_cut. Otherwise
+  // fall back to the solver's internal O(N^2) periodic build (small-cell / standalone).
   mfftorch::MBDOutputs mbd_out;
   const bool use_mbd = mbd_solver_ && (std::getenv("MFF_MBD_TEST") || engine_->long_range_source_kind() == "mbd");
   if (use_mbd) {
@@ -1110,7 +1113,23 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       for (int i = 0; i < nlocal; i++) { sa[i][0] = 1.0 + 0.05 * (type[i] - 1); sa[i][1] = 0.30; }
       auto mbd_pos = cached_pos_t_.narrow(0, 0, nlocal).to(torch::kCPU, torch::kFloat64).contiguous();
       auto mbd_cell = cell_t.to(torch::kCPU, torch::kFloat64).contiguous().view({3, 3});
-      mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, torch::kCPU);
+      const int64_t Edisp = cached_disp_edge_src_t_.defined() ? cached_disp_edge_src_t_.numel() : 0;
+      if (dispersion_cut_global_ > 0.0 && Edisp > 0) {
+        // The reused ghost list is NEAREST-image; the Ewald T_SR needs every image within r_cut, so
+        // enforce 2*r_cut <= box face height (single image). The reciprocal mesh covers beyond r_cut.
+        validate_mbd_dispersion_single_image_cutoff(error, geom, dispersion_cut_global_, "pair_style mff/torch MBD");
+        // Expand the canonical half list -> full (both directions); dipole_field adds to dst only.
+        auto cs = cached_disp_edge_src_t_.to(torch::kCPU);
+        auto cd = cached_disp_edge_dst_t_.to(torch::kCPU);
+        auto csh = cached_disp_edge_shifts_t_.to(torch::kCPU, torch::kFloat64);
+        auto full_src = torch::cat({cs, cd});
+        auto full_dst = torch::cat({cd, cs});
+        auto full_sh = torch::cat({csh, -csh});
+        mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, full_src, full_dst, full_sh,
+                                       dispersion_cut_global_, torch::kCPU);
+      } else {
+        mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, torch::kCPU);
+      }
     } catch (const std::exception &e) {
       error->all(FLERR, (std::string("mff/torch MBD solver failed: ") + e.what()).c_str());
     }

@@ -23,8 +23,12 @@
 namespace mfftorch {
 
 struct MBDConfig {
-  int mesh_size = 32;
-  double ewald_alpha_prefactor = 5.0;  // alpha = prefactor / (0.5 * min periodic box length)
+  int mesh_size = 32;                   // box-tied fallback only; the cutoff path adapts the mesh to alpha
+  double ewald_alpha_prefactor = 5.0;  // box-tied fallback: alpha = prefactor / (0.5 * min box length)
+  double ewald_bound = 5.0;            // cutoff path: alpha = ewald_bound / r_cut  (erfc(ewald_bound)=SR err)
+  double mesh_per_alpha = 2.5;         // adaptive mesh points per (alpha * box length): resolve the screen
+  int mesh_min = 16;                   // adaptive-mesh clamp
+  int mesh_max = 64;
   int cheb_degree = 24;                // Chebyshev degree for sqrt(x) (no eigensolve)
   int num_probes = 64;                 // Hutchinson trace probes (fixed Rademacher seed)
   int power_steps = 20;                // power-iteration steps for the spectral bounds
@@ -61,13 +65,23 @@ class MFFMBDSolver {
       const torch::Tensor& dst,
       const torch::Tensor& shifts,
       const torch::Device& device,
+      double alpha_ewald = -1.0,   // Ewald split parameter; <=0 -> box-tied prefactor/(0.5*Lmin)
       double* used_lmin = nullptr, double* used_lmax = nullptr) const;
 
-  // Deployment entry point (what the pair style calls). pos [N,3], source [N,2]=(omega, alpha_pol),
-  // cell [3,3]. Derives the Ewald alpha + the T_SR cutoff from the box, builds the periodic neighbour
-  // list internally, runs mbd_energy under autograd, and returns energy + conservative forces.
+  // Deployment entry point: reuse a LAMMPS-provided real-space neighbour list (src,dst,shifts) at
+  // `real_cutoff` (e.g. the pair_style 'dispersion <cutoff>' ghost list). The Ewald split parameter is
+  // TIED TO THE CUTOFF (alpha = ewald_bound/real_cutoff) so the erfc near field fits inside the list,
+  // and the mesh ADAPTS to that alpha so the reciprocal far field (no cutoff) stays converged. Runs
+  // mbd_energy under autograd; returns energy + conservative forces. `src,dst,shifts` must be a FULL
+  // (both-directions) edge list. NON-const: adapts config_.mesh_size to the box+alpha.
   MBDOutputs compute(const torch::Tensor& pos, const torch::Tensor& source, const torch::Tensor& cell,
-                     const torch::Device& device) const;
+                     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
+                     double real_cutoff, const torch::Device& device);
+
+  // Fallback entry point (no LAMMPS list): builds an O(N^2) periodic neighbour list internally and
+  // ties alpha to the box. For small cells / standalone tests.
+  MBDOutputs compute(const torch::Tensor& pos, const torch::Tensor& source, const torch::Tensor& cell,
+                     const torch::Device& device);
 
   // T.mu Ewald dipole field [N,3]  (reciprocal PME + real-space T_SR + self). Public for parity tests.
   torch::Tensor dipole_field(
@@ -91,6 +105,14 @@ class MFFMBDSolver {
   // periodic neighbour list within `cutoff` -> (src, dst, shift_int [E,3]) for T_SR (single rank).
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> build_periodic_neighbors(
       const torch::Tensor& pos, const torch::Tensor& cell, double cutoff) const;
+
+  // adaptive mesh: M points/axis so the FFT Nyquist resolves the e^{-k^2/4a^2} screen at this alpha.
+  int adaptive_mesh(double alpha, const torch::Tensor& cell) const;
+
+  // shared core: requires_grad on pos -> mbd_energy(alpha_ewald) -> autograd forces -> MBDOutputs.
+  MBDOutputs run_autograd(const torch::Tensor& pos, const torch::Tensor& source, const torch::Tensor& cell,
+                          const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
+                          double alpha_ewald, const torch::Device& device) const;
 
   MBDConfig config_;
 };

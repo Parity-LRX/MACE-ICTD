@@ -145,7 +145,7 @@ torch::Tensor MFFMBDSolver::coupled_matvec(
 torch::Tensor MFFMBDSolver::mbd_energy(
     const torch::Tensor& global_pos, const torch::Tensor& mbd_source, const torch::Tensor& cell,
     const torch::Tensor& src, const torch::Tensor& dst, const torch::Tensor& shifts,
-    const torch::Device& device, double* used_lmin, double* used_lmax) const {
+    const torch::Device& device, double alpha_ewald, double* used_lmin, double* used_lmax) const {
   const int N = global_pos.size(0);
   const int n = 3 * N;
   auto omega = mbd_source.select(1, 0).contiguous();   // [N]
@@ -153,7 +153,7 @@ torch::Tensor MFFMBDSolver::mbd_energy(
   // alpha (Ewald) = prefactor / (0.5 * min periodic box length)
   auto rownorm = torch::linalg_vector_norm(cell.to(torch::kFloat64), 2, 1);
   double Lmin = rownorm.min().item<double>();
-  double alpha_ew = config_.ewald_alpha_prefactor / (0.5 * Lmin);
+  double alpha_ew = (alpha_ewald > 0.0) ? alpha_ewald : config_.ewald_alpha_prefactor / (0.5 * Lmin);
 
   auto mv = [&](const torch::Tensor& v) {
     return coupled_matvec(v.view({N, 3}), omega, alpha, global_pos, cell, alpha_ew, src, dst, shifts, device)
@@ -249,24 +249,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> MFFMBDSolver::build_peri
   return {torch::cat(vsrc), torch::cat(vdst), torch::cat(vshift)};
 }
 
-MBDOutputs MFFMBDSolver::compute(const torch::Tensor& pos, const torch::Tensor& source,
-                                 const torch::Tensor& cell, const torch::Device& device) const {
+MBDOutputs MFFMBDSolver::run_autograd(const torch::Tensor& pos, const torch::Tensor& source,
+                                      const torch::Tensor& cell, const torch::Tensor& src,
+                                      const torch::Tensor& dst, const torch::Tensor& shift,
+                                      double alpha_ewald, const torch::Device& device) const {
   const int N = pos.size(0);
   torch::AutoGradMode grad_on(true);
   auto p = pos.to(device, torch::kFloat64).clone().detach().set_requires_grad(true);
   auto cellf = cell.to(device, torch::kFloat64);
   auto src_ = source.to(device, torch::kFloat64);
-  double Lmin = torch::linalg_vector_norm(cellf, 2, 1).min().item<double>();
-  double alpha_ew = config_.ewald_alpha_prefactor / (0.5 * Lmin);
-  double cutoff = config_.real_cutoff > 0.0 ? config_.real_cutoff : 5.0 / alpha_ew;  // erfc(5)~1e-12
-
-  torch::Tensor src, dst, shift;
-  {
-    torch::NoGradGuard ng;
-    std::tie(src, dst, shift) = build_periodic_neighbors(p.detach(), cellf, cutoff);
-  }
   double bl = 0.0, bu = 0.0;
-  auto E = mbd_energy(p, src_, cellf, src, dst, shift, device, &bl, &bu);
+  auto E = mbd_energy(p, src_, cellf, src, dst, shift, device, alpha_ewald, &bl, &bu);
   auto grads = torch::autograd::grad({E}, {p}, /*grad_outputs=*/{}, /*retain_graph=*/false,
                                      /*create_graph=*/false, /*allow_unused=*/true);
   MBDOutputs out;
@@ -276,6 +269,42 @@ MBDOutputs MFFMBDSolver::compute(const torch::Tensor& pos, const torch::Tensor& 
                                   : torch::zeros({N, 3}, torch::TensorOptions().dtype(torch::kFloat64).device(device));
   out.atom_energy = torch::full({N}, out.energy / N, torch::TensorOptions().dtype(torch::kFloat64).device(device));
   return out;
+}
+
+int MFFMBDSolver::adaptive_mesh(double alpha, const torch::Tensor& cell) const {
+  // FFT Nyquist k_Nyq = pi*M/L must resolve the e^{-k^2/4a^2} screen -> M ~ mesh_per_alpha * alpha * L.
+  double Lmax = torch::linalg_vector_norm(cell.to(torch::kFloat64), 2, 1).max().item<double>();
+  int M = (int)std::ceil(config_.mesh_per_alpha * alpha * Lmax);
+  if (M < config_.mesh_min) M = config_.mesh_min;
+  if (M > config_.mesh_max) M = config_.mesh_max;
+  return M;
+}
+
+// Deployment path: reuse a LAMMPS real-space list at `real_cutoff`; alpha tied to the cutoff, mesh
+// adapted to alpha (the reciprocal far field has no cutoff -> "dispersion range > r_cut" is fine).
+MBDOutputs MFFMBDSolver::compute(const torch::Tensor& pos, const torch::Tensor& source,
+                                 const torch::Tensor& cell, const torch::Tensor& src,
+                                 const torch::Tensor& dst, const torch::Tensor& shifts,
+                                 double real_cutoff, const torch::Device& device) {
+  double alpha_ew = config_.ewald_bound / real_cutoff;        // erfc(ewald_bound) = SR truncation error
+  config_.mesh_size = adaptive_mesh(alpha_ew, cell);          // resolve the screen at this alpha
+  return run_autograd(pos, source, cell, src, dst, shifts, alpha_ew, device);
+}
+
+// Fallback path: build an O(N^2) periodic list, alpha tied to the box.
+MBDOutputs MFFMBDSolver::compute(const torch::Tensor& pos, const torch::Tensor& source,
+                                 const torch::Tensor& cell, const torch::Device& device) {
+  auto cellf = cell.to(torch::kFloat64);
+  double Lmin = torch::linalg_vector_norm(cellf, 2, 1).min().item<double>();
+  double alpha_ew = config_.ewald_alpha_prefactor / (0.5 * Lmin);
+  double cutoff = config_.real_cutoff > 0.0 ? config_.real_cutoff : 5.0 / alpha_ew;  // erfc(5)~1e-12
+  config_.mesh_size = adaptive_mesh(alpha_ew, cellf);
+  torch::Tensor src, dst, shift;
+  {
+    torch::NoGradGuard ng;
+    std::tie(src, dst, shift) = build_periodic_neighbors(pos.to(device, torch::kFloat64), cellf, cutoff);
+  }
+  return run_autograd(pos, source, cell, src, dst, shift, alpha_ew, device);
 }
 
 }  // namespace mfftorch
