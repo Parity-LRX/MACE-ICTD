@@ -319,8 +319,11 @@ MBDOutputs MFFMBDSolver::run_autograd(const torch::Tensor& pos, const torch::Ten
 int MFFMBDSolver::adaptive_mesh(double alpha, const torch::Tensor& cell) const {
   // FFT Nyquist k_Nyq = pi*M/L must resolve the e^{-k^2/4a^2} screen -> M ~ mesh_per_alpha * alpha * L.
   double Lmax = torch::linalg_vector_norm(cell.to(torch::kFloat64), 2, 1).max().item<double>();
-  int M = (int)std::ceil(config_.mesh_per_alpha * alpha * Lmax);
-  if (M < config_.mesh_min) M = config_.mesh_min;
+  int target = (int)std::ceil(config_.mesh_per_alpha * alpha * Lmax);
+  // Round to a POWER-OF-2 mesh: non-power-of-2 sizes (e.g. 38=2*19) hit slow cuFFT (Bluestein) paths;
+  // a power of 2 is the fast radix-2 path. Clamp to [mesh_min, mesh_max].
+  int M = config_.mesh_min;
+  while (M < target && M < config_.mesh_max) M *= 2;
   if (M > config_.mesh_max) M = config_.mesh_max;
   return M;
 }

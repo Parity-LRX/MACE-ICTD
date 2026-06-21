@@ -441,9 +441,10 @@ void PairMFFTorch::init_style() {
     if (mbd_solver_) {
       mfftorch::MBDConfig mcfg;
       mcfg.mesh_size = std::max(16, static_cast<int>(engine_->long_range_mesh_size()));
+      mcfg.mesh_max = 32;    // cap the adaptive MBD mesh (power-of-2 -> fast cuFFT) for GPU throughput
       mcfg.ewald_alpha_prefactor = engine_->long_range_ewald_alpha_prefactor();
-      mcfg.cheb_degree = 20;
-      mcfg.num_probes = 48;
+      mcfg.cheb_degree = 12;  // SLQ/Chebyshev approximation -- trimmed for GPU speed (energy is a small term)
+      mcfg.num_probes = 16;
       mcfg.cheb_lmin = 0.3;  // fixed spectral bounds -> E smooth in pos -> conservative MD forces
       mcfg.cheb_lmax = 3.0;
       if (engine_->long_range_mbd_source_enabled()) {  // learned damping params from the exported head
