@@ -626,6 +626,10 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
             content, "\"dispersion_deployment_graph_rule\"", dispersion_deployment_graph_rule_);
         (void)parse_string_from_metadata(content, "\"mbd_operator_backend\"", mbd_operator_backend_);
         (void)parse_double_from_metadata(content, "\"dispersion_cutoff\"", dispersion_cutoff_);
+        (void)parse_bool_from_metadata(content, "\"long_range_mbd_source_enabled\"", long_range_mbd_source_enabled_);
+        (void)parse_int64_from_metadata(content, "\"long_range_mbd_source_offset\"", long_range_mbd_source_offset_);
+        (void)parse_double_from_metadata(content, "\"long_range_mbd_beta\"", long_range_mbd_beta_);
+        (void)parse_double_from_metadata(content, "\"long_range_mbd_coupling_scale\"", long_range_mbd_coupling_scale_);
         reconcile_dispersion_training_graph_rule(
             has_dispersion_training_graph_rule,
             dispersion_training_graph_rule_,
@@ -755,6 +759,10 @@ void MFFTorchEngine::load_single_core_file(const std::string& core_pt_path) {
           content, "\"dispersion_deployment_graph_rule\"", dispersion_deployment_graph_rule_);
       (void)parse_string_from_metadata(content, "\"mbd_operator_backend\"", mbd_operator_backend_);
       (void)parse_double_from_metadata(content, "\"dispersion_cutoff\"", dispersion_cutoff_);
+      (void)parse_bool_from_metadata(content, "\"long_range_mbd_source_enabled\"", long_range_mbd_source_enabled_);
+      (void)parse_int64_from_metadata(content, "\"long_range_mbd_source_offset\"", long_range_mbd_source_offset_);
+      (void)parse_double_from_metadata(content, "\"long_range_mbd_beta\"", long_range_mbd_beta_);
+      (void)parse_double_from_metadata(content, "\"long_range_mbd_coupling_scale\"", long_range_mbd_coupling_scale_);
       reconcile_dispersion_training_graph_rule(
           has_dispersion_training_graph_rule,
           dispersion_training_graph_rule_,

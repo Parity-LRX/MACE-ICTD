@@ -446,6 +446,10 @@ void PairMFFTorch::init_style() {
       mcfg.num_probes = 48;
       mcfg.cheb_lmin = 0.3;  // fixed spectral bounds -> E smooth in pos -> conservative MD forces
       mcfg.cheb_lmax = 3.0;
+      if (engine_->long_range_mbd_source_enabled()) {  // learned damping params from the exported head
+        mcfg.mbd_beta = engine_->long_range_mbd_beta();
+        mcfg.coupling_scale = engine_->long_range_mbd_coupling_scale();
+      }
       mbd_solver_->set_config(mcfg);
     }
     if (tree_fmm_solver_) {
@@ -1057,14 +1061,23 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   const bool exports_runtime_source = engine_->exports_reciprocal_source() && engine_->reciprocal_source_channels() > 0;
   const bool use_tree_fmm =
       tree_fmm_solver_ && exports_runtime_source && engine_->long_range_runtime_backend() == "tree_fmm";
+  // Combined [elec | omega,alpha] packing: electrostatics is present unless this is an MBD-only model
+  // (packed source with zero electrostatic width). The reciprocal solver gets only the leading slice.
+  const bool mbd_packed = engine_->long_range_mbd_source_enabled();
+  const int64_t elec_width = engine_->long_range_mbd_source_offset();
+  const bool has_electrostatics = exports_runtime_source && (!mbd_packed || elec_width > 0);
   const bool use_reciprocal =
-      reciprocal_solver_ && exports_runtime_source && !use_tree_fmm;
+      reciprocal_solver_ && has_electrostatics && !use_tree_fmm;
   const bool use_runtime_long_range = use_tree_fmm || use_reciprocal;
   if (use_tree_fmm || use_reciprocal) {
     try {
       const auto reciprocal_device = engine_->device();
-      auto local_source = out.reciprocal_source.defined()
-                              ? out.reciprocal_source.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous()
+      auto reciprocal_rows = out.reciprocal_source.defined()
+          ? (mbd_packed && elec_width > 0 ? out.reciprocal_source.narrow(1, 0, elec_width)
+                                          : out.reciprocal_source)
+          : out.reciprocal_source;
+      auto local_source = reciprocal_rows.defined()
+                              ? reciprocal_rows.narrow(0, 0, nlocal).to(reciprocal_device, torch::kFloat32).contiguous()
                               : torch::zeros(
                                     {nlocal, engine_->reciprocal_source_channels()},
                                     torch::TensorOptions().dtype(torch::kFloat32).device(reciprocal_device));
@@ -1104,13 +1117,23 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   // reciprocal mesh handles the long-range tail, so the dispersion range may exceed r_cut. Otherwise
   // fall back to the solver's internal O(N^2) periodic build (small-cell / standalone).
   mfftorch::MBDOutputs mbd_out;
-  const bool use_mbd = mbd_solver_ && (std::getenv("MFF_MBD_TEST") || engine_->long_range_source_kind() == "mbd");
+  const bool use_mbd = mbd_solver_ && (engine_->long_range_mbd_source_enabled() || std::getenv("MFF_MBD_TEST")
+                                       || engine_->long_range_source_kind() == "mbd");
   if (use_mbd) {
     try {
-      int *type = atom->type;
-      auto mbd_source = torch::zeros({nlocal, 2}, torch::TensorOptions().dtype(torch::kFloat64));
-      auto sa = mbd_source.accessor<double, 2>();
-      for (int i = 0; i < nlocal; i++) { sa[i][0] = 1.0 + 0.05 * (type[i] - 1); sa[i][1] = 0.30; }
+      torch::Tensor mbd_source;
+      if (engine_->long_range_mbd_source_enabled() && out.reciprocal_source.defined()
+          && out.reciprocal_source.size(1) >= elec_width + 2) {
+        // DEPLOY: the model emitted (omega, alpha) packed after the electrostatic source [elec | w,a].
+        mbd_source = out.reciprocal_source.narrow(0, 0, nlocal).narrow(1, elec_width, 2)
+                         .to(torch::kCPU, torch::kFloat64).contiguous();
+      } else {
+        // env-gated demo (MFF_MBD_TEST): (omega, alpha) from atom types
+        int *type = atom->type;
+        mbd_source = torch::zeros({nlocal, 2}, torch::TensorOptions().dtype(torch::kFloat64));
+        auto sa = mbd_source.accessor<double, 2>();
+        for (int i = 0; i < nlocal; i++) { sa[i][0] = 1.0 + 0.05 * (type[i] - 1); sa[i][1] = 0.30; }
+      }
       auto mbd_pos = cached_pos_t_.narrow(0, 0, nlocal).to(torch::kCPU, torch::kFloat64).contiguous();
       auto mbd_cell = cell_t.to(torch::kCPU, torch::kFloat64).contiguous().view({3, 3});
       const int64_t Edisp = cached_disp_edge_src_t_.defined() ? cached_disp_edge_src_t_.numel() : 0;

@@ -90,6 +90,10 @@ class MFFTorchEngine {
   const std::string& dispersion_deployment_graph_rule() const { return dispersion_deployment_graph_rule_; }
   const std::string& mbd_operator_backend() const { return mbd_operator_backend_; }
   double dispersion_cutoff() const { return dispersion_cutoff_; }
+  bool long_range_mbd_source_enabled() const { return long_range_mbd_source_enabled_; }
+  int64_t long_range_mbd_source_offset() const { return long_range_mbd_source_offset_; }
+  double long_range_mbd_beta() const { return long_range_mbd_beta_; }
+  double long_range_mbd_coupling_scale() const { return long_range_mbd_coupling_scale_; }
   bool requires_mbd_dispersion_edges() const {
     return dispersion_deployment_graph_rule_ == "explicit_canonical_single_image_edge_sparse" &&
            dispersion_cutoff_ > 0.0;
@@ -202,6 +206,10 @@ class MFFTorchEngine {
   std::string dispersion_deployment_graph_rule_ = "none";
   std::string mbd_operator_backend_ = "edge_sparse";
   double dispersion_cutoff_ = 0.0;
+  bool long_range_mbd_source_enabled_ = false;
+  int64_t long_range_mbd_source_offset_ = 0;
+  double long_range_mbd_beta_ = 1.0;
+  double long_range_mbd_coupling_scale_ = 1.0;
   int64_t trace_num_nodes_ = 0;
   int64_t trace_num_edges_ = 0;
 
