@@ -1174,8 +1174,20 @@ class ManyBodyDispersionSLQ(nn.Module):
                 y = torch.matmul(y, t)
                 z = torch.matmul(t, z)
             return (y * scale.sqrt().view(-1, 1, 1))[:, 0, 0].clamp_min(self.eig_floor ** 0.5)
+        # Harden the matrix sqrt without changing the physics. A learned coupling that drifts
+        # large can overflow the fp32 matvec -> a non-finite tridiagonal -> eigh emits NaN, and
+        # the old clamp_min(NaN)=NaN propagated into a training-killing NaN (clamp floors finite
+        # negatives but passes NaN/Inf straight through). Sanitize + symmetrize, then floor the
+        # spectrum SMOOTHLY: sqrt(0.5*(x + sqrt(x^2 + eig_floor^2))) equals sqrt(x) for x >> eig_floor
+        # (bit-identical in the physical positive-definite region -> accuracy-neutral) and stays
+        # finite/kink-free for x <= 0, so an indefinite Ritz value can no longer NaN the forward
+        # or its gradient.  eig_floor (1e-8) sits far below the physical spectrum (~omega^2), so
+        # this only intervenes in the unphysical near-/sub-zero region.
+        tri = torch.nan_to_num(tri, nan=0.0, posinf=0.0, neginf=0.0)
+        tri = 0.5 * (tri + tri.transpose(-1, -2))
         evals, evecs = torch.linalg.eigh(tri)
-        sqrt_evals = evals.clamp_min(self.eig_floor).sqrt()
+        smooth = 0.5 * (evals + torch.sqrt(evals.square() + self.eig_floor * self.eig_floor))
+        sqrt_evals = smooth.clamp_min(self.eig_floor).sqrt()
         weights = evecs[:, 0, :].square()
         return (weights * sqrt_evals).sum(dim=-1)
 
@@ -1311,6 +1323,11 @@ class ManyBodyDispersionSLQ(nn.Module):
             basis: list[torch.Tensor] = []
             for step in range(steps):
                 z = matvec(q.reshape(n_probe, m, 3)).reshape(n_probe, 3 * m)
+                # Guard the Krylov recurrence against an overflowing matvec (a large learned
+                # coupling can blow up in fp32): cap non-finite entries so a single bad step
+                # cannot poison q -- and every later step's q and gradient -- via z/||z||.
+                # Identity for finite z, so it is accuracy-neutral on healthy configurations.
+                z = torch.nan_to_num(z, nan=0.0, posinf=1.0e30, neginf=-1.0e30)
                 if step > 0:
                     z = z - beta_prev.view(-1, 1) * q_prev
                 a = (q * z).sum(dim=-1)
