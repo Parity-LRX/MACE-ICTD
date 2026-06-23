@@ -195,6 +195,11 @@ PairMFFTorch::PairMFFTorch(LAMMPS *lmp) : Pair(lmp) {
   restartinfo = 0;
   one_coeff = 1;
   manybody_flag = 1;
+  // rRESPA: this pair splits the cheap short-range core (inner level, every step) from the expensive
+  // many-body-dispersion solve (outer level, every K steps). compute_inner/compute_middle/compute_outer
+  // below implement the multiple-time-stepping; the split is by PHYSICS (SR vs MBD), not by distance,
+  // so we reuse the same full neighbor list in both (no REQ_RESPA inner/outer sub-lists, no cut_respa).
+  respa_enable = 1;
 }
 
 PairMFFTorch::~PairMFFTorch() {
@@ -1053,13 +1058,16 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   auto fidelity_ids_t = current_fidelity_tensor(torch::kCPU);
 
   const bool want_atom_virial = static_cast<bool>(vflag_atom);
+  // rRESPA inner: request the SR scalar energy even though eflag=0, so compute_outer() can tally it
+  // (the engine skips out.energy when need_energy is false). Cheap (a single atom-energy reduction).
+  const bool need_energy = static_cast<bool>(eflag) || (respa_phase_ == PHASE_INNER);
   mfftorch::MFFOutputs out;
   try {
     out = engine_->compute(nlocal, n_model, cached_pos_t_, cached_A_t_,
                            cached_edge_src_t_, cached_edge_dst_t_, cached_edge_shifts_t_,
                            cell_t, cached_disp_edge_src_t_, cached_disp_edge_dst_t_, cached_disp_edge_shifts_t_,
                            external_tensor_t, fidelity_ids_t,
-                           static_cast<bool>(eflag), want_atom_virial);
+                           need_energy, want_atom_virial);
   } catch (const std::exception &e) {
     error->all(FLERR, (std::string("mff/torch engine compute failed: ") + e.what()).c_str());
   }
@@ -1127,6 +1135,7 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   mfftorch::MBDOutputs mbd_out;
   const bool use_mbd = mbd_solver_ && (engine_->long_range_mbd_source_enabled() || std::getenv("MFF_MBD_TEST")
                                        || engine_->long_range_source_kind() == "mbd");
+  respa_have_mbd_ = false;
   if (use_mbd) {
     try {
       // Run the MBD solver on the ENGINE DEVICE (GPU): the FFT / spread-gather / Chebyshev matvecs /
@@ -1153,7 +1162,9 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       auto mbd_pos = cached_pos_t_.narrow(0, 0, nlocal).to(mbd_device, torch::kFloat32).contiguous();
       auto mbd_cell = cell_t.to(mbd_device, torch::kFloat32).contiguous().view({3, 3});
       const int64_t Edisp = cached_disp_edge_src_t_.defined() ? cached_disp_edge_src_t_.numel() : 0;
-      if (dispersion_cut_global_ > 0.0 && Edisp > 0) {
+      const bool have_edges = (dispersion_cut_global_ > 0.0 && Edisp > 0);
+      torch::Tensor full_src, full_dst, full_sh;
+      if (have_edges) {
         // The reused ghost list is NEAREST-image; the Ewald T_SR needs every image within r_cut, so
         // enforce 2*r_cut <= box face height (single image). The reciprocal mesh covers beyond r_cut.
         validate_mbd_dispersion_single_image_cutoff(error, geom, dispersion_cut_global_, "pair_style mff/torch MBD");
@@ -1161,9 +1172,23 @@ void PairMFFTorch::compute(int eflag, int vflag) {
         auto cs = cached_disp_edge_src_t_.to(mbd_device);
         auto cd = cached_disp_edge_dst_t_.to(mbd_device);
         auto csh = cached_disp_edge_shifts_t_.to(mbd_device, torch::kFloat32);
-        auto full_src = torch::cat({cs, cd});
-        auto full_dst = torch::cat({cd, cs});
-        auto full_sh = torch::cat({csh, -csh});
+        full_src = torch::cat({cs, cd});
+        full_dst = torch::cat({cd, cs});
+        full_sh = torch::cat({csh, -csh});
+      }
+      if (respa_phase_ == PHASE_INNER) {
+        // rRESPA outer level runs every K steps; stage the MBD inputs for compute_outer() instead of
+        // solving now. The source/pos/edges already live on the engine device (clones detached from the
+        // AOTI buffer via run_aoti's CPU round-trip), so they survive K inner steps. The MBD force from
+        // the LAST outer solve is re-added every inner step in run_sr_core_and_stage_mbd() (held fixed
+        // between outer updates -> the standard rRESPA slow-force extrapolation).
+        respa_mbd_source_ = mbd_source;
+        respa_mbd_pos_ = mbd_pos;
+        respa_mbd_cell_ = mbd_cell;
+        respa_mbd_have_edges_ = have_edges;
+        if (have_edges) { respa_mbd_full_src_ = full_src; respa_mbd_full_dst_ = full_dst; respa_mbd_full_sh_ = full_sh; }
+        respa_have_mbd_ = true;
+      } else if (have_edges) {
         mbd_out = mbd_solver_->compute(mbd_pos, mbd_source, mbd_cell, full_src, full_dst, full_sh,
                                        dispersion_cut_global_, mbd_device);
       } else {
@@ -1174,14 +1199,24 @@ void PairMFFTorch::compute(int eflag, int vflag) {
     }
   }
 
-  if (eflag) eng_vdwl += out.energy;
-  if (use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
-  if (use_mbd) eng_vdwl += mbd_out.energy;
+  // rRESPA inner level: the SR energy/per-atom/virial tally is DEFERRED to compute_outer() (thermo
+  // only samples at outer steps), and the MBD solve was staged above. Add the SR forces (done below)
+  // + the held MBD force, then return before the global-energy/virial tally.
+  const bool defer_tally = (respa_phase_ == PHASE_INNER);
+
+  if (!defer_tally && eflag) eng_vdwl += out.energy;
+  if (!defer_tally && use_runtime_long_range) eng_vdwl += reciprocal_out.energy;
+  if (!defer_tally && use_mbd) eng_vdwl += mbd_out.energy;
+  // Stage the SR scalar energy so compute_outer() can tally it (thermo samples only at outer steps).
+  if (respa_phase_ == PHASE_INNER) { respa_sr_energy_ = out.energy; respa_staged_nlocal_ = nlocal; }
 
   // When virial is needed, ghost forces must be in f[] for virial_fdotr_compute()
   // to produce correct results (it sums over nall = nlocal + nghost). In fold mode the model has no
   // ghost nodes (cross-boundary forces already landed on local owners), so we only write nlocal rows.
-  const int nwrite = fold_mode_ ? nlocal : ((force->newton_pair || vflag_fdotr) ? ntotal : nlocal);
+  // rRESPA: the inner level always needs ghost SR forces in f[] (reverse_comm folds them onto owners
+  // before the per-level force is stored), so treat PHASE_INNER like the newton_pair/vflag_fdotr case.
+  const int nwrite = fold_mode_ ? nlocal
+      : ((force->newton_pair || vflag_fdotr || respa_phase_ == PHASE_INNER) ? ntotal : nlocal);
   auto forces_cpu = out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
   const double *fp = forces_cpu.data_ptr<double>();
   for (int i = 0; i < nwrite; i++) {
@@ -1207,6 +1242,10 @@ void PairMFFTorch::compute(int eflag, int vflag) {
       f[i][2] += mfp[i * 3 + 2];
     }
   }
+
+  // rRESPA inner level defers all energy/virial tally to compute_outer(); skip the per-atom + fdotr
+  // blocks here (eflag_atom/vflag_atom/vflag_fdotr are stale from the previous outer ev_init anyway).
+  if (defer_tally) { respa_staged_ = true; return; }
 
   if (eflag_atom && eatom && out.atom_energy.defined()) {
     auto ae_cpu = out.atom_energy.to(torch::kCPU, torch::kFloat64).contiguous().view({n_model});
@@ -1234,4 +1273,80 @@ void PairMFFTorch::compute(int eflag, int vflag) {
   }
 
   if (vflag_fdotr) virial_fdotr_compute();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// rRESPA inner level: the cheap short-range core, run EVERY step. Builds the model graph from the full
+// neighbor list, runs the SR engine forward, writes ONLY the SR (+reciprocal) force into f[] (which
+// rRESPA just cleared and will store as the inner-level force), and stages the MBD inputs for the
+// outer level. No energy/virial tally here (deferred to compute_outer). The MBD force is NOT added at
+// this level -- rRESPA stores/applies the outer (MBD) force separately with the large outer timestep.
+void PairMFFTorch::compute_inner() {
+  respa_phase_ = PHASE_INNER;
+  respa_staged_ = false;
+  if (std::getenv("MFF_RESPA_COUNT")) {
+    static long n_inner = 0;
+    std::fprintf(stderr, "[mff/torch RESPA] compute_inner #%ld (step %lld)\n",
+                 ++n_inner, (long long)update->ntimestep);
+  }
+  // compute(0,0): eflag/vflag are ignored on the inner level (defer_tally guards every tally); we pass
+  // 0 so no per-atom arrays are touched. The SR force write inside still happens (phase-gated).
+  compute(0, 0);
+  respa_phase_ = PHASE_FULL;
+}
+
+// rRESPA middle level: unused (this pair is a 2-level inner/outer split). Empty by design.
+void PairMFFTorch::compute_middle() {}
+
+// rRESPA outer level: the expensive many-body-dispersion solve, run every K steps. Runs the MBD solve
+// from the inputs staged by the most recent compute_inner() (same positions -> consistent), writes
+// ONLY the MBD force into f[] (rRESPA cleared it; this becomes the outer-level force applied with the
+// large outer timestep), and tallies the staged SR energy + the MBD energy into the global accumulators
+// (ev_init here zeroed eng_vdwl; the inner level tallied nothing, so the outer level owns the energy).
+void PairMFFTorch::compute_outer(int eflag, int vflag) {
+  ev_init(eflag, vflag);
+  if (!engine_loaded_) init_style();
+  double **f = atom->f;
+  const int nlocal = atom->nlocal;
+  if (std::getenv("MFF_RESPA_COUNT")) {
+    static long n_outer = 0;
+    std::fprintf(stderr, "[mff/torch RESPA] compute_outer #%ld (step %lld, staged=%d mbd=%d)\n",
+                 ++n_outer, (long long)update->ntimestep, (int)respa_staged_, (int)respa_have_mbd_);
+  }
+
+  // Tally the staged SR energy (from the last inner step at these positions). The MBD energy is added
+  // below after the solve. Per-atom SR energy/virial under respa is not staged for the goal of this run
+  // (NVE conservation + speedup needs only the global energy + forces); pressure/per-atom is best-effort.
+  if (respa_staged_ && eflag_global) eng_vdwl += respa_sr_energy_;
+
+  // Run the MBD solve from the staged inputs (engine device). On a step where nothing was staged (e.g.
+  // an empty rank, or MBD disabled) this is a no-op -- f[] keeps only the inner SR force via f_level.
+  mfftorch::MBDOutputs mbd_out;
+  if (respa_staged_ && respa_have_mbd_ && mbd_solver_) {
+    try {
+      const auto mbd_device = engine_->device();
+      if (respa_mbd_have_edges_) {
+        mbd_out = mbd_solver_->compute(respa_mbd_pos_, respa_mbd_source_, respa_mbd_cell_,
+                                       respa_mbd_full_src_, respa_mbd_full_dst_, respa_mbd_full_sh_,
+                                       dispersion_cut_global_, mbd_device);
+      } else {
+        mbd_out = mbd_solver_->compute(respa_mbd_pos_, respa_mbd_source_, respa_mbd_cell_, mbd_device);
+      }
+    } catch (const std::exception &e) {
+      error->all(FLERR, (std::string("mff/torch MBD solver (respa outer) failed: ") + e.what()).c_str());
+    }
+  }
+
+  if (eflag_global && mbd_out.forces.defined()) eng_vdwl += mbd_out.energy;
+  if (mbd_out.forces.defined()) {
+    auto mbd_forces_cpu = mbd_out.forces.to(torch::kCPU, torch::kFloat64).contiguous();
+    const double *mfp = mbd_forces_cpu.data_ptr<double>();
+    const int nadd = std::min(nlocal, respa_staged_nlocal_);
+    for (int i = 0; i < nadd; i++) {
+      f[i][0] += mfp[i * 3 + 0];
+      f[i][1] += mfp[i * 3 + 1];
+      f[i][2] += mfp[i * 3 + 2];
+    }
+  }
+  // No virial_fdotr_compute under rRESPA (virial_style == VIRIAL_PAIR); pressure not targeted this run.
 }
