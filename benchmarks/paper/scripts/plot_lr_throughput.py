@@ -21,15 +21,18 @@ import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.ticker as mticker  # noqa: E402
 
 # condition palette drawn from the paper's WHOLE_MODEL_COLORS family
-COND_COLORS = {"none": "#4a4a4a", "elec": "#08519c", "disp": "#d95f02", "both": "#41ab5d"}
-COND_MARKERS = {"none": "o", "elec": "s", "disp": "^", "both": "D"}
+COND_COLORS = {"none": "#4a4a4a", "elec": "#08519c", "disp": "#d95f02", "both": "#41ab5d", "disp-respa": "#d95f02"}
+COND_MARKERS = {"none": "o", "elec": "s", "disp": "^", "both": "D", "disp-respa": "v"}
+# rRESPA-accelerated dispersion (deployed MBD every K steps): dashed, same orange as disp.
+COND_LINESTYLE = {"disp-respa": "--"}
 COND_LABELS = {
     "none": "no long-range",
     "elec": "electrostatics",
     "disp": "dispersion (MBD)",
     "both": "elec + dispersion",
+    "disp-respa": "dispersion + rRESPA",
 }
-COND_ORDER = ["none", "elec", "disp", "both"]
+COND_ORDER = ["none", "elec", "disp", "both", "disp-respa"]
 
 MODE_TITLES = {
     "train": "Training (E+F+backward)",
@@ -114,6 +117,7 @@ def main() -> None:
                 color=COND_COLORS[cond],
                 label=COND_LABELS[cond],
                 linewidth=1.5, markersize=5.5, markeredgewidth=1.2,
+                linestyle=COND_LINESTYLE.get(cond, "-"),
             )
         ax.set_xscale("log")
         ax.set_yscale("log")
