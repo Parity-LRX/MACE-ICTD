@@ -890,8 +890,9 @@ class _SqrtFirstMomentQuad(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tri: torch.Tensor, eig_floor: float) -> torch.Tensor:
+    def forward(ctx, tri: torch.Tensor, eig_floor: float, eig_ceil: float = 1.0e4) -> torch.Tensor:
         eps = float(eig_floor)
+        ceil = float(eig_ceil)
         # Empty batch: keep the [B] shape and a valid grad path (eigh on a 0-batch is fine, but
         # short-circuit to avoid relying on backend behaviour for B=0).
         if tri.shape[0] == 0:
@@ -906,14 +907,21 @@ class _SqrtFirstMomentQuad(torch.autograd.Function):
             return tri.new_zeros(0)
         evals, evecs = torch.linalg.eigh(tri)                  # [B,k], [B,k,k]
         smooth = 0.5 * (evals + torch.sqrt(evals.square() + eps * eps))
-        f = smooth.clamp_min(eps).sqrt()                       # [B,k] = f(lambda)
+        g = smooth.clamp_min(eps)
+        # smooth spectral CEILING (mirrors the eps floor): gc = ceil*g/(ceil+g) == g for g<<ceil
+        # (physical region ~O(omega^2), accuracy-neutral) and saturates -> ceil for g>>ceil. A
+        # runaway learned coupling driving Ritz values huge then gets fprime->0 (no push) and a
+        # finite sqrt(C), so grad-clip recovers instead of cascading (polarization-catastrophe guard).
+        gc = (ceil * g) / (ceil + g)
+        f = gc.sqrt()                       # [B,k] = f(lambda)
         a = evecs[:, 0, :]                                     # [B,k] first row U[0,:]
         # smooth'(lambda) = 0.5 (1 + lambda / sqrt(lambda^2 + eps^2)); g'(lambda) = smooth' where
         # smooth > eps else 0 (the clamp_min has zero slope on the floored branch).  f'(lambda) =
         # g'(lambda) / (2 f(lambda)); f >= sqrt(eps) > 0 so the division is safe.
         smooth_grad = 0.5 * (1.0 + evals / torch.sqrt(evals.square() + eps * eps))
         gprime = torch.where(smooth > eps, smooth_grad, torch.zeros_like(smooth_grad))
-        fprime = gprime / (2.0 * f)                            # [B,k] = f'(lambda)
+        gc_grad = (ceil * ceil) / ((ceil + g) * (ceil + g))    # dgc/dg = ceil^2/(ceil+g)^2 -> 0 for g>>ceil
+        fprime = (gc_grad * gprime) / (2.0 * f)                            # [B,k] = f'(lambda)
         ctx.eps = eps
         ctx.save_for_backward(evals, evecs, f, fprime, a)
         return (a.square() * f).sum(dim=-1)                    # [B]
@@ -922,7 +930,7 @@ class _SqrtFirstMomentQuad(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):  # grad_out: [B]
         evals, evecs, f, fprime, a = ctx.saved_tensors
         if evals.shape[0] == 0:
-            return torch.zeros_like(evecs).new_zeros(evecs.shape), None
+            return torch.zeros_like(evecs).new_zeros(evecs.shape), None, None
 
         k = evals.shape[-1]
         # Divided differences  f1_ij = (f_i - f_j) / (lambda_i - lambda_j) for i != j, and
@@ -947,7 +955,7 @@ class _SqrtFirstMomentQuad(torch.autograd.Function):
         M = a.unsqueeze(-1) * a.unsqueeze(-2) * f1             # [B,k,k]
         G = torch.matmul(torch.matmul(evecs, M), evecs.transpose(-1, -2))  # [B,k,k]
         grad_tri = 0.5 * (G + G.transpose(-1, -2)) * grad_out.view(-1, 1, 1)
-        return grad_tri, None
+        return grad_tri, None, None
 
 
 class ManyBodyDispersionSLQ(nn.Module):
@@ -985,6 +993,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         alpha_floor: float = 1.0e-4,
         omega_floor: float = 1.0e-3,
         eig_floor: float = 1.0e-8,
+        eig_ceil: float = 1.0e4,
         num_probes: int = 8,
         lanczos_steps: int = 16,
         probe_mode: str = "rademacher",
@@ -1018,6 +1027,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         self.alpha_floor = float(alpha_floor)
         self.omega_floor = float(omega_floor)
         self.eig_floor = float(eig_floor)
+        self.eig_ceil = float(eig_ceil)
         self.num_probes = int(num_probes)
         self.lanczos_steps = int(lanczos_steps)
         self.probe_mode = str(probe_mode)
@@ -1270,7 +1280,7 @@ class ManyBodyDispersionSLQ(nn.Module):
         # The forward is identical to the previous in-line eigh-quadrature; the custom Function
         # only swaps eigh's degeneracy-singular eigenvector backward for the finite Daleckii-Krein
         # divided-difference gradient (see _SqrtFirstMomentQuad).
-        return _SqrtFirstMomentQuad.apply(tri, self.eig_floor)
+        return _SqrtFirstMomentQuad.apply(tri, self.eig_floor, self.eig_ceil)
 
     def _forward_looped(
         self,
