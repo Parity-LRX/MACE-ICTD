@@ -1055,6 +1055,51 @@ Decision rules:
   ICTD-distinctive path); the cost is small.
 - **Core**: AOTI `.pt2` for throughput; TorchScript `.pt` for N-flexible / portable deployment.
 
+### 12.6 Training stability and warm-start (MBD)
+
+MBD is a coupled-dipole solve on a *learned* polarizability, so early in training the coupling
+matrix `C` can drift toward the polarization-catastrophe edge. Two numerical guards are built in and
+always on: a **detached spectral rescaling** keeps `C` strictly positive-definite at every step (the
+`Tr[√C]` estimator never sees a non-PD operator, so there is no hard NaN from the spectrum), and the
+anisotropic l=2 readout uses a **smooth norm** so the second-order (force-loss) gradient stays finite
+at initialization. With those in place, the practical guidance is:
+
+**Warm-start is the recommended path — and the most stable.** Train (or convert) a backbone first,
+then add MBD on top with a non-strict load: the backbone is warm-started and only the MBD head starts
+fresh. This converges fastest and rarely sees instability.
+
+```bash
+# backbone.pth = a trained MACE-ICTD checkpoint with NO long-range (or a converted MACE checkpoint)
+python -m mace_ictd.cli.train --data-dir DATA \
+  --channels 128 --lmax 2 --num-interaction 2 \
+  --long-range-dispersion-mode mbd-slq --mbd-anisotropic --dispersion-cutoff 8.0 \
+  --resume-checkpoint backbone.pth --finetune \
+  --max-grad-norm 10 --lr 1e-3 \
+  --checkpoint model_mbd_aniso.pth
+```
+
+`--finetune` loads weights **non-strictly** (the missing MBD-head keys stay fresh, unexpected keys are
+ignored) with a fresh optimizer from epoch 0. The architecture flags must still describe the *full*
+model (backbone + MBD). To continue the full model afterwards, resume normally with
+`--resume-checkpoint model_mbd_aniso.pth --resume-training-state` (strict load, optimizer restored).
+
+**From-scratch MBD** works too, but is more delicate:
+
+- Always keep `--max-grad-norm 10` (the project standard). If the loss spikes, lower the LR or the
+  dispersion cutoff — do **not** raise the clip.
+- Two-interaction models (receptive field ≈ 2×cutoff) are generally stable once past the first ~20
+  epochs; the rescaling fires gently and convergence is smooth.
+- **Single-interaction** (`--num-interaction 1`) MBD is sensitive at `lr 1e-3`: the coarse receptive
+  field makes α/ω swing batch-to-batch, the rescaling fires hard, and the loss can spike (NaN-free but
+  convergence-wrecking). Warm-start it, or drop the LR.
+
+**Eager vs. compiled for MBD.** `--train-makefx-compile` gives ~3× step throughput and is fine for the
+throughput benchmark and medium runs (tens of epochs). For **long / production MBD training prefer
+eager** (omit `--train-makefx-compile`): the compiled path holds one graph per atom-count bucket, and a
+deep `torch.compile` multi-graph double-backward interaction can surface a *stochastic* NaN late in
+long multi-shape runs (mitigated — not eliminated — by disabling AOTAutograd donated buffers). This is
+a training-only, multi-graph issue: **AOTI deployment is single-graph and unaffected.**
+
 ## 13. Benchmarking
 
 Main benchmark harness:
@@ -1171,6 +1216,16 @@ Dynamic AOTI and make_fx paths are sensitive to PyTorch/Inductor version. If a d
 - smaller buckets,
 - PyTorch 2.7+,
 - disabling optional fusion/autotune flags.
+
+### MBD / dispersion training instability
+
+If MBD training spikes or NaNs, it is almost always one of: (1) training from scratch instead of
+warm-starting (add MBD on a trained backbone with `--resume-checkpoint … --finetune` — see Section
+12.6); (2) a missing or raised gradient clip (keep `--max-grad-norm 10`; lower the LR or cutoff
+instead); (3) single-interaction MBD at `lr 1e-3` (warm-start or drop the LR); or (4) a long
+`--train-makefx-compile` run (use eager for long/production MBD training; AOTI deployment is
+unaffected). The polarizability solve is kept positive-definite at every step, so a hard NaN is rare
+and usually points at one of these. See Section 12.6.
 
 ## 16. Development Notes
 

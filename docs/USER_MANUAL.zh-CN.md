@@ -1022,6 +1022,43 @@ run 1000
 - **各向异性**：当希望 l=2 表示驱动方向性极化率时开启（ICTD 独有路径）；开销很小。
 - **Core**：要吞吐用 AOTI `.pt2`；要 N 灵活/便携用 TorchScript `.pt`。
 
+### 12.6 训练稳定性与 warm-start（MBD）
+
+MBD 是在*学习到的*极化率上做耦合偶极求解，所以训练早期耦合矩阵 `C` 可能漂向极化灾变边缘。两个数值
+护栏内置且常开：**detached 谱再缩放**让 `C` 每一步都严格正定（`Tr[√C]` 估计器永远不会看到非 PD 算子，
+谱本身不会产生硬 NaN），各向异性 l=2 readout 用**光滑范数**让二阶（force-loss）梯度在初始化时保持有限。
+在此基础上的实用建议：
+
+**Warm-start 是推荐路径——也最稳。** 先训（或转换）一个 backbone，再用非严格加载在其上加 MBD：backbone
+被 warm-start，只有 MBD head 从头初始化。这样收敛最快、几乎不出不稳定。
+
+```bash
+# backbone.pth = 一个不带长程、已训好的 MACE-ICTD checkpoint（或转换自 MACE 的 checkpoint）
+python -m mace_ictd.cli.train --data-dir DATA \
+  --channels 128 --lmax 2 --num-interaction 2 \
+  --long-range-dispersion-mode mbd-slq --mbd-anisotropic --dispersion-cutoff 8.0 \
+  --resume-checkpoint backbone.pth --finetune \
+  --max-grad-norm 10 --lr 1e-3 \
+  --checkpoint model_mbd_aniso.pth
+```
+
+`--finetune` 以**非严格**方式加载权重（缺失的 MBD-head 键保持新初始化、多余的键忽略），用全新 optimizer
+从 epoch 0 开始。架构 flag 仍要描述*完整*模型（backbone + MBD）。之后要继续训完整模型，正常 resume：
+`--resume-checkpoint model_mbd_aniso.pth --resume-training-state`（严格加载、恢复 optimizer）。
+
+**从头训 MBD** 也行，但更娇气：
+
+- 始终保留 `--max-grad-norm 10`（项目标准）。loss 若 spike，降 LR 或降色散 cutoff——**不要**调高 clip。
+- 两层交互（感受野 ≈ 2×cutoff）一般过了前 ~20 epoch 就稳；再缩放温和触发、收敛平滑。
+- **单层交互**（`--num-interaction 1`）的 MBD 在 `lr 1e-3` 下敏感：粗感受野让 α/ω 在 batch 间剧烈摆动、
+  再缩放硬触发、loss 会 spike（无 NaN 但毁收敛）。warm-start 它，或降 LR。
+
+**MBD 的 eager vs 编译。** `--train-makefx-compile` 给 ~3× 单步吞吐，适合吞吐 benchmark 和中等长度（几十
+epoch）的训练。**长训/生产 MBD 训练优先用 eager**（去掉 `--train-makefx-compile`）：编译路径每个原子数
+bucket 持有一张图，一个深层的 `torch.compile` 多图二阶反传交互会在长的多 shape 训练后期冒出*随机* NaN
+（靠关闭 AOTAutograd donated buffer 缓解、但未根除）。这是训练侧、多图特有的问题：**AOTI 部署是单图、
+不受影响。**
+
 ## 13. Benchmark
 
 主 benchmark：
@@ -1136,6 +1173,14 @@ Dynamic AOTI 和 make_fx 对 PyTorch/Inductor 版本敏感。如果 dynamic expo
 - 更小/更少的 bucket，
 - PyTorch 2.7+，
 - 关闭 fusion/autotune 等可选优化。
+
+### MBD / 色散训练不稳定
+
+MBD 训练若 spike 或 NaN，几乎总是以下之一：(1) 从头训而非 warm-start（在已训 backbone 上用
+`--resume-checkpoint … --finetune` 加 MBD——见 12.6）；(2) 缺失或调高了梯度裁剪（保持
+`--max-grad-norm 10`，要稳就降 LR 或 cutoff）；(3) 单层交互 MBD 在 `lr 1e-3`（warm-start 或降 LR）；
+(4) 长的 `--train-makefx-compile` 运行（长训/生产 MBD 用 eager；AOTI 部署不受影响）。极化率求解每步都
+保持正定，所以硬 NaN 很少见，出现时通常就是上面几条之一。见 12.6。
 
 ## 16. 开发说明
 
