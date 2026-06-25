@@ -1679,12 +1679,28 @@ class ManyBodyDispersionSLQ(nn.Module):
         # positive-definite. rho(M_g) < 1 - pd_margin => lambda_min(Omega^-1 C_g Omega^-1) >=
         # pd_margin > 0. s_g == 1 where healthy (zero bias); only an indefinite C_g is screened.
         if self.pd_rescale:
-            rho = self._pd_rho(matvec, omega_batch.view(G, 1, m_max, 1), probes_batch)  # [G, n_probe]
-            s_pd = ((1.0 - self.pd_margin) / rho.amax(dim=1).clamp_min(1.0e-6)).clamp(max=1.0).detach()  # [G]
-            _base_mv = matvec
-            _s_b = s_pd.view(G, 1, 1, 1)
-            def matvec(v, _b=_base_mv, _s=_s_b, _o=omega_sq):
-                return _s * _b(v) + (1.0 - _s) * (_o * v)
+            # AMORTIZE the rescaling: a cheap block-Gershgorin test skips the 10-matvec power
+            # iteration whenever C = Omega^2 + coupling is provably PD. For the normalized coupling
+            # M = Omega^-1 (C - Omega^2) Omega^-1 (zero diagonal), Gershgorin gives
+            # rho(M) <= max_i sum_j ||block_ij||_F / (Omega_i Omega_j); if that < 1 - pd_margin then
+            # lambda_min(Omega^-1 C Omega^-1) > pd_margin => C strictly PD => no screening needed.
+            # The bound upper-bounds rho, so a skip is always correct; a no-skip falls through to the
+            # tight power iteration (unchanged). Early / moderate-coupling steps skip (zero extra
+            # matvecs); only near-catastrophe steps pay. Reuses the precomputed coupling blocks.
+            _enorm = blocks_batch.flatten(-2).norm(dim=-1)                       # [G, E] = ||block_e||_F
+            _oi = torch.gather(omega_batch, 1, li_batch).clamp_min(1.0e-6)       # [G, E] Omega at li
+            _oj = torch.gather(omega_batch, 1, lj_batch).clamp_min(1.0e-6)       # [G, E] Omega at lj
+            _rowsum = omega_batch.new_zeros(G, m_max)
+            _rowsum.scatter_add_(1, li_batch, _enorm / _oj)                      # atom li <- ||block||/Omega_j
+            _rowsum.scatter_add_(1, lj_batch, _enorm / _oi)                      # atom lj <- ||block||/Omega_i
+            _gersh = (_rowsum / omega_batch.clamp_min(1.0e-6)).amax(dim=1)       # [G], >= rho(M_g)
+            if not bool((_gersh < (1.0 - self.pd_margin)).all()):               # some graph not provably PD-safe
+                rho = self._pd_rho(matvec, omega_batch.view(G, 1, m_max, 1), probes_batch)  # [G, n_probe]
+                s_pd = ((1.0 - self.pd_margin) / rho.amax(dim=1).clamp_min(1.0e-6)).clamp(max=1.0).detach()  # [G]
+                _base_mv = matvec
+                _s_b = s_pd.view(G, 1, 1, 1)
+                def matvec(v, _b=_base_mv, _s=_s_b, _o=omega_sq):
+                    return _s * _b(v) + (1.0 - _s) * (_o * v)
 
         # --- ONE batched Lanczos over the (G, P) batch (flatten to B = G*P rows) ---
         dim = 3 * m_max
