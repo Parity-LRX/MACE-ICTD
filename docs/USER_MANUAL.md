@@ -603,6 +603,32 @@ only start after Python can load the source object. For older OFF23 checkpoints,
 historical `mace-torch`/`e3nn` environment for the loading and conversion step; the converted ICTD
 checkpoint can then be loaded by the current MACE-ICTD runtime.
 
+**Setting up that historical loading environment.** Current `e3nn` (0.5.x / 0.6.x) cannot deserialize
+OFF23 checkpoints: `torch.load` raises `ValueError: too many values to unpack (expected 2)` from
+`e3nn/util/codegen/_mixin.py` (the compiled-module pickle format changed between e3nn versions). Load
+and convert with the versions OFF23 was serialized with — **`e3nn==0.4.4` + `mace-torch==0.3.16`** —
+installed into isolated directories and prepended on `PYTHONPATH` so they shadow the environment's
+newer `e3nn`/`mace`, while the environment still supplies `torch` (any recent version works for the
+deserialization):
+
+```bash
+# one-time: stage the legacy deserialization deps anywhere persistent
+pip install --target=$HOME/compat_e3nn044/e3nn_0_4_4        "e3nn==0.4.4"
+pip install --target=$HOME/compat_e3nn044/mace_torch_0_3_16 "mace-torch==0.3.16"
+
+# load + convert with them prepended (mace_ictd also importable via PYTHONPATH or install):
+PYTHONPATH=$HOME/compat_e3nn044/mace_torch_0_3_16:$HOME/compat_e3nn044/e3nn_0_4_4 \
+  python -m mace_ictd.cli.convert_mace \
+    --mace-model /path/to/MACE-OFF23_small.model \
+    --out MACE-OFF23_small_ictd_bridge_u_f64.pth \
+    --product-backend ictd-bridge-u --dtype float64
+```
+
+The converted `.pth` is a plain state_dict and loads in the normal (current-`e3nn`) environment for
+training and export — only the *loading of the pickled source model* needs the legacy deps. Note: the
+fresh-build converter parity test (`mace_ictd/test/test_mace_converter.py`) builds its MACE in-process
+and is unaffected; this legacy environment is needed only to load *saved* foundation checkpoints.
+
 Example conversion of an OFF23 small model:
 
 ```bash

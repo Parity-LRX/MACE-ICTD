@@ -592,6 +592,30 @@ load 原始对象后才能开始工作。比较老的 OFF23 checkpoint 可能需
 `mace-torch`/`e3nn` 环境来完成 load 和 conversion；转换后的 ICTD checkpoint 可以再交给当前
 MACE-ICTD runtime 加载、导出和部署。
 
+**搭建这个历史加载环境。** 当前 `e3nn`（0.5.x / 0.6.x）无法反序列化 OFF23 checkpoint：`torch.load`
+会从 `e3nn/util/codegen/_mixin.py` 抛 `ValueError: too many values to unpack (expected 2)`（e3nn 各版本间
+compiled-module 的 pickle 格式变了）。用 OFF23 序列化时的版本——**`e3nn==0.4.4` + `mace-torch==0.3.16`**——
+装到隔离目录、再用 `PYTHONPATH` 前置，让它们 shadow 掉环境里更新的 `e3nn`/`mace`，而 `torch` 仍由环境提供
+（反序列化对 torch 版本不敏感）：
+
+```bash
+# 一次性：把这两个 legacy 反序列化依赖装到任意持久目录
+pip install --target=$HOME/compat_e3nn044/e3nn_0_4_4        "e3nn==0.4.4"
+pip install --target=$HOME/compat_e3nn044/mace_torch_0_3_16 "mace-torch==0.3.16"
+
+# 前置它们来 load + convert（mace_ictd 也要可导入：PYTHONPATH 或已安装）：
+PYTHONPATH=$HOME/compat_e3nn044/mace_torch_0_3_16:$HOME/compat_e3nn044/e3nn_0_4_4 \
+  python -m mace_ictd.cli.convert_mace \
+    --mace-model /path/to/MACE-OFF23_small.model \
+    --out MACE-OFF23_small_ictd_bridge_u_f64.pth \
+    --product-backend ictd-bridge-u --dtype float64
+```
+
+转换出的 `.pth` 是普通 state_dict，可在正常（当前 `e3nn`）环境里加载用于训练和导出——只有*加载 pickled
+源模型*这一步需要 legacy 依赖。注意：fresh-build 的 converter parity 测试
+（`mace_ictd/test/test_mace_converter.py`）在进程内现建 MACE，不受影响；这个 legacy 环境只用于加载*已存档的*
+foundation checkpoint。
+
 OFF23 small 模型转换示例：
 
 ```bash
