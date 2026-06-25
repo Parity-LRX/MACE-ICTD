@@ -997,6 +997,9 @@ class ManyBodyDispersionSLQ(nn.Module):
         pd_rescale: bool = True,
         pd_margin: float = 0.1,
         pd_power_iters: int = 10,
+        trace_estimator: str = "hutch++",
+        hutchpp_sketch: int = 4,
+        hutchpp_residual: int = 2,
         num_probes: int = 8,
         lanczos_steps: int = 16,
         probe_mode: str = "rademacher",
@@ -1034,6 +1037,9 @@ class ManyBodyDispersionSLQ(nn.Module):
         self.pd_rescale = bool(pd_rescale)
         self.pd_margin = float(pd_margin)
         self.pd_power_iters = int(pd_power_iters)
+        self.trace_estimator = str(trace_estimator)
+        self.hutchpp_sketch = int(hutchpp_sketch)
+        self.hutchpp_residual = int(hutchpp_residual)
         self.num_probes = int(num_probes)
         self.lanczos_steps = int(lanczos_steps)
         self.probe_mode = str(probe_mode)
@@ -1318,6 +1324,87 @@ class ManyBodyDispersionSLQ(nn.Module):
         # only swaps eigh's degeneracy-singular eigenvector backward for the finite Daleckii-Krein
         # divided-difference gradient (see _SqrtFirstMomentQuad).
         return _SqrtFirstMomentQuad.apply(tri, self.eig_floor, self.eig_ceil)
+
+    def _det_rademacher(self, count: int, m: int, offset: int, *, device, dtype):
+        """``count`` deterministic Rademacher vectors over ``m`` atoms x 3 components, probe-indexed
+        from ``offset`` (distinct offsets -> distinct, reproducible, makefx-safe vector sets)."""
+        p = torch.arange(offset, offset + count, device=device, dtype=dtype).view(count, 1, 1)
+        a = torch.arange(m, device=device, dtype=dtype).view(1, m, 1)
+        c = torch.arange(3, device=device, dtype=dtype).view(1, 1, 3)
+        h = ((p + 1.0) * 12.9898 + (a + 1.0) * 78.233 + (c + 1.0) * 37.719
+             + (p + 1.0) * (a + 1.0) * 0.137 + (p + 1.0) * (c + 1.0) * 0.193)
+        return torch.where(torch.sin(h) >= 0.0, 1.0, -1.0).to(dtype=dtype)  # [count, m, 3]
+
+    def _lanczos_quad(self, matvec, probes: torch.Tensor, steps: int) -> torch.Tensor:
+        """Per-probe Lanczos quadrature estimate of z^T sqrt(C) z. ``probes``: [G, P, m, 3];
+        ``matvec`` acts on [G, P, m, 3]. Returns [G, P]. (Extracted from the batched Lanczos so the
+        Hutch++ residual can reuse it.)"""
+        G, P, m_max, _ = probes.shape
+        dim = 3 * m_max
+        q = probes.reshape(G * P, dim)
+        q_norm = q.norm(dim=-1).clamp_min(1.0e-14)
+        q = q / q_norm.view(-1, 1)
+        q_prev = torch.zeros_like(q)
+        beta_prev = q.new_zeros(G * P)
+        alphas: list[torch.Tensor] = []
+        betas: list[torch.Tensor] = []
+        basis: list[torch.Tensor] = []
+        for step in range(steps):
+            z = matvec(q.reshape(G, P, m_max, 3)).reshape(G * P, dim)
+            z = torch.nan_to_num(z, nan=0.0, posinf=1.0e30, neginf=-1.0e30)
+            if step > 0:
+                z = z - beta_prev.view(-1, 1) * q_prev
+            a = (q * z).sum(dim=-1)
+            z = z - a.view(-1, 1) * q
+            for old_q in basis:
+                z = z - (z * old_q).sum(dim=-1, keepdim=True) * old_q
+            b = z.norm(dim=-1)
+            alphas.append(a)
+            if step + 1 < steps:
+                betas.append(b)
+            basis.append(q)
+            q_prev = q
+            q = z / b.clamp_min(1.0e-14).view(-1, 1)
+            beta_prev = b
+        tri = q.new_zeros(G * P, steps, steps)
+        ar = torch.arange(steps, device=q.device)
+        tri[:, ar, ar] = torch.stack(alphas, dim=1)
+        if steps > 1:
+            off = torch.stack(betas, dim=1)
+            ar0 = torch.arange(steps - 1, device=q.device)
+            tri[:, ar0, ar0 + 1] = off
+            tri[:, ar0 + 1, ar0] = off
+        return (q_norm.square() * self._sqrt_first_moment(tri)).reshape(G, P)
+
+    def _hutchpp_trace(self, matvec, G: int, m_max: int, steps: int, atom_valid: torch.Tensor,
+                       *, device, dtype) -> torch.Tensor:
+        """Nystrom-Hutch++ estimate of Tr sqrt(C) per graph [G]. Deflates the dominant eigenspace
+        deterministically (zero variance) and Hutchinson-estimates only the residual:
+        Tr sqrt(C) = Tr(Q^T sqrt(C) Q) + Tr((I-QQ^T) sqrt(C) (I-QQ^T)).  The first is the Rayleigh-Ritz
+        Tr sqrt(Q^T C Q) (one small k x k eigh, NO per-column Lanczos); the second is a few deflated
+        Lanczos probes. C is PD here (rescaling guard) so Q^T C Q is PD. Lower variance than vanilla
+        Hutchinson => fewer Lanczos probes for the same accuracy."""
+        dim = 3 * m_max
+        k = max(int(self.hutchpp_sketch), 1)
+        mres = max(int(self.hutchpp_residual), 1)
+        av = atom_valid.view(G, 1, m_max, 1)
+        # sketch the dominant eigenspace: Q = orthonormal(C . S)
+        S = self._det_rademacher(k, m_max, 100, device=device, dtype=dtype).unsqueeze(0) * av  # [G,k,m,3]
+        Y = matvec(S).reshape(G, k, dim).transpose(1, 2)                      # C.S -> [G, dim, k]
+        Y = torch.nan_to_num(Y, nan=0.0, posinf=1.0e30, neginf=-1.0e30)
+        Q, _ = torch.linalg.qr(Y)                                             # [G, dim, k]
+        # dominant trace via Rayleigh-Ritz: B = Q^T C Q (k x k), Tr sqrt(B)
+        CQ = matvec(Q.transpose(1, 2).reshape(G, k, m_max, 3)).reshape(G, k, dim).transpose(1, 2)  # [G,dim,k]
+        B = torch.matmul(Q.transpose(1, 2), CQ)                               # [G, k, k]
+        B = 0.5 * (B + B.transpose(1, 2))
+        mu = torch.linalg.eigvalsh(B).clamp_min(self.eig_floor)              # [G, k]
+        tr_dom = mu.sqrt().sum(dim=1)                                         # [G]
+        # residual: deflated Hutchinson g' = (I - Q Q^T) g
+        g = self._det_rademacher(mres, m_max, 500, device=device, dtype=dtype).unsqueeze(0) * av  # [G,mres,m,3]
+        gf = g.reshape(G, mres, dim)
+        gdef = (gf - torch.matmul(torch.matmul(gf, Q), Q.transpose(1, 2))).reshape(G, mres, m_max, 3)
+        tr_res = self._lanczos_quad(matvec, gdef, steps).mean(dim=1)          # [G]
+        return tr_dom + tr_res
 
     def _forward_looped(
         self,
@@ -1658,14 +1745,18 @@ class ManyBodyDispersionSLQ(nn.Module):
         probes_batch = probes_full.unsqueeze(0) * atom_valid.view(G, 1, m_max, 1)  # [G,P,m_max,3]
 
         omega_sq = omega_batch.square().view(G, 1, m_max, 1)  # [G,1,m_max,1]
-        idx_i = li_batch.view(G, 1, -1, 1).expand(G, n_probe, -1, 3)  # scatter targets (atom dim=2)
-        idx_j = lj_batch.view(G, 1, -1, 1).expand(G, n_probe, -1, 3)
+        idx_i_b = li_batch.view(G, 1, -1, 1)  # [G,1,E,1] scatter/gather targets (atom dim=2)
+        idx_j_b = lj_batch.view(G, 1, -1, 1)
         blocks_g = blocks_batch.unsqueeze(1)                  # [G,1,E,3,3]
         blocks_gT = blocks_batch.transpose(-1, -2).unsqueeze(1)
 
         def matvec(v: torch.Tensor) -> torch.Tensor:
             # v: [G, P, m_max, 3]; C.v = omega^2 v + scatter(blocks @ v[lj]) + scatter(blocks^T @ v[li]).
-            # gather along the atom dim per (G) -- torch.gather broadcasts the index over P/components.
+            # Expand the edge index to v's probe count P so ONE construction serves any P (the Lanczos
+            # probes, the Hutch++ sketch k, and the deflated residual m all flow through this operator).
+            P = v.shape[1]
+            idx_i = idx_i_b.expand(G, P, -1, 3)
+            idx_j = idx_j_b.expand(G, P, -1, 3)
             y = omega_sq * v
             v_j = torch.gather(v, 2, idx_j)
             v_i = torch.gather(v, 2, idx_i)
@@ -1702,46 +1793,12 @@ class ManyBodyDispersionSLQ(nn.Module):
                 def matvec(v, _b=_base_mv, _s=_s_b, _o=omega_sq):
                     return _s * _b(v) + (1.0 - _s) * (_o * v)
 
-        # --- ONE batched Lanczos over the (G, P) batch (flatten to B = G*P rows) ---
-        dim = 3 * m_max
-        q = probes_batch.reshape(G * n_probe, dim)
-        q_norm = q.norm(dim=-1).clamp_min(1.0e-14)
-        q = q / q_norm.view(-1, 1)
-        q_prev = torch.zeros_like(q)
-        beta_prev = q.new_zeros(G * n_probe)
-        alphas: list[torch.Tensor] = []
-        betas: list[torch.Tensor] = []
-        basis: list[torch.Tensor] = []
-        for step in range(steps):
-            z = matvec(q.reshape(G, n_probe, m_max, 3)).reshape(G * n_probe, dim)
-            z = torch.nan_to_num(z, nan=0.0, posinf=1.0e30, neginf=-1.0e30)
-            if step > 0:
-                z = z - beta_prev.view(-1, 1) * q_prev
-            a = (q * z).sum(dim=-1)
-            z = z - a.view(-1, 1) * q
-            for old_q in basis:
-                z = z - (z * old_q).sum(dim=-1, keepdim=True) * old_q
-            b = z.norm(dim=-1)
-            alphas.append(a)
-            if step + 1 < steps:
-                betas.append(b)
-            basis.append(q)
-            q_prev = q
-            q = z / b.clamp_min(1.0e-14).view(-1, 1)
-            beta_prev = b
-
-        tri = q.new_zeros(G * n_probe, steps, steps)
-        diag = torch.stack(alphas, dim=1)
-        ar = torch.arange(steps, device=device)
-        tri[:, ar, ar] = diag
-        if steps > 1:
-            off = torch.stack(betas, dim=1)
-            ar0 = torch.arange(steps - 1, device=device)
-            tri[:, ar0, ar0 + 1] = off
-            tri[:, ar0 + 1, ar0] = off
-        estimates = q_norm.square() * self._sqrt_first_moment(tri)        # [G*P]
-        # mean over P per graph -> Tr sqrt(C_g); e_graph = 0.5 Tr sqrt(C_g) - 1.5 sum_i omega_i.
-        trace_sqrt = estimates.reshape(G, n_probe).mean(dim=1)            # [G]
+        # --- trace estimate: Hutch++ (deflated dominant + few residual probes -> lower variance /
+        # fewer Lanczos) or the vanilla SLQ Hutchinson over all P probes. ---
+        if self.trace_estimator == "hutch++":
+            trace_sqrt = self._hutchpp_trace(matvec, G, m_max, steps, atom_valid, device=device, dtype=dtype)  # [G]
+        else:
+            trace_sqrt = self._lanczos_quad(matvec, probes_batch, steps).mean(dim=1)  # [G]
         omega_sum = omega_batch.sum(dim=1)                               # [G] (padding omega=0)
         e_graph = 0.5 * trace_sqrt - 1.5 * omega_sum                     # [G]
         for bi, g in enumerate(active):
