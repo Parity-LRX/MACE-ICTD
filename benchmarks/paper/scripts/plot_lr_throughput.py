@@ -21,18 +21,22 @@ import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.ticker as mticker  # noqa: E402
 
 # condition palette drawn from the paper's WHOLE_MODEL_COLORS family
-COND_COLORS = {"none": "#4a4a4a", "elec": "#08519c", "disp": "#d95f02", "both": "#41ab5d", "disp-respa": "#d95f02"}
-COND_MARKERS = {"none": "o", "elec": "s", "disp": "^", "both": "D", "disp-respa": "v"}
+COND_COLORS = {"none": "#4a4a4a", "elec": "#08519c", "disp": "#d95f02", "both": "#41ab5d",
+               "disp-respa": "#d95f02", "disp-mf": "#fd8d3c", "disp-c6": "#c51b8a"}
+COND_MARKERS = {"none": "o", "elec": "s", "disp": "^", "both": "D",
+                "disp-respa": "v", "disp-mf": ">", "disp-c6": "P"}
 # rRESPA-accelerated dispersion (deployed MBD every K steps): dashed, same orange as disp.
 COND_LINESTYLE = {"disp-respa": "--"}
 COND_LABELS = {
     "none": "no long-range",
     "elec": "electrostatics",
-    "disp": "dispersion (MBD)",
+    "disp": "dispersion (MBD, in-graph)",
     "both": "elec + dispersion",
-    "disp-respa": "dispersion + rRESPA",
+    "disp-mf": "dispersion (MBD, matrix-free)",
+    "disp-respa": "dispersion (MBD) + rRESPA, K=20",
+    "disp-c6": "dispersion (pairwise C6)",
 }
-COND_ORDER = ["none", "elec", "disp", "both", "disp-respa"]
+COND_ORDER = ["none", "elec", "disp", "disp-respa", "disp-c6", "both"]
 
 MODE_TITLES = {
     "train": "Training (E+F+backward)",
@@ -145,8 +149,12 @@ def main() -> None:
                 axes[idx].set_xlabel("atoms")
                 break
 
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    handles, labels, _seen = [], [], set()
+    for _ax in axes:
+        for _h, _l in zip(*_ax.get_legend_handles_labels()):
+            if _l not in _seen:
+                _seen.add(_l); handles.append(_h); labels.append(_l)
+    fig.legend(handles, labels, loc="lower center", ncol=4, frameon=False, bbox_to_anchor=(0.5, -0.03))
 
     cfg = f"fp32, C={d['channels']}, $\\ell$={d['lmax']}, {d['num_interaction']} interactions, degree {d['degree']}"
     fig.suptitle(f"Long-range cost on RTX 4090 ({cfg})", y=1.0, fontsize=12)
