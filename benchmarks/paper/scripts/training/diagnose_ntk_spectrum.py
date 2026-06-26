@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small empirical NTK-spectrum diagnostic for matched MACE and MACE-ICTD models.
+"""Small empirical NTK-spectrum diagnostic for matched MACE and MACE-ICTC models.
 
 This is intentionally a *diagnostic*, not a full training benchmark. The full
 force-field empirical kernel over all validation configurations and force
@@ -30,15 +30,15 @@ from e3nn import o3
 from mace.modules import ScaleShiftMACE, gate_dict, interaction_classes
 from mace.modules.wrapper_ops import CuEquivarianceConfig
 
-from mace_ictd.cli.train import (
+from mace_ictc.cli.train import (
     _atomic_inter_scale_shift_from_h5,
     _set_global_seed,
     build_baseline_model,
 )
-from mace_ictd.data import H5Dataset, collate_fn_h5
-from mace_ictd.interfaces.mace_converter import convert_mace_to_ictd
-from mace_ictd.utils.config import ModelConfig
-from mace_ictd.utils.scatter import scatter
+from mace_ictc.data import H5Dataset, collate_fn_h5
+from mace_ictc.interfaces.mace_converter import convert_mace_to_ictd
+from mace_ictc.utils.config import ModelConfig
+from mace_ictc.utils.scatter import scatter
 
 
 def parse_csv_numbers(value: str, cast=float):

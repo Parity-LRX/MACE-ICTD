@@ -1,6 +1,6 @@
-# Operator benchmark: MACE-ICTD ICTD product vs cartnn Cartesian tensor product
+# Operator benchmark: MACE-ICTC ICTC product vs cartnn Cartesian tensor product
 
-**RTX 4090 (D), torch 2.7.1+cu128, e3nn 0.5.9, cartnn 0.5.8 @ 4d0dc38, MACE-ICTD local git 414aa25. TF32 disabled.**
+**RTX 4090 (D), torch 2.7.1+cu128, e3nn 0.5.9, cartnn 0.5.8 @ 4d0dc38, MACE-ICTC local git 414aa25. TF32 disabled.**
 
 ## What is being compared (and what is NOT)
 
@@ -10,13 +10,13 @@ The matched operator is the **equivariant tensor product** that couples a hidden
 |---|---|---|---|
 | `e3nn` (reference) | `e3nn.o3.TensorProduct` (wigner_3j) | spherical, `2l+1` | opt_einsum_fx codegen |
 | `cartnn` | `cartnn.o3.TensorProduct` (cartesian_3j) | **full Cartesian, `3**l`** | opt_einsum_fx codegen |
-| `ictd` | `EdgeWeightedPathPreservingTensorProduct` | irreducible-Cartesian (ICTD), `2l+1` | **eager** (Python per-path) |
-| `ictd_compiled` | same ICTD op under `torch.compile` | ICTD `2l+1` | torch.compile (deployed form) |
+| `ictd` | `EdgeWeightedPathPreservingTensorProduct` | irreducible-Cartesian (ICTC), `2l+1` | **eager** (Python per-path) |
+| `ictd_compiled` | same ICTC op under `torch.compile` | ICTC `2l+1` | torch.compile (deployed form) |
 
 **Caveats (do not over-read):**
 - This is an *operator-level comparable workload*, **not** an exact apples-to-apples comparison: cartnn stores a degree-`l` tensor in `3**l` components (vs `2l+1`), and the per-path normalizations differ. Numerical outputs are **not** expected to match across backends.
 - cartnn ships **no symmetric-contraction operator** (the authors declined to implement ICTC), so the MACE symmetric contraction is **out of scope** here; only the binary tensor product is compared.
-- `e3nn`/`cartnn` `TensorProduct` are **codegen-fused**; the bare `ictd` operator is timed in **eager** mode (Python per-path overhead, dominant at small sizes). The deployed MACE-ICTD model removes this via AOTI/`torch.compile` — see `ictd_compiled` below and the existing model-level throughput benchmarks. Read `ictd` eager numbers as a lower bound on the deployed ICTD speed.
+- `e3nn`/`cartnn` `TensorProduct` are **codegen-fused**; the bare `ictd` operator is timed in **eager** mode (Python per-path overhead, dominant at small sizes). The deployed MACE-ICTC model removes this via AOTI/`torch.compile` — see `ictd_compiled` below and the existing model-level throughput benchmarks. Read `ictd` eager numbers as a lower bound on the deployed ICTC speed.
 - No chemical-accuracy or model-level superiority is claimed or measured here.
 
 ## Headline (channels=64, edges=100000)
@@ -417,16 +417,16 @@ Trac |
 
 ## Observations (measured, scoped to the tested workloads)
 
-- **float32 forward_only**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.53×** (min 0.16×, max 1.78×); >1 ⇒ ICTD faster.
+- **float32 forward_only**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.53×** (min 0.16×, max 1.78×); >1 ⇒ ICTC faster.
   - `ictd_compiled` vs `cartnn`: median **0.59×** (min 0.31×, max 1.45×).
-- **float32 forward_backward**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.67×** (min 0.37×, max 3.34×); >1 ⇒ ICTD faster.
+- **float32 forward_backward**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.67×** (min 0.37×, max 3.34×); >1 ⇒ ICTC faster.
   - `ictd_compiled` vs `cartnn`: median **0.73×** (min 0.44×, max 3.35×).
-- **float64 forward_only**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.40×** (min 0.08×, max 2.30×); >1 ⇒ ICTD faster.
+- **float64 forward_only**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.40×** (min 0.08×, max 2.30×); >1 ⇒ ICTC faster.
   - `ictd_compiled` vs `cartnn`: median **0.34×** (min 0.08×, max 2.23×).
-- **float64 forward_backward**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.51×** (min 0.21×, max 3.15×); >1 ⇒ ICTD faster.
+- **float64 forward_backward**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` total-time ratio (cartnn/ictd) median **0.51×** (min 0.21×, max 3.15×); >1 ⇒ ICTC faster.
   - `ictd_compiled` vs `cartnn`: median **0.67×** (min 0.20×, max 2.19×).
 
-Interpretation guidance: cartnn's full `3**l` storage makes its per-edge work grow faster with `max_ell` than the `2l+1` ICTD/e3nn layouts, which is the main structural difference these numbers probe. Where eager ICTD trails, it is the eager per-path launch overhead, not the ICTD algebra — compare the `ictd_compiled` row. e3nn is included only as the spherical MACE-native reference. None of this speaks to accuracy or to full-model performance.
+Interpretation guidance: cartnn's full `3**l` storage makes its per-edge work grow faster with `max_ell` than the `2l+1` ICTC/e3nn layouts, which is the main structural difference these numbers probe. Where eager ICTC trails, it is the eager per-path launch overhead, not the ICTC algebra — compare the `ictd_compiled` row. e3nn is included only as the spherical MACE-native reference. None of this speaks to accuracy or to full-model performance.
 
 ## Key findings (added)
 
@@ -434,19 +434,19 @@ Interpretation guidance: cartnn's full `3**l` storage makes its per-edge work gr
    `cartnn/e3nn` total-time ratio is 1.00× (l1/1, l1/2) → 1.21× (l2/2) → 1.20× (l2/3) → **2.80× (l3/3)**.
    The full Cartesian layout (degree-l = `3**l` numbers vs `2l+1`) only costs once l=3 tensors (27 vs 7)
    enter the product.
-2. **ICTD vs cartnn crosses over at l=3.** Eager ICTD is slower than cartnn at low order
+2. **ICTC vs cartnn crosses over at l=3.** Eager ICTC is slower than cartnn at low order
    (`cartnn/ictd` 0.22–0.59×) but **faster at l3/3** (1.20× fp32 fwd-only). The `2l+1` packing keeps
-   ICTD competitive exactly where cartnn's storage blows up.
+   ICTC competitive exactly where cartnn's storage blows up.
 3. **e3nn (spherical 2l+1) is fastest of the three at every tested point.** Both Cartesian-basis
-   operators (ICTD intrinsic, cartnn full) trail the well-optimized spherical TP at the operator level.
-4. **`torch.compile` ≈ no-op for the standalone ICTD operator** (graph-breaks on dict I/O):
+   operators (ICTC intrinsic, cartnn full) trail the well-optimized spherical TP at the operator level.
+4. **`torch.compile` ≈ no-op for the standalone ICTC operator** (graph-breaks on dict I/O):
    `ictd_compiled ≈ ictd` except the tiny l1/1 case (0.58×) and fitting l3/3 fp64 (287 ms) where eager
    OOMs. Deployed competitiveness is from **model-level AOTI** (existing `benchmark_results/`), not this
    op in isolation.
 5. **Memory / OOM (24 GB):** OOM cells by backend e3nn 35 < cartnn 46 < ictd 50 (of 720); cartnn OOMs
-   more than e3nn from the `3**l` memory; ICTD's eager path-preserving layout is the most memory-hungry.
+   more than e3nn from the `3**l` memory; ICTC's eager path-preserving layout is the most memory-hungry.
 
-**Warmup validity:** the ICTD operator's first forward is 2–22× slower (it populates the
+**Warmup validity:** the ICTC operator's first forward is 2–22× slower (it populates the
 `(device,dtype)` CG/projector cache), but the plateau is reached by call #2–3 and is flat to ≤0.1%;
 the harness discards `warmup=20` calls, so all numbers above are warm. Details: `warmup_validation.md`,
 `warmup_curve.log`.
@@ -458,19 +458,19 @@ chemical-accuracy claim.
 
 ## Reconciliation with model-level results (read this before quoting "e3nn fastest")
 
-This bench isolates the **operator** and times ICTD **eager** (torch.compile graph-breaks on its dict
-I/O) vs e3nn's **codegen-fused** TP — so "ICTD slower than e3nn" is the **un-fused operator at large
+This bench isolates the **operator** and times ICTC **eager** (torch.compile graph-breaks on its dict
+I/O) vs e3nn's **codegen-fused** TP — so "ICTC slower than e3nn" is the **un-fused operator at large
 scale**, NOT the deployed model. The model-level `benchmark_results/` (inference, C64, l2/2) shows the
 same eager regime and the real deployment win:
 
-| atoms | mace-e3nn eager | ICTD eager | ICTD AOTI | ICTD-eager/e3nn | ICTD-AOTI/e3nn |
+| atoms | mace-e3nn eager | ICTC eager | ICTC AOTI | ICTC-eager/e3nn | ICTC-AOTI/e3nn |
 |---|---|---|---|---|---|
 | 512 | 34.2 | 14.6 | 3.76 | 2.35× | 9.10× |
 | 4096 | 65.0 | 68.0 | 27.7 | 0.96× | 2.35× |
 | 8192 | 114.0 | 141.1 | 55.3 | 0.81× | 2.06× |
 
-ICTD **eager** whole-model is itself slower than mace-e3nn at ≥4096 atoms (matches this op bench at large
-edges). The "MACE-ICTD ≫ mace-e3nn" the model sees is **ICTD AOTI** = whole-graph fusion killing launch
-overhead, not the isolated operator. (mace's `MACE cuEq` is a flat ~20 ms floor; ICTD-AOTI beats it
+ICTC **eager** whole-model is itself slower than mace-e3nn at ≥4096 atoms (matches this op bench at large
+edges). The "MACE-ICTC ≫ mace-e3nn" the model sees is **ICTC AOTI** = whole-graph fusion killing launch
+overhead, not the isolated operator. (mace's `MACE cuEq` is a flat ~20 ms floor; ICTC-AOTI beats it
 ≤2048 atoms, loses ≥4096.) End-to-end speed here is governed by **fusion (AOTI)**, not per-op FLOPs;
-this bench does not AOTI the ICTD op, so it under-represents the deployed ICTD.
+this bench does not AOTI the ICTC op, so it under-represents the deployed ICTC.

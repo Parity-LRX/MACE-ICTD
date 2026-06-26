@@ -45,7 +45,7 @@ META = {
         ICTD_URL,
         ICTD_COMMIT,
         "ictd_tp_torchcompile_flat_fwbw",
-        "ICTD flat-wrapper torch.compile tensor product, forward+backward",
+        "ICTC flat-wrapper torch.compile tensor product, forward+backward",
     ),
     "e3nn": (
         E3NN_URL,

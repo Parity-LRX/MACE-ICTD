@@ -15,12 +15,12 @@ import pandas as pd
 BACKEND_LABELS = {
     "e3nn": "e3nn",
     "cartnn": "cartnn (Cartesian-3j)",
-    "ictd": "ICTD eager",
-    "ictd_eager": "ICTD eager",
-    "ictd_compile": "ICTD compile",
-    "ictd_compile_fwbw": "ICTD compile",
-    "ictd_compiled": "ICTD compile",
-    "ictd_aoti": "ICTD AOTI",
+    "ictd": "ICTC eager",
+    "ictd_eager": "ICTC eager",
+    "ictd_compile": "ICTC compile",
+    "ictd_compile_fwbw": "ICTC compile",
+    "ictd_compiled": "ICTC compile",
+    "ictd_aoti": "ICTC AOTI",
 }
 
 BACKEND_COLORS = {
@@ -48,25 +48,25 @@ BACKEND_MARKERS = {
 WHOLE_MODEL_LABELS = {
     "MACE e3nn": "MACE e3nn",
     "MACE cuEq": "MACE cuEq",
-    "ICTD eager": "ICTD eager",
-    "ICTD compiled": "ICTD compiled",
-    "ICTD+cuEq compiled": "ICTD+cuEq compiled",
+    "ICTC eager": "ICTC eager",
+    "ICTC compiled": "ICTC compiled",
+    "ICTC+cuEq compiled": "ICTC+cuEq compiled",
 }
 
 WHOLE_MODEL_COLORS = {
     "MACE e3nn": "#4a4a4a",
     "MACE cuEq": "#d95f02",
-    "ICTD eager": "#9ecae1",
-    "ICTD compiled": "#08519c",
-    "ICTD+cuEq compiled": "#41ab5d",
+    "ICTC eager": "#9ecae1",
+    "ICTC compiled": "#08519c",
+    "ICTC+cuEq compiled": "#41ab5d",
 }
 
 WHOLE_MODEL_MARKERS = {
     "MACE e3nn": "s",
     "MACE cuEq": "o",
-    "ICTD eager": "^",
-    "ICTD compiled": "D",
-    "ICTD+cuEq compiled": "P",
+    "ICTC eager": "^",
+    "ICTC compiled": "D",
+    "ICTC+cuEq compiled": "P",
 }
 
 
@@ -157,7 +157,7 @@ def plot_matched_fusion(aoti: pd.DataFrame, fwbw: pd.DataFrame, outdir: Path) ->
         ("Forward + backward", train_pivot, "forward+backward total time (ms, log)"),
     ]
     backend_order = ["e3nn", "cartnn", "ictd"]
-    labels = {"e3nn": "e3nn", "cartnn": "cartnn (Cartesian-3j)", "ictd": "ICTD"}
+    labels = {"e3nn": "e3nn", "cartnn": "cartnn (Cartesian-3j)", "ictd": "ICTC"}
     colors = {"e3nn": BACKEND_COLORS["e3nn"], "cartnn": BACKEND_COLORS["cartnn"], "ictd": BACKEND_COLORS["ictd_compile"]}
     markers = {"e3nn": BACKEND_MARKERS["e3nn"], "cartnn": BACKEND_MARKERS["cartnn"], "ictd": BACKEND_MARKERS["ictd_compile"]}
 
@@ -438,7 +438,7 @@ def read_whole_model_csv(path: Path) -> pd.DataFrame:
 def plot_whole_model_fixed_configs(df: pd.DataFrame, outdir: Path) -> None:
     configs = ["1/1", "1/2", "2/2", "2/3"]
     tasks = ["train", "inference"]
-    modes = ["MACE e3nn", "MACE cuEq", "ICTD eager", "ICTD compiled", "ICTD+cuEq compiled"]
+    modes = ["MACE e3nn", "MACE cuEq", "ICTC eager", "ICTC compiled", "ICTC+cuEq compiled"]
     tick_values = sorted(df["equiv_atoms50"].dropna().unique())
     tick_labels = [format_equiv_atom_tick(v) for v in tick_values]
 

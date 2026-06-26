@@ -38,7 +38,7 @@ def main():
     C, E, N = args.channels, args.edges, args.n
     print(f"# config l{hidden_lmax}/{max_ell} C{C} E{E} {args.dtype}  (per-call forward ms)")
 
-    # ICTD (fresh instance -> cold cache)
+    # ICTC (fresh instance -> cold cache)
     tp, _ = build_ictd(hidden_lmax, max_ell, target, C, dtype, device)
     inp, _ = ictd_make_inputs(tp, hidden_lmax, max_ell, C, E, dtype, device, False)
     cuda_sync(device)

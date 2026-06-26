@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Companion pass: time the MACE-ICTD conv tensor product under torch.compile
+"""Companion pass: time the MACE-ICTC conv tensor product under torch.compile
 (the deployed form; the model ships an AOTI/compiled product path), so the operator
 comparison against the codegen-fused e3nn/cartnn TensorProducts is fair.
 
@@ -21,7 +21,7 @@ from operator_bench import (
     cuda_sync, free,
 )
 
-SEMEQ = ("operator-level comparable workload: MACE-ICTD conv tensor product (ICTD 2l+1 "
+SEMEQ = ("operator-level comparable workload: MACE-ICTC conv tensor product (ICTC 2l+1 "
          "basis) under torch.compile (deployed form; eager has Python per-path overhead). "
          "Same (l1,l2,l3) path set as cartnn/e3nn; NOT exact apples-to-apples")
 

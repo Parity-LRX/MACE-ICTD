@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Publication fp32 operator figure (forward-only, matched fusion, channels=64).
 Outputs vector PDF + 300-dpi PNG + SVG to figures/.
-Left: per-config forward time (ms, log) for ICTD eager / ICTD torch.compile / e3nn / cartnn.
-Right: speedup vs e3nn (e3nn_ms / backend_ms; >1 = faster than e3nn) for fused ICTD and cartnn.
+Left: per-config forward time (ms, log) for ICTC eager / ICTC torch.compile / e3nn / cartnn.
+Right: speedup vs e3nn (e3nn_ms / backend_ms; >1 = faster than e3nn) for fused ICTC and cartnn.
 """
 import argparse, csv, os
 from collections import defaultdict
@@ -47,8 +47,8 @@ def main():
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
 
     # ---- left: grouped bars (log ms) ----
-    series = [("ictd_eager", "ICTD (eager)", C_EAGER),
-              ("ictd_compile", "ICTD (torch.compile)", C_COMP),
+    series = [("ictd_eager", "ICTC (eager)", C_EAGER),
+              ("ictd_compile", "ICTC (torch.compile)", C_COMP),
               ("e3nn", "e3nn (spherical, ref)", C_E3NN),
               ("cartnn", "cartnn (Cartesian 3$^\\ell$)", C_CART)]
     n = len(series); w = 0.20
@@ -66,7 +66,7 @@ def main():
     axL.legend(frameon=False, loc="upper left", ncol=1)
 
     # ---- right: speedup vs e3nn ----
-    for be, lab, col, mk in (("ictd_compile", "ICTD (torch.compile)", C_COMP, "o"),
+    for be, lab, col, mk in (("ictd_compile", "ICTC (torch.compile)", C_COMP, "o"),
                              ("cartnn", "cartnn", C_CART, "s")):
         ys = []
         for c in configs:

@@ -20,8 +20,8 @@ REPO = Path(__file__).resolve().parents[4]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from mace_ictd.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
-from mace_ictd.models.pure_cartesian_ictd_fix import _tp_allowed_paths_from_target_lmax
+from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+from mace_ictc.models.pure_cartesian_ictd_fix import _tp_allowed_paths_from_target_lmax
 
 
 def parity(l: int) -> int:
@@ -98,7 +98,7 @@ def timing_cell(df: pd.DataFrame, hidden_lmax: int, max_ell: int, backend: str, 
     if sub.empty:
         return {}
     # Prefer the flat compile-fwbw rerun for forward+backward because it puts
-    # e3nn, cartnn, and compiled ICTD in one script and one launch environment.
+    # e3nn, cartnn, and compiled ICTC in one script and one launch environment.
     if mode == "forward_backward" and "operator_compile_fwbw_flat.csv" in set(sub["source_file"]):
         sub = sub[sub["source_file"].eq("operator_compile_fwbw_flat.csv")]
     row = sub.iloc[-1]
@@ -190,7 +190,7 @@ def main() -> None:
                 "ictd_weight_numel": ictd_tp.num_paths * args.channels,
                 "e3nn_fusion_level": "e3nn TensorProduct opt_einsum/codegen",
                 "cartnn_fusion_level": "cartnn TensorProduct opt_einsum/codegen with cartesian_3j",
-                "ictd_fusion_level": "ICTD eager or torch.compile/AOTI depending on row timing",
+                "ictd_fusion_level": "ICTC eager or torch.compile/AOTI depending on row timing",
             }
         )
 
@@ -216,7 +216,7 @@ def main() -> None:
         for backend, label in [
             ("e3nn", "MACE e3nn TensorProduct"),
             ("cartnn", "cartnn Cartesian-3j TensorProduct"),
-            ("ictd_compile_fwbw", "ICTD torch.compile fused product"),
+            ("ictd_compile_fwbw", "ICTC torch.compile fused product"),
         ]:
             cell = timing_cell(timing, hidden_lmax, max_ell, backend, "forward_backward")
             if not cell:

@@ -1,25 +1,25 @@
-# MACE-ICTD User Manual
+# MACE-ICTC User Manual
 
-This manual describes the standalone MACE-ICTD repository: what each subsystem is for, which runtime mode to choose, and how to train, convert, export, benchmark, and deploy models.
+This manual describes the standalone MACE-ICTC repository: what each subsystem is for, which runtime mode to choose, and how to train, convert, export, benchmark, and deploy models.
 
 Chinese version: [USER_MANUAL.zh-CN.md](USER_MANUAL.zh-CN.md)
 
 ## 1. What This Repository Contains
 
-MACE-ICTD is a standalone implementation of MACE in the Irreducible Cartesian Tensor Decomposition (ICTD) basis. It keeps the MACE model class and deployment stack independent of the original FSCETP tree.
+MACE-ICTC is a standalone implementation of MACE in the Irreducible Cartesian Tensor Decomposition (ICTC) basis. It keeps the MACE model class and deployment stack independent of the original FSCETP tree.
 
-The central technical point is the ICTD basis construction: fixed `Q`/`U` operators re-express MACE/e3nn angular algebra in irreducible Cartesian tensor blocks while preserving the original MACE interaction/readout semantics. The repository focuses on basis conversion, native `mace-torch` parity, and deployment.
+The central technical point is the ICTC basis construction: fixed `Q`/`U` operators re-express MACE/e3nn angular algebra in irreducible Cartesian tensor blocks while preserving the original MACE interaction/readout semantics. The repository focuses on basis conversion, native `mace-torch` parity, and deployment.
 
 The repository includes:
 
-- `mace_ictd/models/`: the `PureCartesianICTDFix` model, ICTD irreps, tensor product helpers, MACE-compatible symmetric contractions, radial basis functions, optional ZBL and long-range modules.
-- `mace_ictd/training/`: the energy/force/stress trainer and the `make_fx` + Inductor force-step compiler.
-- `mace_ictd/data/`: extended-XYZ parsing, H5 dataset loading, graph padding, bucket sampling, and collate functions.
-- `mace_ictd/cli/`: command-line tools for training, MACE conversion, AOTInductor export, TorchScript export, and LAMMPS helper generation.
-- `mace_ictd/interfaces/`: checkpoint loading, LAMMPS MLIAP wrappers, and deployment-facing compatibility code.
-- `mace_ictd/evaluation/`: ASE calculator wrappers.
-- `mace_ictd/bench/`: benchmark harnesses comparing MACE-ICTD modes against native `mace-torch`.
-- `mace_ictd/test/`: numerical and smoke tests.
+- `mace_ictc/models/`: the `PureCartesianICTDFix` model, ICTC irreps, tensor product helpers, MACE-compatible symmetric contractions, radial basis functions, optional ZBL and long-range modules.
+- `mace_ictc/training/`: the energy/force/stress trainer and the `make_fx` + Inductor force-step compiler.
+- `mace_ictc/data/`: extended-XYZ parsing, H5 dataset loading, graph padding, bucket sampling, and collate functions.
+- `mace_ictc/cli/`: command-line tools for training, MACE conversion, AOTInductor export, TorchScript export, and LAMMPS helper generation.
+- `mace_ictc/interfaces/`: checkpoint loading, LAMMPS MLIAP wrappers, and deployment-facing compatibility code.
+- `mace_ictc/evaluation/`: ASE calculator wrappers.
+- `mace_ictc/bench/`: benchmark harnesses comparing MACE-ICTC modes against native `mace-torch`.
+- `mace_ictc/test/`: numerical and smoke tests.
 - `lammps_user_mfftorch/`: a LAMMPS `USER-MFFTORCH` package with C++ pair styles and LibTorch/AOTI integration.
 
 The core model forward signature is:
@@ -45,7 +45,7 @@ Atomic reference energies E0 are handled outside the core model in training/expo
 Minimal editable install:
 
 ```bash
-cd /path/to/MACE-ICTD
+cd /path/to/MACE-ICTC
 pip install -e .
 ```
 
@@ -65,7 +65,7 @@ Important runtime expectations:
 - `e3nn < 0.6` for compatibility with current `mace-torch`.
 - CUDA is required for the cuEquivariance and serious AOTI/Inductor benchmark paths.
 
-Optional compiled ICTD tensor-product extension:
+Optional compiled ICTC tensor-product extension:
 
 ```bash
 MFF_BUILD_ICTD_TP_EXT=1 pip install -e .
@@ -85,24 +85,24 @@ Installed console scripts:
 
 | Command | Python entry point | Purpose |
 |---|---|---|
-| `mff-convert-mace` | `mace_ictd.cli.convert_mace` | Convert a native `mace-torch` `ScaleShiftMACE` checkpoint to MACE-ICTD. |
-| `mff-export-aoti` | `mace_ictd.cli.export_aoti_core` | Export an AOTInductor `.pt2` core for Python/C++/LAMMPS deployment. |
-| `mff-export-core` | `mace_ictd.cli.export_libtorch_core` | Export a TorchScript core. Mostly for legacy LibTorch deployment. |
-| `mff-lammps` | `mace_ictd.cli.lammps_interface` | Generate helper files for LAMMPS-style deployment. |
+| `mff-convert-mace` | `mace_ictc.cli.convert_mace` | Convert a native `mace-torch` `ScaleShiftMACE` checkpoint to MACE-ICTC. |
+| `mff-export-aoti` | `mace_ictc.cli.export_aoti_core` | Export an AOTInductor `.pt2` core for Python/C++/LAMMPS deployment. |
+| `mff-export-core` | `mace_ictc.cli.export_libtorch_core` | Export a TorchScript core. Mostly for legacy LibTorch deployment. |
+| `mff-lammps` | `mace_ictc.cli.lammps_interface` | Generate helper files for LAMMPS-style deployment. |
 
 Direct module commands are also supported:
 
 ```bash
-python -m mace_ictd.cli.train --help
-python -m mace_ictd.cli.convert_mace --help
-python -m mace_ictd.cli.export_aoti_core --help
+python -m mace_ictc.cli.train --help
+python -m mace_ictc.cli.convert_mace --help
+python -m mace_ictc.cli.export_aoti_core --help
 ```
 
 ## 4. Core Concepts
 
-### 4.1 ICTD Basis Versus e3nn/MACE Basis
+### 4.1 ICTC Basis Versus e3nn/MACE Basis
 
-Original MACE uses e3nn spherical features. MACE-ICTD stores equivariant features in an ICTD Cartesian basis. The two bases are related by fixed orthogonal per-`l` matrices `Q`.
+Original MACE uses e3nn spherical features. MACE-ICTC stores equivariant features in an ICTC Cartesian basis. The two bases are related by fixed orthogonal per-`l` matrices `Q`.
 
 For invariant outputs such as total energy, forces, and virial, the basis choice should not change the physical result. For equivariant intermediate features, use:
 
@@ -111,7 +111,7 @@ model.to_mace_basis(x)
 model.to_ictd_basis(x)
 ```
 
-or the lower-level helpers in `mace_ictd.mace_basis`.
+or the lower-level helpers in `mace_ictc.mace_basis`.
 
 ### 4.2 `angular_basis`
 
@@ -119,7 +119,7 @@ or the lower-level helpers in `mace_ictd.mace_basis`.
 
 | Value | Meaning | When to use |
 |---|---|---|
-| `ictd` | Default ICTD internal basis. | Canonical parity mode, bridge-U mode, safest baseline. |
+| `ictd` | Default ICTC internal basis. | Canonical parity mode, bridge-U mode, safest baseline. |
 | `e3nn` | Fold fixed angular operators once so the internal equivariant features are in the original MACE/e3nn convention. | cuEq product performance path; AOTI export with `--cueq-product`. |
 
 Important constraints:
@@ -132,10 +132,10 @@ Important constraints:
 
 | Backend | Description | Recommended use |
 |---|---|---|
-| `ictd-bridge-u` | Uses MACE/e3nn symmetric-contraction U tensors with the ICTD/e3nn basis bridge folded into the U tensors. | Canonical MACE parity and high-`max_ell` conversion. |
+| `ictd-bridge-u` | Uses MACE/e3nn symmetric-contraction U tensors with the ICTC/e3nn basis bridge folded into the U tensors. | Canonical MACE parity and high-`max_ell` conversion. |
 | `cueq` | Uses cuEquivariance for the product/symmetric contraction. | Performance training and inference, especially with `--angular-basis e3nn`. |
 | `native-mace` | Calls MACE's native symmetric contraction in the product block. | Debug/reference path. |
-| `ictd-pure-u` | Uses ICTD-generated U tensors directly. | Diagnostic path; not the primary high-`max_ell` production path. |
+| `ictd-pure-u` | Uses ICTC-generated U tensors directly. | Diagnostic path; not the primary high-`max_ell` production path. |
 
 ### 4.4 `use_reduced_cg`
 
@@ -145,7 +145,7 @@ Rules:
 
 - When converting an existing native MACE checkpoint, follow the original `mace_model.use_reduced_cg`. Do not choose it manually.
 - Native `mace-torch` training also has this option, named `--use_reduced_cg`.
-- For from-scratch MACE-ICTD training, only enable it if you intentionally want the reduced-CG architecture.
+- For from-scratch MACE-ICTC training, only enable it if you intentionally want the reduced-CG architecture.
 - It is not a guaranteed stable-step throughput accelerator. In recent 4090 tests for `cueq + angular_basis=e3nn + make_fx`, stable step-time changed only by roughly -1% to +2%, while compile time improved more.
 
 ## 5. Which Mode Should I Use?
@@ -155,13 +155,13 @@ Rules:
 | Exact MACE conversion/parity baseline | `ictd-bridge-u`, `angular_basis=ictd`, usually `dtype=float64`. |
 | From-scratch training that should match MACE architecture semantics | `ictd-bridge-u`, `function-type=bessel`, MACE-style ScaleShift enabled. |
 | Fast training | `cueq`, `angular_basis=e3nn`, `--train-makefx-compile`, bucketed shapes. |
-| Fast AOTI inference from an ICTD checkpoint | `mff-export-aoti --cueq-product --angular-basis e3nn` when cuEq custom ops are deployable. |
+| Fast AOTI inference from an ICTC checkpoint | `mff-export-aoti --cueq-product --angular-basis e3nn` when cuEq custom ops are deployable. |
 | Most conservative deployment | Export the checkpoint without cuEq replacement, keep `angular_basis=checkpoint` or `ictd`. |
 
 Complete canonical parity training command:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --train-prefix train \
   --val-prefix val \
@@ -210,7 +210,7 @@ python -m mace_ictd.cli.train \
 Complete high-performance training command:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --train-prefix train \
   --val-prefix val \
@@ -268,13 +268,13 @@ ScaleShift/E0 settings.
 
 ### 5.1 Multi-GPU Training
 
-MACE-ICTD training supports PyTorch `DistributedDataParallel` through the training
+MACE-ICTC training supports PyTorch `DistributedDataParallel` through the training
 CLI. The default `--ddp auto` enables DDP when the process environment has
 `WORLD_SIZE>1`, so a normal `torchrun` launch is enough:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
-  -m mace_ictd.cli.train \
+  -m mace_ictc.cli.train \
   --data-dir DATA \
   --train-prefix train \
   --val-prefix val \
@@ -304,7 +304,7 @@ create one process per GPU. A minimal pattern is:
 source /path/to/conda.sh
 conda activate mff
 
-srun python -m mace_ictd.cli.train \
+srun python -m mace_ictc.cli.train \
   --data-dir DATA \
   --train-prefix train \
   --val-prefix val \
@@ -348,7 +348,7 @@ DATA/
   processed_train.counts.npz / bucket sidecars, when generated
 ```
 
-The parser in `mace_ictd.data.preprocessing` supports extended XYZ-style data with:
+The parser in `mace_ictc.data.preprocessing` supports extended XYZ-style data with:
 
 - atomic species / atomic numbers,
 - Cartesian positions,
@@ -360,7 +360,7 @@ The parser in `mace_ictd.data.preprocessing` supports extended XYZ-style data wi
 Programmatic preprocessing entry point:
 
 ```python
-from mace_ictd.data.preprocessing import save_to_h5_parallel
+from mace_ictc.data.preprocessing import save_to_h5_parallel
 
 save_to_h5_parallel(
     prefix="train",
@@ -370,7 +370,7 @@ save_to_h5_parallel(
 )
 ```
 
-The dataset loader is `mace_ictd.data.datasets.H5Dataset`; batching uses `mace_ictd.data.collate.collate_fn_h5`.
+The dataset loader is `mace_ictc.data.datasets.H5Dataset`; batching uses `mace_ictc.data.collate.collate_fn_h5`.
 
 For `make_fx` training, prefer size bucketing:
 
@@ -385,7 +385,7 @@ This groups similar atom/edge counts so Inductor compiles once per bucket instea
 Training CLI:
 
 ```bash
-python -m mace_ictd.cli.train --help
+python -m mace_ictc.cli.train --help
 ```
 
 Key architecture arguments:
@@ -473,7 +473,7 @@ E0 behavior:
 Long-range correction:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 64 --lmax 2 --num-interaction 2 \
   --long-range-mode reciprocal-spectral-v1 \
@@ -508,7 +508,7 @@ Key options:
 The checkpoint stores the long-range hyperparameters in `model_hyperparameters`, so
 `LAMMPS_MLIAP_MFF.from_checkpoint` and `mff-export-aoti --checkpoint model_lr.pth ...` rebuild the
 same architecture. Native MACE conversion does not add a long-range module to an already trained
-MACE checkpoint; train or fine-tune in MACE-ICTD with `--long-range-mode reciprocal-spectral-v1` when
+MACE checkpoint; train or fine-tune in MACE-ICTC with `--long-range-mode reciprocal-spectral-v1` when
 this correction is needed.
 
 ## 8. Native MACE Conversion
@@ -519,7 +519,7 @@ Use this path after training a model with native `mace-torch`. The input must be
 ```bash
 mff-convert-mace \
   --mace-model mace.model \
-  --out mace_ictd.pth \
+  --out mace_ictc.pth \
   --product-backend ictd-bridge-u \
   --dtype float64 \
   --device cpu
@@ -534,9 +534,9 @@ Recommended parity path:
 
 ```bash
 mff-export-aoti \
-  --checkpoint mace_ictd.pth \
+  --checkpoint mace_ictc.pth \
   --elements H,C,N,O \
-  --out mace_ictd.pt2 \
+  --out mace_ictc.pt2 \
   --dynamic \
   --embed-e0
 ```
@@ -545,9 +545,9 @@ For faster cuEq product inference from the same converted checkpoint:
 
 ```bash
 mff-export-aoti \
-  --checkpoint mace_ictd.pth \
+  --checkpoint mace_ictc.pth \
   --elements H,C,N,O \
-  --out mace_ictd_cueq_e3nn.pt2 \
+  --out mace_ictc_cueq_e3nn.pt2 \
   --dynamic \
   --cueq-product \
   --angular-basis e3nn
@@ -585,14 +585,14 @@ Conversion constraints are intentionally strict. Unsupported variants are reject
 
 Backend differences:
 
-- `ictd-bridge-u`: recommended conversion backend; folds the MACE/e3nn U convention through the ICTD
+- `ictd-bridge-u`: recommended conversion backend; folds the MACE/e3nn U convention through the ICTC
   basis bridge and is the main parity path.
 - `native-mace`: debug/reference backend; useful for diagnosing MACE-side contraction behavior.
 - `cueq`: performance-oriented product backend; use especially at export time with
   `--cueq-product --angular-basis e3nn`.
-- `ictd-pure-u`: diagnostic ICTD-generated-U path; it is not the native MACE exact-conversion path.
+- `ictd-pure-u`: diagnostic ICTC-generated-U path; it is not the native MACE exact-conversion path.
 
-The converter reads `mace_model.use_reduced_cg` and rebuilds MACE-ICTD with the same reduced-CG setting.
+The converter reads `mace_model.use_reduced_cg` and rebuilds MACE-ICTC with the same reduced-CG setting.
 Users should not guess or override that flag for imported native MACE models.
 Conversion preserves the source MACE architecture; it does not add a learned long-range module.
 
@@ -600,8 +600,8 @@ Conversion preserves the source MACE architecture; it does not add a learned lon
 
 Public pretrained MACE checkpoints are often saved as pickled Python model objects. The converter can
 only start after Python can load the source object. For older OFF23 checkpoints, this may require a
-historical `mace-torch`/`e3nn` environment for the loading and conversion step; the converted ICTD
-checkpoint can then be loaded by the current MACE-ICTD runtime.
+historical `mace-torch`/`e3nn` environment for the loading and conversion step; the converted ICTC
+checkpoint can then be loaded by the current MACE-ICTC runtime.
 
 **Setting up that historical loading environment.** Current `e3nn` (0.5.x / 0.6.x) cannot deserialize
 OFF23 checkpoints: `torch.load` raises `ValueError: too many values to unpack (expected 2)` from
@@ -616,9 +616,9 @@ deserialization):
 pip install --target=$HOME/compat_e3nn044/e3nn_0_4_4        "e3nn==0.4.4"
 pip install --target=$HOME/compat_e3nn044/mace_torch_0_3_16 "mace-torch==0.3.16"
 
-# load + convert with them prepended (mace_ictd also importable via PYTHONPATH or install):
+# load + convert with them prepended (mace_ictc also importable via PYTHONPATH or install):
 PYTHONPATH=$HOME/compat_e3nn044/mace_torch_0_3_16:$HOME/compat_e3nn044/e3nn_0_4_4 \
-  python -m mace_ictd.cli.convert_mace \
+  python -m mace_ictc.cli.convert_mace \
     --mace-model /path/to/MACE-OFF23_small.model \
     --out MACE-OFF23_small_ictd_bridge_u_f64.pth \
     --product-backend ictd-bridge-u --dtype float64
@@ -626,7 +626,7 @@ PYTHONPATH=$HOME/compat_e3nn044/mace_torch_0_3_16:$HOME/compat_e3nn044/e3nn_0_4_
 
 The converted `.pth` is a plain state_dict and loads in the normal (current-`e3nn`) environment for
 training and export — only the *loading of the pickled source model* needs the legacy deps. Note: the
-fresh-build converter parity test (`mace_ictd/test/test_mace_converter.py`) builds its MACE in-process
+fresh-build converter parity test (`mace_ictc/test/test_mace_converter.py`) builds its MACE in-process
 and is unaffected; this legacy environment is needed only to load *saved* foundation checkpoints.
 
 Example conversion of an OFF23 small model:
@@ -747,14 +747,14 @@ Important export options:
 
 ## 10. ASE and Python Inference
 
-The ASE wrapper is `mace_ictd.evaluation.calculator.MyE3NNCalculator`.
+The ASE wrapper is `mace_ictc.evaluation.calculator.MyE3NNCalculator`.
 
 Typical use:
 
 ```python
 import torch
-from mace_ictd.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
-from mace_ictd.evaluation.calculator import MyE3NNCalculator
+from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
+from mace_ictc.evaluation.calculator import MyE3NNCalculator
 
 wrapper = LAMMPS_MLIAP_MFF.from_checkpoint(
     "model.pth",
@@ -876,7 +876,7 @@ Device mapping details:
 
 ## 12. Long-Range and Dispersion (Train → Export → Deploy)
 
-MACE-ICTD learns two families of long-range correction, both in-network (no external Ewald or
+MACE-ICTC learns two families of long-range correction, both in-network (no external Ewald or
 libMBD) and both LAMMPS-deployable through the `mff/torch` pair style. This section is the
 end-to-end reference: what is available, how to train it, how to export it, and how to run it in
 LAMMPS.
@@ -905,7 +905,7 @@ MBD-SLQ has two further axes:
   deploy** — the C++ solver runs the matching operator.
 - **Polarizability rank** `--mbd-anisotropic`. Off = isotropic scalar α (emits an `[N,2]` source
   `(ω, α)`); on = **anisotropic l=2 tensor** α (emits `[N,8]` `(ω, α_iso, 6×B)`, coupling W=ω·B). The
-  tensor is built from the l=2 node block, so it needs `--lmax ≥ 2`. It is ICTD-distinctive and nearly
+  tensor is built from the l=2 node block, so it needs `--lmax ≥ 2`. It is ICTC-distinctive and nearly
   free (Section 12.5).
 
 Electrostatics and dispersion are independent and combine in one model (e.g. multipole l=2 + MBD).
@@ -915,7 +915,7 @@ Electrostatics and dispersion are independent and combine in one model (e.g. mul
 MBD-SLQ, isotropic, default `edge_sparse` backend:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 128 --lmax 2 --num-interaction 2 \
   --long-range-dispersion-mode mbd-slq \
@@ -927,7 +927,7 @@ python -m mace_ictd.cli.train \
 Anisotropic (l=2 tensor) MBD — add `--mbd-anisotropic` (needs `--lmax >= 2`):
 
 ```bash
-python -m mace_ictd.cli.train ... \
+python -m mace_ictc.cli.train ... \
   --long-range-dispersion-mode mbd-slq --dispersion-cutoff 8.0 \
   --mbd-operator-backend edge_sparse --mbd-anisotropic \
   --checkpoint model_mbd_aniso.pth
@@ -936,14 +936,14 @@ python -m mace_ictd.cli.train ... \
 Pairwise-C6 dispersion (cheapest, in-graph):
 
 ```bash
-python -m mace_ictd.cli.train ... --long-range-dispersion-mode pairwise-c6 --dispersion-cutoff 8.0 --checkpoint model_c6.pth
+python -m mace_ictc.cli.train ... --long-range-dispersion-mode pairwise-c6 --dispersion-cutoff 8.0 --checkpoint model_c6.pth
 ```
 
 Multipole electrostatics (mesh-FFT, dipole+quadrupole) — the mesh-FFT multipole path requires
 full-Ewald screening:
 
 ```bash
-python -m mace_ictd.cli.train ... \
+python -m mace_ictc.cli.train ... \
   --long-range-mode reciprocal-spectral-v1 \
   --long-range-reciprocal-backend mesh_fft --long-range-mesh-size 32 \
   --long-range-max-multipole-l 2 --long-range-mesh-fft-full-ewald \
@@ -971,7 +971,7 @@ Two cores; both are parity-correct — choose by target:
 
 | | AOTI `.pt2` (production) | TorchScript `.pt` (portable) |
 |---|---|---|
-| Tool | `mace_ictd.cli.export_aoti_core` | `mace_ictd.cli.export_libtorch_core` |
+| Tool | `mace_ictc.cli.export_aoti_core` | `mace_ictc.cli.export_libtorch_core` |
 | Speed | Inductor-fused fwd+bwd, ~3.7–5.4× faster | C++ autograd, no fusion |
 | N | static-N or N-dynamic | N-flexible (one core, any N) |
 | Long-range | full (defers reciprocal/MBD to C++; C6 in-graph) | minimal |
@@ -979,7 +979,7 @@ Two cores; both are parity-correct — choose by target:
 Export from a trained checkpoint (inherits the long-range config, see Section 9):
 
 ```bash
-python -m mace_ictd.cli.export_aoti_core --checkpoint model_mbd_aniso.pth --out model.pt2
+python -m mace_ictc.cli.export_aoti_core --checkpoint model_mbd_aniso.pth --out model.pt2
 ```
 
 The synthetic/combined export builds a long-range config at export time (for testing) and accepts:
@@ -994,7 +994,7 @@ The synthetic/combined export builds a long-range config at export time (for tes
 | `--long-range-mode`, `--long-range-multipole-l` | electrostatics block |
 
 ```bash
-python -m mace_ictd.cli.export_aoti_core --route baseline --channels 128 --lmax 2 \
+python -m mace_ictc.cli.export_aoti_core --route baseline --channels 128 --lmax 2 \
   --num-interaction 2 --dtype float32 --device cuda \
   --dispersion-mode mbd-slq --dispersion-cutoff 8.0 --mbd-operator-backend edge_sparse \
   --mbd-anisotropic --out model_aniso.pt2
@@ -1078,7 +1078,7 @@ Decision rules:
 - **MBD backend**: `edge_sparse` for small/medium systems (faster through ~8k atoms); `pme_fft` for
   large periodic boxes.
 - **Anisotropic**: enable when the l=2 representation should drive directional polarizability (the
-  ICTD-distinctive path); the cost is small.
+  ICTC-distinctive path); the cost is small.
 - **Core**: AOTI `.pt2` for throughput; TorchScript `.pt` for N-flexible / portable deployment.
 
 ### 12.6 Training stability and warm-start (MBD)
@@ -1095,8 +1095,8 @@ then add MBD on top with a non-strict load: the backbone is warm-started and onl
 fresh. This converges fastest and rarely sees instability.
 
 ```bash
-# backbone.pth = a trained MACE-ICTD checkpoint with NO long-range (or a converted MACE checkpoint)
-python -m mace_ictd.cli.train --data-dir DATA \
+# backbone.pth = a trained MACE-ICTC checkpoint with NO long-range (or a converted MACE checkpoint)
+python -m mace_ictc.cli.train --data-dir DATA \
   --channels 128 --lmax 2 --num-interaction 2 \
   --long-range-dispersion-mode mbd-slq --mbd-anisotropic --dispersion-cutoff 8.0 \
   --resume-checkpoint backbone.pth --finetune \
@@ -1131,7 +1131,7 @@ a training-only, multi-graph issue: **AOTI deployment is single-graph and unaffe
 Main benchmark harness:
 
 ```bash
-python -m mace_ictd.bench.bench_mace_ictd_vs_mace \
+python -m mace_ictc.bench.bench_mace_ictc_vs_mace \
   --device cuda \
   --dtype float32 \
   --channels 64 \
@@ -1139,7 +1139,7 @@ python -m mace_ictd.bench.bench_mace_ictd_vs_mace \
   --configs 1:1,2:2,2:3 \
   --train-iters 5 \
   --infer-iters 20 \
-  --out-dir /tmp/mace_ictd_bench
+  --out-dir /tmp/mace_ictc_bench
 ```
 
 The benchmark reports rows for training and inference modes where supported. Treat it as a kernel/backend throughput harness, not a chemistry validation benchmark.
@@ -1148,8 +1148,8 @@ Recommended comparisons:
 
 - Native `mace-torch` e3nn backend.
 - Native `mace-torch` cuEq backend.
-- MACE-ICTD bridge-U eager/make_fx/AOTI.
-- MACE-ICTD cuEq product eager/make_fx/AOTI.
+- MACE-ICTC bridge-U eager/make_fx/AOTI.
+- MACE-ICTC cuEq product eager/make_fx/AOTI.
 - Optional pure-U diagnostic path.
 
 Always separate:
@@ -1165,22 +1165,22 @@ Always separate:
 Core smoke tests:
 
 ```bash
-python -m mace_ictd.test.test_training_smoke
-python -m pytest mace_ictd/test/test_angular_basis.py -q
-python -m pytest mace_ictd/test/test_export_aoti_core.py -q
+python -m mace_ictc.test.test_training_smoke
+python -m pytest mace_ictc/test/test_angular_basis.py -q
+python -m pytest mace_ictc/test/test_export_aoti_core.py -q
 ```
 
 MACE converter validation:
 
 ```bash
-python -m mace_ictd.test.test_mace_converter
+python -m mace_ictc.test.test_mace_converter
 ```
 
 cuEq product tests:
 
 ```bash
-python -m pytest mace_ictd/test/test_cueq_product_backend.py -q
-python -m mace_ictd.test.test_cueq_makefx_training
+python -m pytest mace_ictc/test/test_cueq_product_backend.py -q
+python -m mace_ictc.test.test_cueq_makefx_training
 ```
 
 Use a CUDA machine for the cuEq and make_fx tests.
@@ -1209,7 +1209,7 @@ For e3nn-folded product inference, use:
 
 ### cuEq Product Replacement
 
-When replacing bridge-U products with cuEq products, only learnable MACE contraction weights should be copied. Fixed bridge-U `U_matrix_*` buffers already contain the ICTD/e3nn basis fold and must not be copied into cuEq.
+When replacing bridge-U products with cuEq products, only learnable MACE contraction weights should be copied. Fixed bridge-U `U_matrix_*` buffers already contain the ICTC/e3nn basis fold and must not be copied into cuEq.
 
 The export path handles this.
 
@@ -1259,7 +1259,7 @@ Local code style is intentionally conservative:
 
 - Prefer existing model/backend abstractions.
 - Keep MACE parity tests before changing angular basis or product code.
-- Do not treat passing smoke tests as proof of MACE parity; run direct MACE-vs-ICTD converter tests for parity claims.
+- Do not treat passing smoke tests as proof of MACE parity; run direct MACE-vs-ICTC converter tests for parity claims.
 - When touching checkpoint metadata, verify `LAMMPS_MLIAP_MFF.from_checkpoint` strict reload.
 - When touching `angular_basis=e3nn`, verify both eager forward and checkpoint reload to avoid double-folding fixed buffers.
 
@@ -1267,11 +1267,11 @@ Useful files:
 
 | File | Why it matters |
 |---|---|
-| `mace_ictd/models/pure_cartesian_ictd_fix.py` | Main model and product backends. |
-| `mace_ictd/mace_basis.py` | Orthogonal ICTD/e3nn basis conversion. |
-| `mace_ictd/interfaces/mace_converter.py` | Native MACE to MACE-ICTD weight conversion. |
-| `mace_ictd/cli/export_aoti_core.py` | AOTI export, cuEq product replacement, angular-basis export logic. |
-| `mace_ictd/training/makefx_compile.py` | `make_fx` force-step compilation. |
-| `mace_ictd/training/train_loop.py` | Trainer, checkpoint metadata, ScaleShift/E0 loss handling. |
-| `mace_ictd/interfaces/lammps_mliap.py` | Deployment checkpoint reload and wrapper logic. |
-| `mace_ictd/test/test_mace_converter.py` | Native MACE to MACE-ICTD conversion parity tests. |
+| `mace_ictc/models/pure_cartesian_ictd_fix.py` | Main model and product backends. |
+| `mace_ictc/mace_basis.py` | Orthogonal ICTC/e3nn basis conversion. |
+| `mace_ictc/interfaces/mace_converter.py` | Native MACE to MACE-ICTC weight conversion. |
+| `mace_ictc/cli/export_aoti_core.py` | AOTI export, cuEq product replacement, angular-basis export logic. |
+| `mace_ictc/training/makefx_compile.py` | `make_fx` force-step compilation. |
+| `mace_ictc/training/train_loop.py` | Trainer, checkpoint metadata, ScaleShift/E0 loss handling. |
+| `mace_ictc/interfaces/lammps_mliap.py` | Deployment checkpoint reload and wrapper logic. |
+| `mace_ictc/test/test_mace_converter.py` | Native MACE to MACE-ICTC conversion parity tests. |

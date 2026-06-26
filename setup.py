@@ -1,7 +1,7 @@
-"""Setup script for the standalone MACE-ICTD package.
+"""Setup script for the standalone MACE-ICTC package.
 
-MACE-ICTD = MACE in the Irreducible Cartesian Tensor Decomposition basis, extracted
-from FSCETP as a self-contained deployment stack: the ICTD-basis MACE model plus
+MACE-ICTC = MACE in the Irreducible Cartesian Tensor Decomposition basis, extracted
+from FSCETP as a self-contained deployment stack: the ICTC-basis MACE model plus
 AOTInductor export, make_fx training compilation, the LAMMPS interface, and the
 long-range module.
 """
@@ -24,7 +24,7 @@ long_description = readme_file.read_text(encoding="utf-8") if readme_file.exists
 
 
 def _get_ext_modules():
-    # Optional compiled ICTD tensor-product extension. Opt-in: the pure-PyTorch path is
+    # Optional compiled ICTC tensor-product extension. Opt-in: the pure-PyTorch path is
     # the default and the package is fully functional without it.
     if os.environ.get("MFF_BUILD_ICTD_TP_EXT", "0") != "1":
         return []
@@ -36,16 +36,16 @@ def _get_ext_modules():
         and CUDA_HOME is not None
     )
     extension_cls = CUDAExtension if use_cuda else CppExtension
-    sources = ["mace_ictd/csrc/ictd_tp.cpp"]
+    sources = ["mace_ictc/csrc/ictd_tp.cpp"]
     extra_compile_args = {"cxx": ["-O3"]}
     define_macros = []
     if use_cuda:
-        sources.append("mace_ictd/csrc/ictd_tp_cuda.cu")
+        sources.append("mace_ictc/csrc/ictd_tp_cuda.cu")
         extra_compile_args["nvcc"] = ["-O3"]
         define_macros.append(("WITH_CUDA", None))
     return [
         extension_cls(
-            name="mace_ictd._C_ictd_tp",
+            name="mace_ictc._C_ictd_tp",
             sources=sources,
             extra_compile_args=extra_compile_args,
             define_macros=define_macros,
@@ -58,15 +58,15 @@ cmdclass = {"build_ext": BuildExtension} if ext_modules and BuildExtension is no
 
 
 setup(
-    name="mace-ictd",
+    name="mace-ictc",
     version="0.1.0",
     description="MACE in the Irreducible Cartesian Tensor Decomposition basis, with AOTInductor / make_fx / LAMMPS / long-range deployment",
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="MIT",
-    packages=find_packages(include=["mace_ictd", "mace_ictd.*"]),
+    packages=find_packages(include=["mace_ictc", "mace_ictc.*"]),
     package_data={
-        "mace_ictd": [
+        "mace_ictc": [
             "models/_ictd_cache/v1/cg/*.pt",
             "models/_ictd_cache/v1/cg_full/*.pt",
             "models/_ictd_cache/v1/u_so3/*.pt",
@@ -114,10 +114,10 @@ setup(
     entry_points={
         "console_scripts": [
             # Deployment CLIs (names kept identical to FSCETP so the LAMMPS docs apply verbatim).
-            "mff-export-aoti=mace_ictd.cli.export_aoti_core:main",
-            "mff-export-core=mace_ictd.cli.export_libtorch_core:main",
-            "mff-lammps=mace_ictd.cli.lammps_interface:main",
-            "mff-convert-mace=mace_ictd.cli.convert_mace:main",
+            "mff-export-aoti=mace_ictc.cli.export_aoti_core:main",
+            "mff-export-core=mace_ictc.cli.export_libtorch_core:main",
+            "mff-lammps=mace_ictc.cli.lammps_interface:main",
+            "mff-convert-mace=mace_ictc.cli.convert_mace:main",
         ],
     },
     ext_modules=ext_modules,

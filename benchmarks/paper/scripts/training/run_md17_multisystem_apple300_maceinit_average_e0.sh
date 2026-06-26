@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # Apple-to-apple 300-epoch rMD17 training benchmark for additional molecules.
-# This script is intended for the RTX 4090 host. It runs MACE-ICTD and
+# This script is intended for the RTX 4090 host. It runs MACE-ICTC and
 # mace-torch baselines with matched architecture, optimizer, scheduler, E/F
 # weights, average-E0 convention, and seeds.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTD}"
+REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
-DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictd_public_md17}"
-OUT="${OUT_ROOT:-/tmp/mace_ictd_train_multisystem_apple300_maceinit_average_e0_$(date +%Y%m%d_%H%M%S)}"
+DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictc_public_md17}"
+OUT="${OUT_ROOT:-/tmp/mace_ictc_train_multisystem_apple300_maceinit_average_e0_$(date +%Y%m%d_%H%M%S)}"
 
 SYSTEMS_CSV="${SYSTEMS:-revised_benzene,revised_aspirin}"
 SEEDS_CSV="${SEEDS:-20260616,20260617,20260618}"
@@ -58,7 +58,7 @@ cat > "${OUT}/metadata.json" <<EOF
   "optimizer": {"type": "AdamW", "lr": ${LR}, "weight_decay": ${WEIGHT_DECAY}, "amsgrad": true},
   "architecture": {"channels": ${CHANNELS}, "hidden_lmax": ${HIDDEN_LMAX}, "max_ell": ${MAX_ELL}, "num_interactions": ${NUM_INTERACTIONS}, "correlation": ${CORRELATION}, "readout_hidden_channels": ${READOUT_HIDDEN}, "first_layer_self_connection": true, "use_reduced_cg": true},
   "radial": {"type": "bessel", "num_basis": 8, "polynomial_cutoff_p": 6, "r_max": ${R_MAX}},
-  "scaling": {"mode": "std_scaling", "avg_num_neighbors": ${AVG_NEIGHBORS}, "e0_rule": "For each fixed-composition molecule, solve the minimum-norm average-E0 linear system E0_Z = mean(E) n_Z / sum_Z n_Z^2, then use the same E0s in MACE-ICTD and mace-torch."}
+  "scaling": {"mode": "std_scaling", "avg_num_neighbors": ${AVG_NEIGHBORS}, "e0_rule": "For each fixed-composition molecule, solve the minimum-norm average-E0 linear system E0_Z = mean(E) n_Z / sum_Z n_Z^2, then use the same E0s in MACE-ICTC and mace-torch."}
 }
 EOF
 
@@ -221,15 +221,15 @@ for raw_system in "${SYSTEMS_ARR[@]}"; do
       case "${mode}" in
         ictd_bridge_u_eager)
           mapfile -t flags < <(ictd_common_flags "${data}" ictd-bridge-u "${E0_KEYS}" "${E0_VALS}" --seed "${seed}" --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
           ;;
         ictd_bridge_u_makefx)
           mapfile -t flags < <(ictd_common_flags "${data}" ictd-bridge-u "${E0_KEYS}" "${E0_VALS}" --seed "${seed}" --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
           ;;
         ictd_cueq_makefx)
           mapfile -t flags < <(ictd_common_flags "${data}" cueq "${E0_KEYS}" "${E0_VALS}" --seed "${seed}" --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+          run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
           ;;
         mace_e3nn)
           run_logged "${job}" env PYTHONPATH="${MACE}:${PYTHONPATH:-}" "${PY}" -m mace.cli.run_train \

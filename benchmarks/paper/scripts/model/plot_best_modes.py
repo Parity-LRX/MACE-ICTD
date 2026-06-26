@@ -24,25 +24,25 @@ CHANNELS = 64
 TRAIN_MODES = {
     "mace_torch_e3nn": "MACE e3nn",
     "mace_torch_cueq": "MACE cuEq",
-    "mace_ictd_bridge_u_eager": "ICTD eager",
-    "mace_ictd_bridge_u_makefx_train": "ICTD compiled",
-    "mace_ictd_cueq_product_makefx_train": "ICTD+cuEq compiled",
+    "mace_ictc_bridge_u_eager": "ICTC eager",
+    "mace_ictc_bridge_u_makefx_train": "ICTC compiled",
+    "mace_ictc_cueq_product_makefx_train": "ICTC+cuEq compiled",
 }
 
 INFER_MODES = {
     "mace_torch_e3nn": "MACE e3nn",
     "mace_torch_cueq": "MACE cuEq",
-    "mace_ictd_bridge_u_eager": "ICTD eager",
-    "mace_ictd_bridge_u_aoti": "ICTD compiled",
-    "mace_ictd_cueq_product_aoti": "ICTD+cuEq compiled",
+    "mace_ictc_bridge_u_eager": "ICTC eager",
+    "mace_ictc_bridge_u_aoti": "ICTC compiled",
+    "mace_ictc_cueq_product_aoti": "ICTC+cuEq compiled",
 }
 
 STYLE = {
     "MACE e3nn": {"color": "#4C78A8", "marker": "o"},
     "MACE cuEq": {"color": "#F58518", "marker": "s"},
-    "ICTD eager": {"color": "#54A24B", "marker": "^"},
-    "ICTD compiled": {"color": "#B279A2", "marker": "D"},
-    "ICTD+cuEq compiled": {"color": "#E45756", "marker": "P"},
+    "ICTC eager": {"color": "#54A24B", "marker": "^"},
+    "ICTC compiled": {"color": "#B279A2", "marker": "D"},
+    "ICTC+cuEq compiled": {"color": "#E45756", "marker": "P"},
 }
 
 AVG_DEGREE = 16
@@ -69,7 +69,7 @@ FIXED_NOTE = (
 
 def load_rows() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
-    for csv_path in sorted(RAW.glob("mace_ictd_vs_mace_bench_*.csv")):
+    for csv_path in sorted(RAW.glob("mace_ictc_vs_mace_bench_*.csv")):
         json_path = csv_path.with_suffix(".json")
         if not json_path.exists():
             continue

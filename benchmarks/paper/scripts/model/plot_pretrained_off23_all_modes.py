@@ -18,16 +18,16 @@ DEGREE = 50
 MODES = [
     "MACE e3nn",
     "MACE cuEq",
-    "ICTD eager",
-    "ICTD compiled",
-    "ICTD+cuEq compiled",
+    "ICTC eager",
+    "ICTC compiled",
+    "ICTC+cuEq compiled",
 ]
 STYLE = {
     "MACE e3nn": {"color": "#4C78A8", "marker": "o"},
     "MACE cuEq": {"color": "#F58518", "marker": "s"},
-    "ICTD eager": {"color": "#54A24B", "marker": "^"},
-    "ICTD compiled": {"color": "#B279A2", "marker": "D"},
-    "ICTD+cuEq compiled": {"color": "#E45756", "marker": "P"},
+    "ICTC eager": {"color": "#54A24B", "marker": "^"},
+    "ICTC compiled": {"color": "#B279A2", "marker": "D"},
+    "ICTC+cuEq compiled": {"color": "#E45756", "marker": "P"},
 }
 
 RAW_ROWS = [
@@ -35,14 +35,14 @@ RAW_ROWS = [
     # 50-neighbor-equivalent atoms equals the actual atom count.
     {"atoms": 128, "mode": "MACE e3nn", "time_ms": 12.232},
     {"atoms": 128, "mode": "MACE cuEq", "time_ms": 17.944},
-    {"atoms": 128, "mode": "ICTD eager", "time_ms": 11.391},
-    {"atoms": 128, "mode": "ICTD compiled", "time_ms": 1.503},
-    {"atoms": 128, "mode": "ICTD+cuEq compiled", "time_ms": 3.990},
+    {"atoms": 128, "mode": "ICTC eager", "time_ms": 11.391},
+    {"atoms": 128, "mode": "ICTC compiled", "time_ms": 1.503},
+    {"atoms": 128, "mode": "ICTC+cuEq compiled", "time_ms": 3.990},
     {"atoms": 512, "mode": "MACE e3nn", "time_ms": 13.617},
     {"atoms": 512, "mode": "MACE cuEq", "time_ms": 17.899},
-    {"atoms": 512, "mode": "ICTD eager", "time_ms": 13.905},
-    {"atoms": 512, "mode": "ICTD compiled", "time_ms": 4.488},
-    {"atoms": 512, "mode": "ICTD+cuEq compiled", "time_ms": 4.692},
+    {"atoms": 512, "mode": "ICTC eager", "time_ms": 13.905},
+    {"atoms": 512, "mode": "ICTC compiled", "time_ms": 4.488},
+    {"atoms": 512, "mode": "ICTC+cuEq compiled", "time_ms": 4.692},
 ]
 
 
@@ -166,7 +166,7 @@ def plot(rows: list[dict[str, str]]) -> list[Path]:
         0.012,
         0.02,
         "RTX 4090, FP32, OFF23-small, fixed 50 directed edges/atom. "
-        "Native MACE modes used isolated e3nn 0.4.4 for old OFF pickle compatibility; ICTD modes used current MACE-ICTD.",
+        "Native MACE modes used isolated e3nn 0.4.4 for old OFF pickle compatibility; ICTC modes used current MACE-ICTC.",
         ha="left",
         fontsize=7.2,
         color="#333333",

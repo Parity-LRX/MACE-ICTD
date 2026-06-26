@@ -9,15 +9,15 @@ set -euo pipefail
 #       force_weight  = 100.0
 #   No SWA/EMA/stage-two weight change is enabled.
 #
-# ICTD modes use --mace-compatible-random-init and
+# ICTC modes use --mace-compatible-random-init and
 # --first-layer-self-connection so the initial function and first-layer skip
 # trainability match the corresponding random ScaleShiftMACE model.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTD}"
+REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
-DATA="${DATA_DIR:-/tmp/mace_ictd_public_md17/revised_ethanol}"
-OUT="${OUT_ROOT:-/tmp/mace_ictd_train_apple100_maceinit_$(date +%Y%m%d_%H%M%S)}"
+DATA="${DATA_DIR:-/tmp/mace_ictc_public_md17/revised_ethanol}"
+OUT="${OUT_ROOT:-/tmp/mace_ictc_train_apple100_maceinit_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "${OUT}/logs" "${OUT}/checkpoints" "${OUT}/models" "${OUT}/results" "${OUT}/commands"
 
@@ -62,7 +62,7 @@ cat > "${OUT}/metadata.json" <<EOF
   "architecture": {"channels": ${CHANNELS}, "hidden_lmax": ${HIDDEN_LMAX}, "max_ell": ${MAX_ELL}, "num_interactions": ${NUM_INTERACTIONS}, "correlation": ${CORRELATION}, "readout_hidden_channels": ${READOUT_HIDDEN}, "first_layer_self_connection": true, "use_reduced_cg": true},
   "radial": {"type": "bessel", "num_basis": 8, "polynomial_cutoff_p": 6, "r_max": ${R_MAX}},
   "scaling": {"mode": "std_scaling", "avg_num_neighbors": ${AVG_NEIGHBORS}, "E0s": {"1": 0.0, "6": 0.0, "7": 0.0, "8": 0.0}},
-  "note": "E/F weights are fixed for every run. ICTD modes use --mace-compatible-random-init and --first-layer-self-connection. MACE modes use the same seed and matching ScaleShiftMACE architecture. No SWA or EMA is enabled."
+  "note": "E/F weights are fixed for every run. ICTC modes use --mace-compatible-random-init and --first-layer-self-connection. MACE modes use the same seed and matching ScaleShiftMACE architecture. No SWA or EMA is enabled."
 }
 EOF
 
@@ -136,15 +136,15 @@ for raw_seed in "${SEEDS_ARR[@]}"; do
     case "${mode}" in
       ictd_bridge_u_eager)
         mapfile -t flags < <(ictd_common_flags ictd-bridge-u --seed "${seed}" --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       ictd_bridge_u_makefx)
         mapfile -t flags < <(ictd_common_flags ictd-bridge-u --seed "${seed}" --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       ictd_cueq_makefx)
         mapfile -t flags < <(ictd_common_flags cueq --seed "${seed}" --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       mace_e3nn)
         run_logged "${job}" env PYTHONPATH="${MACE}:${PYTHONPATH:-}" "${PY}" -m mace.cli.run_train \

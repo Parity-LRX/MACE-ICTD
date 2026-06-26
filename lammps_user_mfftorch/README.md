@@ -1,6 +1,6 @@
 # LAMMPS USER-MFFTORCH
 
-`USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTD models through
+`USER-MFFTORCH` is a LAMMPS package for running exported MACE-ICTC models through
 LibTorch/AOTInductor from C++. It is intended for production MD after a model has
 already been trained or converted in Python and exported as a deployment core.
 
@@ -16,7 +16,7 @@ Pair styles:
   inference. Use this for GPU MD when the Kokkos build is available.
 
 The recommended model artifact is an AOTInductor `.pt2` core exported by
-`mff-export-aoti` or `python -m mace_ictd.cli.export_aoti_core`. Legacy
+`mff-export-aoti` or `python -m mace_ictc.cli.export_aoti_core`. Legacy
 TorchScript `core.pt` support is still kept for older LibTorch deployments, but
 new validation uses `.pt2`.
 
@@ -26,7 +26,7 @@ path; do not rely on `compute mff/torch/phys` for production runs.
 
 ## Install Into LAMMPS
 
-From the MACE-ICTD repository root:
+From the MACE-ICTC repository root:
 
 ```bash
 bash scripts/install_user_mfftorch_into_lammps.sh /path/to/lammps
@@ -70,7 +70,7 @@ export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.pat
 
 ## Export a Model
 
-Basic `.pt2` export from a MACE-ICTD checkpoint:
+Basic `.pt2` export from a MACE-ICTC checkpoint:
 
 ```bash
 mff-export-aoti \
@@ -186,7 +186,7 @@ decomposition, cutoff, ghost, or static `.pt2` capacity issue.
 ## OFF23 Smoke Test
 
 On an RTX 4090 validation host, `MACE-OFF23_small.model` was converted to
-bridge-U MACE-ICTD, exported as a float32 static-6 `.pt2`, and loaded by both
+bridge-U MACE-ICTC, exported as a float32 static-6 `.pt2`, and loaded by both
 `build-mfftorch` and `build-mfftorch-kk`.
 
 Fresh LAMMPS `run 0` result:
@@ -208,4 +208,4 @@ norm.
 
 Older public OFF23 pickle files may require a matching historical
 `mace-torch`/`e3nn` environment for the initial load/conversion step. Once
-converted, the MACE-ICTD checkpoint can be exported by the current runtime.
+converted, the MACE-ICTC checkpoint can be exported by the current runtime.

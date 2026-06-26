@@ -5,8 +5,8 @@ Remote host: `XHPC-4090-01` via `ssh -p 18022 ylzhang@10.10.3.21`
 Model artifacts:
 
 - Native source model: `/home/ylzhang/.cache/mace/MACE-OFF23_small.model`
-- MACE-ICTD FP32 checkpoint: `/tmp/mace_ictd_pretrained/off23_small_ictd_bridge_u_float32.pth`
-- MACE-ICTD FP64 checkpoint generated for this check: `/tmp/mace_ictd_pretrained/off23_small_ictd_bridge_u_float64.pth`
+- MACE-ICTC FP32 checkpoint: `/tmp/mace_ictc_pretrained/off23_small_ictd_bridge_u_float32.pth`
+- MACE-ICTC FP64 checkpoint generated for this check: `/tmp/mace_ictc_pretrained/off23_small_ictd_bridge_u_float64.pth`
 
 System:
 
@@ -17,7 +17,7 @@ System:
 Native reference:
 
 - Native MACE was run with `mace==0.3.16` and `e3nn==0.4.4` from `/tmp/mace_torch_0_3_16` and `/tmp/e3nn_0_4_4`.
-- MACE-ICTD was run from `/home/ylzhang/lrx/MACE-ICTD` in the current FSCETP environment.
+- MACE-ICTC was run from `/home/ylzhang/lrx/MACE-ICTC` in the current FSCETP environment.
 
 Main FP64 parity results:
 

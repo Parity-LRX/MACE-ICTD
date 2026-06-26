@@ -1,7 +1,7 @@
 # MD17 convergence analysis
 
 All force RMSE values are in eV/A and all energy RMSE values are in eV/atom.
-Scalar validation losses are intentionally not compared because MACE-ICTD and mace-torch log different internal loss normalizations.
+Scalar validation losses are intentionally not compared because MACE-ICTC and mace-torch log different internal loss normalizations.
 Partial rows are included so long-running jobs can be monitored before all modes finish.
 
 ## Per-run summary

@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Plot operator-level throughput + speedup: ICTD vs cartnn vs e3nn(reference).
+"""Plot operator-level throughput + speedup: ICTC vs cartnn vs e3nn(reference).
 
 Reads operator_cartnn_vs_ictd.csv (written by operator_bench.py) and produces
   figures/operator_throughput.png   (edges/s vs directed edges)
-  figures/operator_speedup.png      (ICTD- and e3nn-vs-cartnn speedup)
+  figures/operator_speedup.png      (ICTC- and e3nn-vs-cartnn speedup)
 
 Grid: rows = (hidden_lmax/max_ell) configs, cols = {fp32,fp64} x {forward_only,forward_backward}.
 Fixed channels (default 64). forward-only and forward+backward are kept in separate columns,
@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 BACKENDS = ["e3nn", "cartnn", "ictd"]
 COLORS = {"e3nn": "#888888", "cartnn": "#d62728", "ictd": "#1f77b4"}
 MARKERS = {"e3nn": "s", "cartnn": "o", "ictd": "^"}
-LABELS = {"e3nn": "e3nn (spherical, ref)", "cartnn": "cartnn (Cartesian 3^l)", "ictd": "MACE-ICTD"}
+LABELS = {"e3nn": "e3nn (spherical, ref)", "cartnn": "cartnn (Cartesian 3^l)", "ictd": "MACE-ICTC"}
 
 
 def load(csv_path):
@@ -96,7 +96,7 @@ def main():
             ax.grid(True, which="both", alpha=0.25)
             if ri == 0 and ci == 0 and any_data:
                 ax.legend(fontsize=8, loc="lower right")
-    fig.suptitle(f"Operator throughput (channels={args.channels}): MACE-ICTD vs cartnn vs e3nn",
+    fig.suptitle(f"Operator throughput (channels={args.channels}): MACE-ICTC vs cartnn vs e3nn",
                  fontsize=14, y=1.005)
     fig.tight_layout()
     p1 = os.path.join(args.outdir, "operator_throughput.png")

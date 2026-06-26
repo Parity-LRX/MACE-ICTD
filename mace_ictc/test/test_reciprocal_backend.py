@@ -1,0 +1,65 @@
+"""Task 1 regression: the shared ReciprocalBackend's scalar route reproduces the existing
+MeshLongRangeKernel3D reciprocal potential exactly (same grid ops, just factored out)."""
+from __future__ import annotations
+
+import torch
+
+from mace_ictc.models.long_range import MeshLongRangeKernel3D
+from mace_ictc.models.reciprocal_backend import ReciprocalBackend
+
+
+def _kernel_spectral(k, cell_b):
+    """Replicate apply_green_kernel_batched's per-k scalar spectral weight for cell_b [1,3,3]."""
+    k_norms, volume = k.build_k_norms_batched(cell_b, dtype=torch.float64)  # [1,M,M,M]
+    sw = k.green_kernel(k_norms) / volume.view(-1, 1, 1, 1)
+    if k.full_ewald:
+        rc = k._estimate_real_cutoff_batched(cell_b.to(torch.float64))
+        alpha = k._estimate_ewald_alpha(rc)
+        sw = sw * torch.exp(-(k_norms.square()) / (4.0 * alpha.view(-1, 1, 1, 1).square()))
+    if k.full_ewald or k.assignment != "cic":
+        win = k._build_assignment_window(device=cell_b.device, dtype=torch.float64)
+        sw = sw * torch.reciprocal(win.clamp_min(k.assignment_window_floor).square()).unsqueeze(0)
+    if k.full_ewald or (not k.include_k0):
+        sw = torch.where(k_norms > k.k_norm_floor, sw, torch.zeros_like(sw))
+    return sw[0]  # [M,M,M]
+
+
+def test_scalar_backend_matches_existing():
+    torch.set_default_dtype(torch.float64)
+    for full_ewald in (False, True):
+        for assignment in ("cic", "pcs"):
+            cfg = dict(mesh_size=16, boundary="periodic", slab_padding_factor=2, assignment=assignment)
+            k = MeshLongRangeKernel3D(full_ewald=full_ewald, include_k0=False, **cfg)
+            be = ReciprocalBackend(include_k0=False, k_norm_floor=k.k_norm_floor, **cfg)
+
+            N, L = 8, 8.0
+            g = torch.Generator().manual_seed(0)
+            pos = torch.rand(N, 3, generator=g, dtype=torch.float64) * L
+            cell = torch.eye(3, dtype=torch.float64) * L
+            source = torch.randn(N, 1, generator=g, dtype=torch.float64)
+
+            frac = be.frac(pos, cell)
+            mesh = be.spread(frac, source)                                  # [M,M,M,1]
+            # existing kernel path (batched, B=1)
+            pot_b, *_ = k.apply_green_kernel_batched(mesh.unsqueeze(0), cell.unsqueeze(0))
+            recip_existing = be.gather(frac, pot_b[0])
+            # backend scalar route with the kernel's spectral
+            recip_backend = be.scalar_potential(frac, source, _kernel_spectral(k, cell.unsqueeze(0)))
+
+            d = (recip_existing - recip_backend).abs().max().item()
+            assert d < 1e-12, f"full_ewald={full_ewald} assignment={assignment}: mismatch {d:.2e}"
+
+    # k_grid sanity + 3-channel (MBD dipole) spread/gather adjoint
+    be = ReciprocalBackend(mesh_size=16, assignment="cic")
+    cell = torch.eye(3, dtype=torch.float64) * 8.0
+    k_cart, k_norm, vol = be.k_grid(cell, dtype=torch.float64)
+    assert abs(vol.item() - 8.0 ** 3) < 1e-9 and k_cart.shape == (16 ** 3, 3)
+    pos = torch.rand(5, 3, dtype=torch.float64) * 8.0
+    frac = be.frac(pos, cell)
+    assert be.gather(frac, be.spread(frac, torch.randn(5, 3, dtype=torch.float64))).shape == (5, 3)
+
+
+if __name__ == "__main__":
+    test_scalar_backend_matches_existing()
+    print("OK: Task1 ReciprocalBackend scalar route == existing reciprocal (cic+pcs, bare+ewald);"
+          " k_grid + 3-channel spread/gather OK")

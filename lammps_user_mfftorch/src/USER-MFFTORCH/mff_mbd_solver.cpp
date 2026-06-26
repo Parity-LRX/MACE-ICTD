@@ -1,4 +1,4 @@
-// Task 5/5: C++ MBD solver -- mirrors the validated Python (mace_ictd/models/mbd.py +
+// Task 5/5: C++ MBD solver -- mirrors the validated Python (mace_ictc/models/mbd.py +
 // reciprocal_backend.py) 1:1 using the libtorch C++ API. Shares the PME/cuFFT grid ops with the
 // scalar electrostatics (here self-contained CIC spread/gather to match a Python assignment="cic"
 // reference for parity). Chebyshev Tr[sqrt C] (no eigensolve) for the deployment hot path.

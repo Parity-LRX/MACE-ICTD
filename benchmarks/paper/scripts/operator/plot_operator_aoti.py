@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""Plot the matched-fusion (forward-only) operator comparison: eager vs fused ICTD vs e3nn/cartnn.
-Shows that the ICTD operator's standing vs e3nn flips once it is fused (torch.compile/AOTI).
+"""Plot the matched-fusion (forward-only) operator comparison: eager vs fused ICTC vs e3nn/cartnn.
+Shows that the ICTC operator's standing vs e3nn flips once it is fused (torch.compile/AOTI).
 figures/operator_matched_fusion.png
 """
 import argparse, csv, os
@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 ORDER = ["ictd_eager", "ictd_compile", "ictd_aoti", "e3nn", "cartnn"]
 COLOR = {"ictd_eager": "#9ecae1", "ictd_compile": "#1f77b4", "ictd_aoti": "#08306b",
          "e3nn": "#888888", "cartnn": "#d62728"}
-LABEL = {"ictd_eager": "ICTD eager", "ictd_compile": "ICTD torch.compile", "ictd_aoti": "ICTD AOTI",
+LABEL = {"ictd_eager": "ICTC eager", "ictd_compile": "ICTC torch.compile", "ictd_aoti": "ICTC AOTI",
          "e3nn": "e3nn (fused ref)", "cartnn": "cartnn (fused)"}
 
 
@@ -71,7 +71,7 @@ def main():
         if j == 0:
             ax2.legend(fontsize=8)
     fig.suptitle("Matched-fusion operator comparison (forward-only, channels=64): "
-                 "ICTD competitiveness vs e3nn flips once fused", fontsize=13)
+                 "ICTC competitiveness vs e3nn flips once fused", fontsize=13)
     fig.tight_layout()
     p = os.path.join(args.outdir, "operator_matched_fusion.png")
     fig.savefig(p, dpi=130, bbox_inches="tight"); plt.close(fig)

@@ -1,6 +1,6 @@
 # rMD17 Aspirin Convergence Analysis
 
-Source run: `/tmp/mace_ictd_train_multisystem_apple300_maceinit_average_e0_20260617_061128` on the RTX 4090 host.
+Source run: `/tmp/mace_ictc_train_multisystem_apple300_maceinit_average_e0_20260617_061128` on the RTX 4090 host.
 
 This directory contains only `revised_aspirin` logs from that run. The same remote run also contained an earlier benzene attempt, but that benzene data is intentionally excluded because it predated the edge-shift sanitation fix. The aspirin H5 files were audited after the fix path and had zero nonperiodic edge shifts and maximum edge length below the 4.5 A cutoff.
 
@@ -8,9 +8,9 @@ Protocol:
 
 - 300 epochs from random MACE-compatible initialization.
 - 3 seeds: `20260616`, `20260617`, `20260618`.
-- Modes: ICTD eager, ICTD compiled, ICTD+cuEq compiled, MACE e3nn, MACE cuEq.
+- Modes: ICTC eager, ICTC compiled, ICTC+cuEq compiled, MACE e3nn, MACE cuEq.
 - Metrics are validation RMSE values only: force RMSE in eV/A and energy RMSE in eV/atom.
-- Scalar validation losses are not compared because MACE-ICTD and mace-torch log different internal loss normalizations.
+- Scalar validation losses are not compared because MACE-ICTC and mace-torch log different internal loss normalizations.
 
 Files:
 

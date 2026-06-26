@@ -985,7 +985,7 @@ void MFFTorchEngine::warmup(int64_t N, int64_t E) {
   // The first real compute() call runs it at the correct N, so skip warmup in AOTI mode.
   if (aoti_mode_) return;
   // MBD/SLQ-MBD cores need a physically meaningful second neighbor list. A synthetic warmup
-  // graph can satisfy the signature but still trip traced ICTD/MBD shape branches, so let the
+  // graph can satisfy the signature but still trip traced ICTC/MBD shape branches, so let the
   // first real LAMMPS graph warm caches instead of validating on fake topology.
   if (core_takes_dispersion_edges_arg_ && requires_mbd_dispersion_edges()) {
     return;

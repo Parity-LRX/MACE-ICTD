@@ -10,10 +10,10 @@ set -euo pipefail
 # Use prepare_md17_public.py to create this layout.
 
 PYTHON_BIN="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-MACE_ICTD_REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTD}"
+MACE_ICTD_REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE_TORCH_PATH="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
-DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictd_public_md17}"
-OUT_ROOT="${OUT_ROOT:-/tmp/mace_ictd_public_md17_train_$(date +%Y%m%d_%H%M%S)}"
+DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictc_public_md17}"
+OUT_ROOT="${OUT_ROOT:-/tmp/mace_ictc_public_md17_train_$(date +%Y%m%d_%H%M%S)}"
 
 DATASETS="${DATASETS:-revised_ethanol,revised_benzene,revised_aspirin}"
 MODES="${MODES:-ictd_bridge_u_eager,ictd_bridge_u_makefx,ictd_cueq_makefx,mace_e3nn,mace_cueq}"
@@ -149,7 +149,7 @@ for dataset in "${DATASET_ARR[@]}"; do
     job="${dataset}_${mode}_seed${SEED}_steps${MAX_STEPS}"
     case "${mode}" in
       ictd_bridge_u_eager)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictd.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \
@@ -167,7 +167,7 @@ for dataset in "${DATASET_ARR[@]}"; do
           --checkpoint "${OUT_ROOT}/checkpoints/${job}.pth"
         ;;
       ictd_bridge_u_makefx)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictd.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \
@@ -186,7 +186,7 @@ for dataset in "${DATASET_ARR[@]}"; do
           --checkpoint "${OUT_ROOT}/checkpoints/${job}.pth"
         ;;
       ictd_cueq_makefx)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictd.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \

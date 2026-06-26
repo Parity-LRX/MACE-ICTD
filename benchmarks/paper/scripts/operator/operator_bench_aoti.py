@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Matched-fusion operator comparison (forward-only / inference).
 
-The earlier operator bench timed the ICTD conv-TP EAGER (torch.compile graph-broke on its dict I/O)
-against e3nn/cartnn which are opt_einsum_fx codegen-FUSED -> unfair to ICTD. Here the ICTD operator is
+The earlier operator bench timed the ICTC conv-TP EAGER (torch.compile graph-broke on its dict I/O)
+against e3nn/cartnn which are opt_einsum_fx codegen-FUSED -> unfair to ICTC. Here the ICTC operator is
 put at the SAME fusion level the model deploys: torch.compile and AOTInductor of a thin flat-I/O wrapper
-around the *unmodified* repo tp. Timed vs e3nn / cartnn fused + eager-ICTD ref. Forward-only (AOTI is
+around the *unmodified* repo tp. Timed vs e3nn / cartnn fused + eager-ICTC ref. Forward-only (AOTI is
 inference-only).  No repo source is modified.
 
 Ordering matters: the repo tp lazily builds a (device,dtype) CG/projector cache on first forward. We WARM
@@ -69,9 +69,9 @@ def time_fwd(call, inp, warmup, measured, device):
 
 
 META = {
-    "ictd_eager": (ICTD_URL, ICTD_COMMIT, "ictd_tp_eager", "ICTD eager (ref)"),
-    "ictd_compile": (ICTD_URL, ICTD_COMMIT, "ictd_tp_torchcompile", "ICTD torch.compile(flat wrapper)"),
-    "ictd_aoti": (ICTD_URL, ICTD_COMMIT, "ictd_tp_aoti", "ICTD AOTInductor (flat wrapper) = deployment fusion level"),
+    "ictd_eager": (ICTD_URL, ICTD_COMMIT, "ictd_tp_eager", "ICTC eager (ref)"),
+    "ictd_compile": (ICTD_URL, ICTD_COMMIT, "ictd_tp_torchcompile", "ICTC torch.compile(flat wrapper)"),
+    "ictd_aoti": (ICTD_URL, ICTD_COMMIT, "ictd_tp_aoti", "ICTC AOTInductor (flat wrapper) = deployment fusion level"),
     "e3nn": (E3NN_URL, E3NN_COMMIT, "e3nn_tp_fused", "e3nn codegen-fused TP (ref)"),
     "cartnn": (CARTNN_URL, CARTNN_COMMIT, "cartnn_tp_fused", "cartnn codegen-fused TP"),
 }

@@ -1,7 +1,7 @@
 include README.md
 include LICENSE
-recursive-include mace_ictd/models/_ictd_cache *.pt
-recursive-include mace_ictd/csrc *.cpp *.cu
+recursive-include mace_ictc/models/_ictd_cache *.pt
+recursive-include mace_ictc/csrc *.cpp *.cu
 recursive-include lammps_user_mfftorch *.cpp *.h *.cmake *.md
 recursive-include lammps_user_mfftorch/examples *
 recursive-include lammps_user_mfftorch/docs *

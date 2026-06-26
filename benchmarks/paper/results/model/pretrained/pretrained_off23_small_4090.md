@@ -4,7 +4,7 @@ Remote host: `XHPC-4090-01` via `ssh -p 18022 ylzhang@10.10.3.21`
 
 Software path:
 
-- MACE-ICTD: `/home/ylzhang/lrx/MACE-ICTD`
+- MACE-ICTC: `/home/ylzhang/lrx/MACE-ICTC`
 - Python: `/home/ylzhang/micromamba/envs/FSCETP/bin/python`
 - `mace-torch`: `/tmp/mace_torch_0_3_16` (`mace==0.3.16`)
 - Current default `e3nn`: `0.5.9`
@@ -13,7 +13,7 @@ Software path:
 Model:
 
 - Source: `/home/ylzhang/.cache/mace/MACE-OFF23_small.model`
-- Converted checkpoint: `/tmp/mace_ictd_pretrained/off23_small_ictd_bridge_u_float32.pth`
+- Converted checkpoint: `/tmp/mace_ictc_pretrained/off23_small_ictd_bridge_u_float32.pth`
 - Species: `H,C,N,O,F,P,S,Cl,Br,I`
 - MACE config extracted from checkpoint:
   - `num_interactions=2`
@@ -31,13 +31,13 @@ The OFF23 small pickle is not directly runnable under the current `e3nn==0.5.9`:
 - direct `torch.load(..., weights_only=False)` fails because old `CodeGenMixin.__codegen__` stores compiled modules as raw bytes, while current e3nn expects `(buffer_type, buffer)` pairs;
 - after a temporary codegen loader patch, native MACE forward still fails because old pickled `SphericalHarmonics` and `Activation` objects miss runtime fields expected by e3nn 0.5.9.
 
-For native-MACE reference output, the model was run with isolated `e3nn==0.4.4` from `/tmp/e3nn_0_4_4`. MACE-ICTD conversion and `.pt2` export were run with the normal current environment.
+For native-MACE reference output, the model was run with isolated `e3nn==0.4.4` from `/tmp/e3nn_0_4_4`. MACE-ICTC conversion and `.pt2` export were run with the normal current environment.
 
-## Native MACE vs Converted MACE-ICTD
+## Native MACE vs Converted MACE-ICTC
 
 The comparison used synthetic fixed-edge graphs with 50 directed edges per atom. These are kernel/parity stress graphs, not physical MD configurations; random short distances make absolute energies and forces very large.
 
-| atoms | directed edges | native MACE ms | ICTD wrapper ms | speedup | rel energy diff | rel force diff |
+| atoms | directed edges | native MACE ms | ICTC wrapper ms | speedup | rel energy diff | rel force diff |
 |---:|---:|---:|---:|---:|---:|---:|
 | 128 | 6,400 | 12.232 | 11.391 | 1.074x | 7.729e-07 | 1.118e-06 |
 | 512 | 25,600 | 13.617 | 13.905 | 0.979x | 3.079e-07 | 1.126e-06 |
@@ -58,8 +58,8 @@ Common export settings:
 
 | exported core | output | AOTI strict | numerical match | equivariance | vary E | vary N | eager ms | AOTI ms | speedup | peak CUDA memory |
 |---|---|---:|---|---|---|---|---:|---:|---:|---:|
-| bridge-U AOTI | `/tmp/mace_ictd_pretrained/off23_small_ictd_bridge_u_n512_d50.pt2` | true | pass, `dE_rel=4.31e-06`, `dF_rel=3.29e-06` | pass | pass | pass | 11.228 | 4.343 | 2.59x | 0.71 GB |
-| cuEq-product AOTI, `angular_basis=e3nn` | `/tmp/mace_ictd_pretrained/off23_small_ictd_cueq_e3nn_n512_d50.pt2` | false | pass, `dE_rel=3.47e-06`, `dF_rel=3.07e-06` | pass | pass | pass | 13.757 | 4.703 | 2.93x | 0.64 GB |
+| bridge-U AOTI | `/tmp/mace_ictc_pretrained/off23_small_ictd_bridge_u_n512_d50.pt2` | true | pass, `dE_rel=4.31e-06`, `dF_rel=3.29e-06` | pass | pass | pass | 11.228 | 4.343 | 2.59x | 0.71 GB |
+| cuEq-product AOTI, `angular_basis=e3nn` | `/tmp/mace_ictc_pretrained/off23_small_ictd_cueq_e3nn_n512_d50.pt2` | false | pass, `dE_rel=3.47e-06`, `dF_rel=3.07e-06` | pass | pass | pass | 13.757 | 4.703 | 2.93x | 0.64 GB |
 
 Important caveat: for this OFF23 small model, `hidden_lmax=0`. On this case, bridge-U AOTI was slightly faster than cuEq-product AOTI at the tested size. Do not generalize the synthetic high-`lmax` cuEq conclusion to this scalar-hidden pretrained model.
 

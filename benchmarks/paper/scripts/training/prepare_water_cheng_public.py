@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the public Cheng liquid-water XYZ set for MACE/MACE-ICTD tests.
+"""Prepare the public Cheng liquid-water XYZ set for MACE/MACE-ICTC tests.
 
 Input:
   Bingqing Cheng, ab-initio-thermodynamics-of-water/training-set/dataset_1593.xyz

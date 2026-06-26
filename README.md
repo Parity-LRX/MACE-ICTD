@@ -1,17 +1,17 @@
-# MACE-ICTD
+# MACE-ICTC
 
 **DOI:** [10.5281/zenodo.20690950](https://doi.org/10.5281/zenodo.20690950)
 
-MACE-ICTD is a standalone implementation of MACE in an Irreducible Cartesian
-Tensor Decomposition (ICTD) basis. It keeps the MACE interaction/readout
+MACE-ICTC is a standalone implementation of MACE in an Irreducible Cartesian
+Tensor Decomposition (ICTC) basis. It keeps the MACE interaction/readout
 semantics, but stores equivariant angular features in compact Cartesian
 irreducible blocks and uses fixed basis-change operators to communicate with
 the original e3nn/MACE convention.
 
 The repository is intended for three workflows:
 
-- train MACE-style force fields directly in the ICTD basis;
-- convert compatible native `mace-torch` checkpoints into MACE-ICTD checkpoints;
+- train MACE-style force fields directly in the ICTC basis;
+- convert compatible native `mace-torch` checkpoints into MACE-ICTC checkpoints;
 - export trained or converted models for ASE, AOTInductor, and LAMMPS deployment.
 
 Full manuals:
@@ -21,8 +21,8 @@ Full manuals:
 
 ## What Is Included
 
-- MACE-compatible ICTD model: `PureCartesianICTDFix`.
-- Fixed `Q`/`U` basis bridges for ICTD/e3nn correspondence.
+- MACE-compatible ICTC model: `PureCartesianICTDFix`.
+- Fixed `Q`/`U` basis bridges for ICTC/e3nn correspondence.
 - H5 training with energy/force/stress losses, SWA/EMA, resume, and optional
   `make_fx`/Inductor compilation.
 - Native `mace-torch` checkpoint conversion for supported `ScaleShiftMACE`
@@ -37,7 +37,7 @@ Full manuals:
 ## Installation
 
 ```bash
-cd /path/to/MACE-ICTD
+cd /path/to/MACE-ICTC
 pip install -e .
 ```
 
@@ -52,7 +52,7 @@ pip install -e ".[full]"   # all optional Python extras
 
 Runtime expectations: Python >= 3.9, PyTorch >= 2.4, `e3nn >= 0.4.4, < 0.6`.
 PyTorch >= 2.7 is recommended for AOTInductor and `make_fx`; CUDA is required
-for cuEquivariance and the main GPU benchmark paths. An optional compiled ICTD
+for cuEquivariance and the main GPU benchmark paths. An optional compiled ICTC
 tensor-product extension can be built with:
 
 ```bash
@@ -68,7 +68,7 @@ also work from a source checkout before the script PATH is refreshed.
 
 ```python
 import torch
-from mace_ictd.synthetic import build_model, make_fixed_graph, compute_energy_forces
+from mace_ictc.synthetic import build_model, make_fixed_graph, compute_energy_forces
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = build_model(
@@ -108,17 +108,17 @@ where `A` is a tensor of atomic numbers, not species indices.
 | --- | --- |
 | Conservative MACE parity or native MACE conversion | `product_backend=ictd-bridge-u`, `angular_basis=ictd` |
 | Fast training | `product_backend=cueq`, `angular_basis=e3nn`, `--train-makefx-compile` |
-| Fast AOTI inference with cuEq available | `python -m mace_ictd.cli.export_aoti_core --cueq-product --angular-basis e3nn` |
+| Fast AOTI inference with cuEq available | `python -m mace_ictc.cli.export_aoti_core --cueq-product --angular-basis e3nn` |
 | Strictest deployment path | export the checkpoint without product replacement |
 | Debug/reference comparisons | `native-mace` or `ictd-pure-u`, depending on the question being tested |
 
 Important distinction:
 
 - `ictd-bridge-u` is the main MACE-correspondence path. It preserves the source
-  MACE product convention through the ICTD/e3nn basis bridge.
+  MACE product convention through the ICTC/e3nn basis bridge.
 - `cueq + angular_basis=e3nn` is the main performance path. It folds compatible
   fixed angular operators once and uses cuEquivariance for the product block.
-- `ictd-pure-u` is useful for diagnostics and ICTD-native experiments, but it is
+- `ictd-pure-u` is useful for diagnostics and ICTC-native experiments, but it is
   not the default exact native-MACE conversion path.
 
 ## Training From Scratch
@@ -134,7 +134,7 @@ DATA/
 Bridge-U training keeps the conservative MACE-correspondence product path:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 64 --lmax 2 --max-ell 2 \
   --num-interaction 2 --correlation 2 \
@@ -151,7 +151,7 @@ python -m mace_ictd.cli.train \
 The performance path uses cuEquivariance products and compiles the force step:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 64 --lmax 2 --max-ell 2 \
   --num-interaction 2 --correlation 2 \
@@ -175,12 +175,12 @@ documented in [docs/USER_MANUAL.md](docs/USER_MANUAL.md).
 
 ## Convert a Native MACE Checkpoint
 
-MACE-ICTD can import compatible native `mace-torch` `ScaleShiftMACE` objects:
+MACE-ICTC can import compatible native `mace-torch` `ScaleShiftMACE` objects:
 
 ```bash
-python -m mace_ictd.cli.convert_mace \
+python -m mace_ictc.cli.convert_mace \
   --mace-model mace.model \
-  --out mace_ictd.pth \
+  --out mace_ictc.pth \
   --product-backend ictd-bridge-u \
   --dtype float64 \
   --device cpu
@@ -191,10 +191,10 @@ The input must be a `torch.save(model)` object, not a raw `state_dict`.
 Conservative AOTI export from the converted checkpoint:
 
 ```bash
-python -m mace_ictd.cli.export_aoti_core \
-  --checkpoint mace_ictd.pth \
+python -m mace_ictc.cli.export_aoti_core \
+  --checkpoint mace_ictc.pth \
   --elements H,C,N,O \
-  --out mace_ictd.pt2 \
+  --out mace_ictc.pt2 \
   --dynamic \
   --embed-e0
 ```
@@ -202,10 +202,10 @@ python -m mace_ictd.cli.export_aoti_core \
 Performance-oriented cuEq export:
 
 ```bash
-python -m mace_ictd.cli.export_aoti_core \
-  --checkpoint mace_ictd.pth \
+python -m mace_ictc.cli.export_aoti_core \
+  --checkpoint mace_ictc.pth \
   --elements H,C,N,O \
-  --out mace_ictd_cueq_e3nn.pt2 \
+  --out mace_ictc_cueq_e3nn.pt2 \
   --dynamic \
   --cueq-product \
   --angular-basis e3nn
@@ -218,11 +218,11 @@ releases may work when the saved object layout remains compatible, but arbitrary
 research forks, raw state dicts, pair-repulsion variants, and changed readout or
 radial layouts are rejected rather than silently converted.
 
-For exact MACE correspondence, the converted ICTD model must preserve the source
+For exact MACE correspondence, the converted ICTC model must preserve the source
 model's structural options, including `use_reduced_cg`.
 
 OFF23 smoke test, RTX 4090, 2026-06-18: `MACE-OFF23_small.model` was converted
-to bridge-U ICTD and compared against native `mace-torch` in float64. On a
+to bridge-U ICTC and compared against native `mace-torch` in float64. On a
 benzene trajectory, same-frame maximum differences were `2.73e-12 eV` in energy
 and `4.44e-15 eV/A` in force. A fresh float32 static-6 AOTI export loaded in
 LAMMPS `mff/torch`; LAMMPS `pe=-6633.036` matched the Python checkpoint energy
@@ -233,7 +233,7 @@ conversion.
 
 ## Long-Range Interactions (Electrostatics and Dispersion)
 
-Beyond the message-passing cutoff, MACE-ICTD provides two complementary
+Beyond the message-passing cutoff, MACE-ICTC provides two complementary
 long-range channels. Both are differentiable and trained end-to-end from the
 same energy/force/stress losses — each module is initialized near zero, so
 enabling it starts close to the short-range model and learns the correction.
@@ -248,7 +248,7 @@ the final invariant descriptor, with periodic or slab boundaries and either a
 direct k-space sum or an FFT mesh backend:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 64 --lmax 2 --num-interaction 2 \
   --long-range-mode reciprocal-spectral-v1 \
@@ -270,12 +270,12 @@ learned scalar source channels.
 
 A many-body dispersion term evaluated by matrix-free stochastic Lanczos
 quadrature (no explicit eigendecomposition). The atomic polarizability is either
-an isotropic scalar or an **anisotropic 3x3 tensor** built from the ICTD `l=2`
+an isotropic scalar or an **anisotropic 3x3 tensor** built from the ICTC `l=2`
 features, which keeps the dispersion energy rotationally equivariant and uses the
-ICTD representation directly:
+ICTC representation directly:
 
 ```bash
-python -m mace_ictd.cli.train \
+python -m mace_ictc.cli.train \
   --data-dir DATA \
   --channels 64 --lmax 2 --num-interaction 2 \
   --long-range-dispersion-mode mbd-slq \
@@ -309,7 +309,7 @@ terms to an already trained MACE checkpoint.
 ASE:
 
 ```python
-from mace_ictd.evaluation.calculator import MyE3NNCalculator
+from mace_ictc.evaluation.calculator import MyE3NNCalculator
 
 atoms.calc = MyE3NNCalculator(checkpoint="model.pth", device="cuda")
 ```
@@ -317,7 +317,7 @@ atoms.calc = MyE3NNCalculator(checkpoint="model.pth", device="cuda")
 AOTInductor:
 
 ```bash
-python -m mace_ictd.cli.export_aoti_core \
+python -m mace_ictc.cli.export_aoti_core \
   --checkpoint model.pth \
   --elements H,C,N,O \
   --out model.pt2 \
@@ -348,17 +348,17 @@ Representative RTX 4090 results are shown below. They are meant to summarize
 the observed regimes, not replace the full artifact tables.
 
 - Isolated tensor product, FP32, `C=64`, `E=100k`, forward+backward:
-  compiled ICTD is `45.5 ms` at `(L_h,L_e)=(2,2)` versus e3nn `50.8 ms`
-  and cartnn `62.5 ms`; at `(3,3)`, compiled ICTD is `128.5 ms` versus
+  compiled ICTC is `45.5 ms` at `(L_h,L_e)=(2,2)` versus e3nn `50.8 ms`
+  and cartnn `62.5 ms`; at `(3,3)`, compiled ICTC is `128.5 ms` versus
   e3nn `174.7 ms`, while cartnn OOMs.
 - Whole-model synthetic training, `lmax=max_ell=1`, 8192 atoms, avg degree 16:
-  `ICTD+cuEq compiled` reaches `46.3 ms/step`, about `1.9x` faster than
+  `ICTC+cuEq compiled` reaches `46.3 ms/step`, about `1.9x` faster than
   MACE e3nn (`89.0 ms`) and slower than native MACE cuEq (`36.5 ms`).
-- Whole-model synthetic inference, same setting: `ICTD+cuEq compiled` reaches
+- Whole-model synthetic inference, same setting: `ICTC+cuEq compiled` reaches
   `15.3 ms/step`, about `1.5x` faster than MACE e3nn (`22.6 ms`) and slightly
   faster than native MACE cuEq (`16.9 ms`).
 - Matched 300-epoch training runs on revised benzene/ethanol/aspirin and Cheng
-  water show lower final force RMSE for ICTD modes than for the matched MACE
+  water show lower final force RMSE for ICTC modes than for the matched MACE
   e3nn/cuEq baselines under the archived protocol. This is a controlled
   protocol comparison, not a universal accuracy claim.
 
@@ -385,7 +385,7 @@ optimizer settings.
 
 The repository contains tests and benchmark records for:
 
-- ICTD/e3nn frame correspondence;
+- ICTC/e3nn frame correspondence;
 - converted native-MACE energy and force agreement for supported models;
 - rotation invariance/equivariance checks;
 - fused contraction agreement against reference contraction paths;
@@ -393,21 +393,21 @@ The repository contains tests and benchmark records for:
 - long-MD checkpoint-correspondence diagnostics for selected models.
 
 The strongest exactness statement is for the supported MACE correspondence path:
-compatible native MACE checkpoints can be represented in MACE-ICTD with the same
+compatible native MACE checkpoints can be represented in MACE-ICTC with the same
 energy/force behavior up to expected floating-point tolerances. This should not
 be read as a guarantee for arbitrary MACE forks, unsupported model structures,
-or every possible ICTD-native experimental backend.
+or every possible ICTC-native experimental backend.
 
 ## Repository Layout
 
 ```text
-MACE-ICTD/
-  mace_ictd/
+MACE-ICTC/
+  mace_ictc/
     cli/                 # training, conversion, export, LAMMPS helpers
     data/                # preprocessing, H5 datasets, batching
     evaluation/          # ASE calculator wrappers
     interfaces/          # checkpoint and deployment wrappers
-    models/              # ICTD model, irreps, products, radial, long-range
+    models/              # ICTC model, irreps, products, radial, long-range
     training/            # ForceTrainer and make_fx compile helpers
     utils/               # graph, scatter, config, checkpoint metadata
   lammps_user_mfftorch/  # LAMMPS USER-MFFTORCH package
@@ -417,8 +417,8 @@ MACE-ICTD/
 
 ## Citation
 
-If you use MACE-ICTD, cite the Zenodo DOI:
+If you use MACE-ICTC, cite the Zenodo DOI:
 
 ```text
-MACE-ICTD DOI: 10.5281/zenodo.20690950
+MACE-ICTC DOI: 10.5281/zenodo.20690950
 ```

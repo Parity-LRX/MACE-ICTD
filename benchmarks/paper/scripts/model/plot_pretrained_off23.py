@@ -90,7 +90,7 @@ def main() -> None:
     ax = axes[0, 0]
     add_panel_label(ax, "a")
     ax.plot(edges, native_ms, marker="o", color=BLUE, label="native MACE")
-    ax.plot(edges, ictd_ms, marker="s", color=ORANGE, label="converted ICTD")
+    ax.plot(edges, ictd_ms, marker="s", color=ORANGE, label="converted ICTC")
     for x, y, n in zip(edges, native_ms, atoms):
         ax.annotate(f"{n} atoms", (x, y), textcoords="offset points", xytext=(3, 5), fontsize=7.2)
     style_axis(ax, ylabel="fwd+force time (ms)", xlabel="Directed edges")
@@ -105,7 +105,7 @@ def main() -> None:
     ax.axhline(3e-3, color="#777777", linestyle="--", linewidth=0.8, label="FP32 export tol")
     style_axis(ax, ylabel="relative difference", xlabel="Atoms at 50 directed neighbors", logy=True)
     ax.legend(frameon=False, loc="best")
-    ax.set_title("native MACE vs converted ICTD")
+    ax.set_title("native MACE vs converted ICTC")
 
     ax = axes[1, 0]
     add_panel_label(ax, "c")
@@ -136,7 +136,7 @@ def main() -> None:
     ax.set_title("LAMMPS mff/torch AOTI smoke")
 
     fig.suptitle(
-        "OFF23 small pretrained MACE to MACE-ICTD on RTX 4090",
+        "OFF23 small pretrained MACE to MACE-ICTC on RTX 4090",
         y=0.985,
         fontsize=11.5,
     )

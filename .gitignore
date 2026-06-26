@@ -15,9 +15,9 @@ dist/
 *.dylib
 
 # Precomputed ICTD Clebsch-Gordan / U-tensor cache (~47M of .pt blobs).
-# Regenerated on demand by mace_ictd.models.ictd_disk_cache.load_or_compute, so it is
+# Regenerated on demand by mace_ictc.models.ictd_disk_cache.load_or_compute, so it is
 # a build artifact, not source.
-mace_ictd/models/_ictd_cache/
+mace_ictc/models/_ictd_cache/
 
 # Model / run artifacts
 benchmark_results/

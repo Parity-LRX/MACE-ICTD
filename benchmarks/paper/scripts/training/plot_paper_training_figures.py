@@ -25,11 +25,11 @@ MODE_ORDER = [
 MODE_LABELS = {
     "mace_e3nn": "MACE e3nn",
     "mace_cueq": "MACE cuEq",
-    "ictd_bridge_u_eager": "ICTD eager",
-    "ictd_bridge_u_makefx": "ICTD compiled",
-    "ictd_cueq_makefx": "ICTD+cuEq compiled",
-    "ictd_bridge_u": "ICTD",
-    "ictd_cueq": "ICTD+cuEq",
+    "ictd_bridge_u_eager": "ICTC eager",
+    "ictd_bridge_u_makefx": "ICTC compiled",
+    "ictd_cueq_makefx": "ICTC+cuEq compiled",
+    "ictd_bridge_u": "ICTC",
+    "ictd_cueq": "ICTC+cuEq",
 }
 
 MODE_COLORS = {
@@ -318,7 +318,7 @@ def plot_md_parity(summary_json: Path, out_stem: Path) -> None:
     axes[1].set_yscale("log")
     axes[1].set_ylabel("Max trajectory RMS position error (A)")
     axes[2].bar(x - 0.16, df["native_ms_per_step_including_eval"], width=0.32, color="#4C78A8", label="native")
-    axes[2].bar(x + 0.16, df["ictd_ms_per_step_including_eval"], width=0.32, color="#E45756", label="ICTD")
+    axes[2].bar(x + 0.16, df["ictd_ms_per_step_including_eval"], width=0.32, color="#E45756", label="ICTC")
     axes[2].set_ylabel("ms per MD step")
     axes[2].legend(
         frameon=False,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run native-MACE vs MACE-ICTD MD parity checks for MACE-OFF23.
+"""Run native-MACE vs MACE-ICTC MD parity checks for MACE-OFF23.
 
 The script has engine-specific entry points because the historical OFF23 pickle
-needs an old e3nn runtime for native MACE, while MACE-ICTD runs in the current
+needs an old e3nn runtime for native MACE, while MACE-ICTC runs in the current
 environment.
 """
 
@@ -260,8 +260,8 @@ def run_native(args: argparse.Namespace) -> None:
 
 def run_ictd(args: argparse.Namespace) -> None:
     import torch
-    from mace_ictd.evaluation.calculator import MyE3NNCalculator
-    from mace_ictd.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
+    from mace_ictc.evaluation.calculator import MyE3NNCalculator
+    from mace_ictc.interfaces.lammps_mliap import LAMMPS_MLIAP_MFF
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -331,7 +331,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=None, help="override the default step count for all selected cases")
     parser.add_argument("--record-stride", type=int, default=1, help="save/evaluate every N integration steps")
     parser.add_argument("--mace-model", default="/home/ylzhang/.cache/mace/MACE-OFF23_small.model")
-    parser.add_argument("--ictd-checkpoint", default="/tmp/mace_ictd_pretrained/off23_small_ictd_bridge_u_float64.pth")
+    parser.add_argument("--ictd-checkpoint", default="/tmp/mace_ictc_pretrained/off23_small_ictd_bridge_u_float64.pth")
     parser.add_argument("--elements", default="H,C,N,O,F,P,S,Cl,Br,I")
     args = parser.parse_args()
     if args.engine == "native":

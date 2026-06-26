@@ -1,6 +1,6 @@
 // Task 5/5 (DRAFT -- pending build+verify on the 4090): C++ many-body-dispersion (MBD) solver for
 // USER-MFFTORCH, sharing the cuFFT reciprocal BACKEND with the scalar electrostatics but NOT the
-// physics. Mirrors the validated Python (mace_ictd/models/mbd.py + reciprocal_backend.py):
+// physics. Mirrors the validated Python (mace_ictc/models/mbd.py + reciprocal_backend.py):
 //
 //   E_MBD = 1/2 Tr[sqrt C] - 3/2 sum_i omega_i,   C_pq = w_i^2 d_pq + (1-d) w_i w_j sqrt(a_i a_j) T_ij^LR
 //

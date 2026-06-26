@@ -27,7 +27,7 @@
 | CMake | ≥ 3.20 |
 | C++ 编译器 | GCC 7+ 或 Clang，支持 C++17 |
 | CUDA | 11+（与 PyTorch/LibTorch 版本匹配） |
-| Python | 3.9+（用于 MACE-ICTD 导出 `.pt2` / `core.pt`） |
+| Python | 3.9+（用于 MACE-ICTC 导出 `.pt2` / `core.pt`） |
 
 ### 1.2 Python 环境
 
@@ -227,7 +227,7 @@ build-mfftorch/lmp
 AOTInductor `.pt2` core。TorchScript `core.pt` 路径仍可用于 legacy LibTorch
 部署，也适合调试导出签名和数值差异。
 
-### 7.1 从 MACE-ICTD checkpoint 导出 `.pt2`
+### 7.1 从 MACE-ICTC checkpoint 导出 `.pt2`
 
 ```bash
 mff-export-aoti \
@@ -265,12 +265,12 @@ mff-export-aoti \
 
 ### 7.2 从原生 MACE 预训练模型导出
 
-先把原生 `mace-torch` `ScaleShiftMACE` 对象转成 MACE-ICTD checkpoint：
+先把原生 `mace-torch` `ScaleShiftMACE` 对象转成 MACE-ICTC checkpoint：
 
 ```bash
 mff-convert-mace \
   --mace-model /path/to/mace.model \
-  --out mace_ictd.pth \
+  --out mace_ictc.pth \
   --product-backend ictd-bridge-u \
   --dtype float64 \
   --device cpu
@@ -282,7 +282,7 @@ mff-convert-mace \
 
 ```bash
 mff-export-aoti \
-  --checkpoint mace_ictd_f32.pth \
+  --checkpoint mace_ictc_f32.pth \
   --elements H,C,N,O,F,P,S,Cl,Br,I \
   --atoms 6 \
   --degree 5 \
@@ -290,7 +290,7 @@ mff-export-aoti \
   --dtype float32 \
   --device cuda \
   --embed-e0 \
-  --out mace_ictd_static6.pt2
+  --out mace_ictc_static6.pt2
 ```
 
 ### 7.3 Legacy TorchScript `core.pt`
@@ -574,11 +574,11 @@ export LD_LIBRARY_PATH="$(python -c 'import os, torch; print(os.path.join(os.pat
 
 这里 LAMMPS `fmax` 是最大绝对力分量。Python 侧应比较 `max(abs(forces))`，不要比较逐原子力向量范数最大值。
 
-### 9.3 原生 MACE 到 ICTD 的数值对应
+### 9.3 原生 MACE 到 ICTC 的数值对应
 
 转换桥接本身应先在 Python 中验证，再进入 LAMMPS。OFF23 small 的 float64 验证记录为：
 
-- native `mace-torch` vs converted ICTD，苯 same-frame 轨迹；
+- native `mace-torch` vs converted ICTC，苯 same-frame 轨迹；
 - 最大能量绝对差：`2.73e-12 eV`；
 - 最大力分量差：`4.44e-15 eV/A`。
 
@@ -629,16 +629,16 @@ LAMMPS-vs-Python，因为编译器 lowering 会改变浮点运算顺序。
 ## 11. 附录：目录结构速览
 
 ```
-MACE-ICTD/
+MACE-ICTC/
 ├── lammps_user_mfftorch/
 │   ├── src/USER-MFFTORCH/          # 源码
 │   ├── cmake/Modules/Packages/USER-MFFTORCH.cmake
 │   ├── cmake/Packages/USER-MFFTORCH.cmake  # 部分版本
 │   ├── examples/
 │   └── docs/BUILD_AND_RUN.md       # 本文档
-├── mace_ictd/
+├── mace_ictc/
 │   └── cli/
-│       ├── convert_mace.py          # 原生 MACE -> MACE-ICTD
+│       ├── convert_mace.py          # 原生 MACE -> MACE-ICTC
 │       ├── export_aoti_core.py      # 导出 .pt2
 │       └── export_libtorch_core.py  # legacy TorchScript core
 └── scripts/

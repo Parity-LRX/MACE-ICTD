@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyze MD17 apple-to-apple training convergence logs.
 
-The raw MACE-ICTD and mace-torch logs report comparable validation RMSE values
+The raw MACE-ICTC and mace-torch logs report comparable validation RMSE values
 but not comparable scalar validation losses. This script therefore extracts only
 energy and force RMSE curves, computes per-run convergence metrics, and aggregates
 them by dataset and mode.
@@ -286,7 +286,7 @@ def write_markdown(path: Path, run_rows: list[dict[str, object]], agg_rows: list
         "# MD17 convergence analysis",
         "",
         "All force RMSE values are in eV/A and all energy RMSE values are in eV/atom.",
-        "Scalar validation losses are intentionally not compared because MACE-ICTD and mace-torch log different internal loss normalizations.",
+        "Scalar validation losses are intentionally not compared because MACE-ICTC and mace-torch log different internal loss normalizations.",
         "Partial rows are included so long-running jobs can be monitored before all modes finish.",
         "",
         "## Per-run summary",
@@ -380,9 +380,9 @@ def plot_curves(curve_rows: list[dict[str, object]], out_dir: Path) -> None:
         "mace_cueq": "#f58518",
     }
     labels = {
-        "ictd_bridge_u_eager": "ICTD eager",
-        "ictd_bridge_u_makefx": "ICTD compiled",
-        "ictd_cueq_makefx": "ICTD+cuEq compiled",
+        "ictd_bridge_u_eager": "ICTC eager",
+        "ictd_bridge_u_makefx": "ICTC compiled",
+        "ictd_cueq_makefx": "ICTC+cuEq compiled",
         "mace_e3nn": "MACE e3nn",
         "mace_cueq": "MACE cuEq",
     }

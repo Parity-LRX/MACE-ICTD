@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Operator-level throughput benchmark: MACE-ICTD ICTD product vs cartnn Cartesian
+"""Operator-level throughput benchmark: MACE-ICTC ICTC product vs cartnn Cartesian
 tensor product (and e3nn spherical TP as the MACE-native reference).
 
 The *matched operator* is the equivariant tensor product that couples a hidden node
@@ -8,7 +8,7 @@ feature (degrees 0..hidden_lmax, C channels) with the edge angular embedding
 MACE convolution tensor product, evaluated on identical (l1,l2,l3) natural-parity paths
 on all three backends:
 
-  backend=ictd   : mace_ictd EdgeWeightedPathPreservingTensorProduct  (ICTD 2l+1 basis)
+  backend=ictd   : mace_ictc EdgeWeightedPathPreservingTensorProduct  (ICTC 2l+1 basis)
   backend=cartnn : cartnn.o3.TensorProduct driven by cartesian_3j     (full 3**l Cartesian)
   backend=e3nn   : e3nn.o3.TensorProduct driven by wigner_3j          (spherical 2l+1; reference)
 
@@ -36,10 +36,10 @@ from e3nn import o3 as e3o3
 import cartnn
 from cartnn import o3 as co3
 
-from mace_ictd.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
-from mace_ictd.models.pure_cartesian_ictd_fix import _tp_allowed_paths_from_target_lmax
+from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
+from mace_ictc.models.pure_cartesian_ictd_fix import _tp_allowed_paths_from_target_lmax
 
-ICTD_URL = "local /home/ylzhang/lrx/MACE-ICTD (== github MACE-ICTD); local git 414aa25"
+ICTD_URL = "local /home/ylzhang/lrx/MACE-ICTC (== github MACE-ICTC); local git 414aa25"
 ICTD_COMMIT = "414aa25"
 CARTNN_URL = "https://github.com/xvzemin/cartnn"
 CARTNN_COMMIT = "4d0dc381ffe76d62ccddb5cf8ab5030b270a5869"
@@ -53,8 +53,8 @@ CSV_COLUMNS = [
     "peak_mem_gb", "status", "error", "notes",
 ]
 
-SEMEQ_ICTD = ("operator-level comparable workload: ICTD conv tensor product in the 2l+1 "
-              "irreducible-Cartesian (ICTD) basis; same (l1,l2,l3) natural-parity path set "
+SEMEQ_ICTD = ("operator-level comparable workload: ICTC conv tensor product in the 2l+1 "
+              "irreducible-Cartesian (ICTC) basis; same (l1,l2,l3) natural-parity path set "
               "and per-edge weight count as cartnn/e3nn")
 SEMEQ_CARTNN = ("operator-level comparable workload: cartnn ICTP via cartesian_3j in the FULL "
                 "3**l Cartesian layout; same (l1,l2,l3) path set as ictd/e3nn but more numbers "
@@ -71,7 +71,7 @@ def build_paths(hidden_lmax: int, max_ell: int, target_lmax: int):
     return [tuple(p) for p in _tp_allowed_paths_from_target_lmax(hidden_lmax, max_ell, target_lmax)]
 
 
-# ---------------------------------------------------------------- ICTD operator
+# ---------------------------------------------------------------- ICTC operator
 def build_ictd(hidden_lmax, max_ell, target_lmax, C, dtype, device):
     paths = build_paths(hidden_lmax, max_ell, target_lmax)
     L = max(hidden_lmax, max_ell, target_lmax)

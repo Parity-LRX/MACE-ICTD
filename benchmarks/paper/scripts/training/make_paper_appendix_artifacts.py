@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 
 
-REPO = Path("/Users/sara/Desktop/code/MACE-ICTD")
-PAPER = Path("/Users/sara/Desktop/code/mace_ictd_paper")
+REPO = Path("/Users/sara/Desktop/code/MACE-ICTC")
+PAPER = Path("/Users/sara/Desktop/code/mace_ictc_paper")
 SUMMARY_DIR = REPO / "benchmarks/paper/results/training/paper_training_summary_20260618"
 PAPER_ARTIFACT_TRAIN = PAPER / "benchmark_artifacts/results/training"
 PAPER_ARTIFACT_FIG = PAPER / "benchmark_artifacts/figures"
@@ -27,11 +27,11 @@ LARGE_MD_DIR = REPO / "benchmarks/paper/results/model/md_parity_off23_large_1000
 MODE_LABELS = {
     "mace_e3nn": "MACE e3nn",
     "mace_cueq": "MACE cuEq",
-    "ictd_bridge_u_eager": "ICTD eager",
-    "ictd_bridge_u_makefx": "ICTD compiled",
-    "ictd_cueq_makefx": "ICTD+cuEq compiled",
-    "ictd_bridge_u": "ICTD",
-    "ictd_cueq": "ICTD+cuEq",
+    "ictd_bridge_u_eager": "ICTC eager",
+    "ictd_bridge_u_makefx": "ICTC compiled",
+    "ictd_cueq_makefx": "ICTC+cuEq compiled",
+    "ictd_bridge_u": "ICTC",
+    "ictd_cueq": "ICTC+cuEq",
 }
 
 DATASET_LABELS = {
@@ -325,11 +325,11 @@ def make_md_tables(summary: pd.DataFrame) -> None:
         r"\scriptsize",
         r"\setlength{\tabcolsep}{3pt}",
         r"\renewcommand{\arraystretch}{1.08}",
-        r"\caption{Long-MD trajectory-property summary for native MACE and MACE-ICTD. Energy drift is the final total-energy change per atom over 10000 velocity-Verlet steps and is reported in meV atom$^{-1}$.}",
+        r"\caption{Long-MD trajectory-property summary for native MACE and MACE-ICTC. Energy drift is the final total-energy change per atom over 10000 velocity-Verlet steps and is reported in meV atom$^{-1}$.}",
         r"\label{tab:appendix-md-trajectory-properties}",
         r"\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.17\textwidth}C{0.06\textwidth}C{0.07\textwidth}C{0.125\textwidth}C{0.125\textwidth}C{0.14\textwidth}C{0.14\textwidth}@{}}",
         r"\toprule",
-        r"\multicolumn{1}{c}{System} & Atoms & Frames & $\bar T_{\mathrm{native}}$ (K) & $\bar T_{\mathrm{ICTD}}$ (K) & Native drift & ICTD drift \\",
+        r"\multicolumn{1}{c}{System} & Atoms & Frames & $\bar T_{\mathrm{native}}$ (K) & $\bar T_{\mathrm{ICTC}}$ (K) & Native drift & ICTC drift \\",
         r"\midrule",
     ]
     resid_lines = [
@@ -338,11 +338,11 @@ def make_md_tables(summary: pd.DataFrame) -> None:
         r"\scriptsize",
         r"\setlength{\tabcolsep}{2.2pt}",
         r"\renewcommand{\arraystretch}{1.08}",
-        r"\caption{Long-MD checkpoint-correspondence residuals and wall-clock records. Same-frame energy errors are in meV atom$^{-1}$, force RMS values are in eV~\AA$^{-1}$, and trajectory position residuals are in \AA. Same-frame quantities compare ICTD evaluations on native MACE frames; trajectory residuals compare independently integrated native and ICTD trajectories.}",
+        r"\caption{Long-MD checkpoint-correspondence residuals and wall-clock records. Same-frame energy errors are in meV atom$^{-1}$, force RMS values are in eV~\AA$^{-1}$, and trajectory position residuals are in \AA. Same-frame quantities compare ICTC evaluations on native MACE frames; trajectory residuals compare independently integrated native and ICTC trajectories.}",
         r"\label{tab:appendix-md-correspondence-properties}",
         r"\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.20\textwidth}C{0.16\textwidth}C{0.16\textwidth}C{0.16\textwidth}C{0.13\textwidth}C{0.13\textwidth}@{}}",
         r"\toprule",
-        r"\multicolumn{1}{c}{System} & Max $|\Delta E|$/atom & Max force RMS & Max RMS $\Delta r$ & Native ms/step & ICTD ms/step \\",
+        r"\multicolumn{1}{c}{System} & Max $|\Delta E|$/atom & Max force RMS & Max RMS $\Delta r$ & Native ms/step & ICTC ms/step \\",
         r"\midrule",
     ]
     for _, row in summary.iterrows():

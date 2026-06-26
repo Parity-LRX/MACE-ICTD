@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # Continue the average-E0 apple-to-apple rMD17 ethanol benchmark from the
-# 100-epoch checkpoints to epoch 300. ICTD resumes model + optimizer state from
-# the MACE-ICTD checkpoint. MACE uses mace-torch --restart_latest after copying
+# 100-epoch checkpoints to epoch 300. ICTC resumes model + optimizer state from
+# the MACE-ICTC checkpoint. MACE uses mace-torch --restart_latest after copying
 # the epoch-100-run checkpoint into the new run tag.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTD}"
+REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
-DATA="${DATA_DIR:-/tmp/mace_ictd_public_md17/revised_ethanol}"
-OLD_OUT="${OLD_OUT:-/tmp/mace_ictd_train_apple100_maceinit_average_e0_20260617_002357}"
-OUT="${OUT_ROOT:-/tmp/mace_ictd_train_apple300_maceinit_average_e0_from100_$(date +%Y%m%d_%H%M%S)}"
+DATA="${DATA_DIR:-/tmp/mace_ictc_public_md17/revised_ethanol}"
+OLD_OUT="${OLD_OUT:-/tmp/mace_ictc_train_apple100_maceinit_average_e0_20260617_002357}"
+OUT="${OUT_ROOT:-/tmp/mace_ictc_train_apple300_maceinit_average_e0_from100_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "${OUT}/logs" "${OUT}/checkpoints" "${OUT}/models" "${OUT}/results" "${OUT}/commands"
 
@@ -37,7 +37,7 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 AVG_NEIGHBORS="${AVG_NEIGHBORS:-8.0}"
 READOUT_HIDDEN="${READOUT_HIDDEN:-64}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-10.0}"
-source /tmp/mace_ictd_average_e0.env
+source /tmp/mace_ictc_average_e0.env
 
 IFS=',' read -r -a SEEDS_ARR <<< "${SEEDS_CSV}"
 IFS=',' read -r -a MODES_ARR <<< "${MODES_CSV}"
@@ -58,7 +58,7 @@ cat > "${OUT}/metadata.json" <<EOF
   "architecture": {"channels": ${CHANNELS}, "hidden_lmax": ${HIDDEN_LMAX}, "max_ell": ${MAX_ELL}, "num_interactions": ${NUM_INTERACTIONS}, "correlation": ${CORRELATION}, "readout_hidden_channels": ${READOUT_HIDDEN}, "first_layer_self_connection": true, "use_reduced_cg": true},
   "radial": {"type": "bessel", "num_basis": 8, "polynomial_cutoff_p": 6, "r_max": ${R_MAX}},
   "scaling": {"mode": "std_scaling", "avg_num_neighbors": ${AVG_NEIGHBORS}, "e0_keys": "${E0_KEYS}", "e0_vals": "${E0_VALS}", "mace_e0s": "${MACE_E0S}"},
-  "note": "Continuation from 100-epoch checkpoints. ICTD checkpoints contain optimizer/global_step and are resumed with --resume-training-state. MACE checkpoints are resumed with --restart_latest after copying the previous run checkpoint to the new tag."
+  "note": "Continuation from 100-epoch checkpoints. ICTC checkpoints contain optimizer/global_step and are resumed with --resume-training-state. MACE checkpoints are resumed with --restart_latest after copying the previous run checkpoint to the new tag."
 }
 EOF
 
@@ -167,19 +167,19 @@ for raw_seed in "${SEEDS_ARR[@]}"; do
         old_ckpt="${OLD_OUT}/checkpoints/${old_job}.pth"
         test -f "${old_ckpt}"
         mapfile -t flags < <(ictd_common_flags ictd-bridge-u --seed "${seed}" --resume-checkpoint "${old_ckpt}" --resume-training-state --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       ictd_bridge_u_makefx)
         old_ckpt="${OLD_OUT}/checkpoints/${old_job}.pth"
         test -f "${old_ckpt}"
         mapfile -t flags < <(ictd_common_flags ictd-bridge-u --seed "${seed}" --resume-checkpoint "${old_ckpt}" --resume-training-state --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       ictd_cueq_makefx)
         old_ckpt="${OLD_OUT}/checkpoints/${old_job}.pth"
         test -f "${old_ckpt}"
         mapfile -t flags < <(ictd_common_flags cueq --seed "${seed}" --resume-checkpoint "${old_ckpt}" --resume-training-state --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max --checkpoint "${OUT}/checkpoints/${job}.pth" --log-interval 200)
-        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictd.cli.train "${flags[@]}"
+        run_logged "${job}" env PYTHONPATH="${REPO}:${MACE}:${PYTHONPATH:-}" "${PY}" -m mace_ictc.cli.train "${flags[@]}"
         ;;
       mace_e3nn)
         copy_mace_checkpoint "${old_job}" "${job}" "${seed}" | tee -a "${OUT}/status.log"

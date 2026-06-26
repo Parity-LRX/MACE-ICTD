@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare public MD17/rMD17 subsets for MACE and MACE-ICTD training.
+"""Prepare public MD17/rMD17 subsets for MACE and MACE-ICTC training.
 
 Outputs, per molecule:
   - train.extxyz / val.extxyz / test.extxyz for mace-torch
-  - processed_train.h5 / processed_val.h5 / processed_test.h5 for MACE-ICTD
+  - processed_train.h5 / processed_val.h5 / processed_test.h5 for MACE-ICTC
   - split_indices.npz and metadata.json for auditability
 
 PyG MD17 labels are kcal/mol and kcal/mol/Angstrom. This script converts them

@@ -1661,7 +1661,7 @@ z
    </g>
   </g>
   <g id="text_16">
-   <!-- RTX 4090, FP32, OFF23-small, fixed 50 directed edges/atom. Native MACE modes used isolated e3nn 0.4.4 for old OFF pickle compatibility; ICTD modes used current MACE-ICTD. -->
+   <!-- RTX 4090, FP32, OFF23-small, fixed 50 directed edges/atom. Native MACE modes used isolated e3nn 0.4.4 for old OFF pickle compatibility; ICTD modes used current MACE-ICTC. -->
    <g style="fill: #333333" transform="translate(7.2 229.9) scale(0.072 -0.072)">
     <defs>
      <path id="DejaVuSans-52" d="M 2841 2188 

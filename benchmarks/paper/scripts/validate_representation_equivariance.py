@@ -374,7 +374,7 @@ def validate_orbital_harmonics() -> Dict[str, float | str]:
         max_abs = max(max_abs, float(diff.abs().max().item()))
         max_rel = max(max_rel, _rel(diff, rhs))
     return {
-        "test": "ICTD orbital harmonic values l<=3",
+        "test": "ICTC orbital harmonic values l<=3",
         "max_abs": max_abs,
         "max_rel": max_rel,
         "detail": "ordinary O3 parent carrier used by double-cover backend",

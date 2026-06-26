@@ -5,7 +5,7 @@ set -euo pipefail
 # MD17 training logs. This is log-only analysis and does not launch training.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTD}"
+REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 TARGET_EPOCH="${TARGET_EPOCH:-300}"
 
 if [[ "$#" -lt 1 ]]; then

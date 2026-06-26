@@ -1,7 +1,7 @@
 # Paper benchmark artifacts
 
 This directory contains the lightweight benchmark scripts, CSV/JSON summaries,
-logs, and SVG figures used by the MACE-ICTD technical report. It is intended to
+logs, and SVG figures used by the MACE-ICTC technical report. It is intended to
 make the reported numbers auditable without making the source repository carry
 large binary artifacts.
 
@@ -11,13 +11,13 @@ Release instead of committed to the repository. The local release bundle prepare
 for that purpose has been uploaded to the draft release:
 
 ```text
-https://github.com/Parity-LRX/MACE-ICTD/releases/tag/untagged-2f9a99e0bf462f646213
+https://github.com/Parity-LRX/MACE-ICTC/releases/tag/untagged-2f9a99e0bf462f646213
 ```
 
 Local copy:
 
 ```text
-/Users/sara/Desktop/code/MACE-ICTD_release_artifacts/mace-ictd-paper-benchmark-artifacts-20260618.tar.gz
+/Users/sara/Desktop/code/MACE-ICTC_release_artifacts/mace-ictc-paper-benchmark-artifacts-20260618.tar.gz
 sha256: e07bab682e78d0534e545e5211a936706535a0f763d3ac45c03a2321c2d33a13
 ```
 
@@ -83,14 +83,14 @@ workloads to expose backend throughput. The isolated operator benchmark fixes
 edge count, angular cutoffs, channel count, precision, and fusion level to
 compare angular coupling implementations. The matched training results fix a
 small-model protocol to compare parameterization and backend behavior, not to
-claim globally optimal MACE or MACE-ICTD hyperparameters.
+claim globally optimal MACE or MACE-ICTC hyperparameters.
 
 The cartnn records are reported at the isolated tensor-product level. cartnn
 provides an irreducible Cartesian-3j tensor-product runtime, but it is not an
 equivalent drop-in backend for the MACE higher-body symmetric contraction used
 in the whole-model benchmark. This is why the paper compares cartnn at the
 operator level and reports whole-model throughput only for native MACE and
-MACE-ICTD execution modes.
+MACE-ICTC execution modes.
 
 Large generated deployment artifacts such as AOTInductor `.pt2` packages,
 checkpoint files, PDF/PNG figure exports, and MD `.npz` trajectory arrays are

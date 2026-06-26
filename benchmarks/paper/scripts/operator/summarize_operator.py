@@ -2,7 +2,7 @@
 """Summarize the operator benchmark into operator_cartnn_vs_ictd_summary.md.
 
 Reads operator_cartnn_vs_ictd.csv (eager e3nn/cartnn/ictd) and, if present,
-operator_ictd_compiled.csv (torch.compile ICTD). Produces markdown tables + a
+operator_ictd_compiled.csv (torch.compile ICTC). Produces markdown tables + a
 carefully-scoped conclusions section (computed ratios, hedged language; no
 model-level or chemical-accuracy claims).
 """
@@ -56,10 +56,10 @@ L = []
 def w(s=""):
     L.append(s)
 
-w("# Operator benchmark: MACE-ICTD ICTD product vs cartnn Cartesian tensor product")
+w("# Operator benchmark: MACE-ICTC ICTC product vs cartnn Cartesian tensor product")
 w()
 w("**RTX 4090 (D), torch 2.7.1+cu128, e3nn 0.5.9, cartnn 0.5.8 @ 4d0dc38, "
-  "MACE-ICTD local git 414aa25. TF32 disabled.**")
+  "MACE-ICTC local git 414aa25. TF32 disabled.**")
 w()
 w("## What is being compared (and what is NOT)")
 w()
@@ -73,9 +73,9 @@ w("| backend | operator | basis / storage | fusion |")
 w("|---|---|---|---|")
 w("| `e3nn` (reference) | `e3nn.o3.TensorProduct` (wigner_3j) | spherical, `2l+1` | opt_einsum_fx codegen |")
 w("| `cartnn` | `cartnn.o3.TensorProduct` (cartesian_3j) | **full Cartesian, `3**l`** | opt_einsum_fx codegen |")
-w("| `ictd` | `EdgeWeightedPathPreservingTensorProduct` | irreducible-Cartesian (ICTD), `2l+1` | **eager** (Python per-path) |")
+w("| `ictd` | `EdgeWeightedPathPreservingTensorProduct` | irreducible-Cartesian (ICTC), `2l+1` | **eager** (Python per-path) |")
 if "ictd_compiled" in backends_present:
-    w("| `ictd_compiled` | same ICTD op under `torch.compile` | ICTD `2l+1` | torch.compile (deployed form) |")
+    w("| `ictd_compiled` | same ICTC op under `torch.compile` | ICTC `2l+1` | torch.compile (deployed form) |")
 w()
 w("**Caveats (do not over-read):**")
 w("- This is an *operator-level comparable workload*, **not** an exact apples-to-apples "
@@ -84,9 +84,9 @@ w("- This is an *operator-level comparable workload*, **not** an exact apples-to
 w("- cartnn ships **no symmetric-contraction operator** (the authors declined to implement ICTC), "
   "so the MACE symmetric contraction is **out of scope** here; only the binary tensor product is compared.")
 w("- `e3nn`/`cartnn` `TensorProduct` are **codegen-fused**; the bare `ictd` operator is timed in "
-  "**eager** mode (Python per-path overhead, dominant at small sizes). The deployed MACE-ICTD model "
+  "**eager** mode (Python per-path overhead, dominant at small sizes). The deployed MACE-ICTC model "
   "removes this via AOTI/`torch.compile` — see `ictd_compiled` below and the existing model-level "
-  "throughput benchmarks. Read `ictd` eager numbers as a lower bound on the deployed ICTD speed.")
+  "throughput benchmarks. Read `ictd` eager numbers as a lower bound on the deployed ICTC speed.")
 w("- No chemical-accuracy or model-level superiority is claimed or measured here.")
 w()
 
@@ -211,7 +211,7 @@ for dt in ("float32", "float64"):
             import statistics as st
             w(f"- **{dt} {mode}**: across all tested (config,channels,edges), eager `ictd` vs `cartnn` "
               f"total-time ratio (cartnn/ictd) median **{st.median(rs):.2f}×** "
-              f"(min {min(rs):.2f}×, max {max(rs):.2f}×); >1 ⇒ ICTD faster.")
+              f"(min {min(rs):.2f}×, max {max(rs):.2f}×); >1 ⇒ ICTC faster.")
         rc = avg_ratio(dt, mode, "ictd_compiled", "cartnn")
         if rc:
             import statistics as st
@@ -219,8 +219,8 @@ for dt in ("float32", "float64"):
               f"(min {min(rc):.2f}×, max {max(rc):.2f}×).")
 w()
 w("Interpretation guidance: cartnn's full `3**l` storage makes its per-edge work grow faster with "
-  "`max_ell` than the `2l+1` ICTD/e3nn layouts, which is the main structural difference these "
-  "numbers probe. Where eager ICTD trails, it is the eager per-path launch overhead, not the ICTD "
+  "`max_ell` than the `2l+1` ICTC/e3nn layouts, which is the main structural difference these "
+  "numbers probe. Where eager ICTC trails, it is the eager per-path launch overhead, not the ICTC "
   "algebra — compare the `ictd_compiled` row. e3nn is included only as the spherical MACE-native "
   "reference. None of this speaks to accuracy or to full-model performance.")
 
