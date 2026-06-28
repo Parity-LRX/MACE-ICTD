@@ -127,6 +127,7 @@ class ForceTrainer:
         # plumbing
         train_sampler=None,
         log_interval: int = 10,
+        evals_per_epoch: int = 1,
         checkpoint_path: str | None = None,
         extra_hparams: dict | None = None,
         distributed: bool = False,
@@ -202,6 +203,7 @@ class ForceTrainer:
         self.global_step = 0
         self.max_grad_norm = max_grad_norm
         self.log_interval = int(log_interval)
+        self.evals_per_epoch = max(1, int(evals_per_epoch))
         self.checkpoint_path = checkpoint_path
         self.train_sampler = train_sampler
         self.distributed = bool(distributed)
@@ -1227,6 +1229,10 @@ class ForceTrainer:
                "stress_loss": 0.0, "force_rmse": 0.0, "energy_rmse_avg": 0.0}
         t0 = time.time()
         seen = 0
+        _val_pts = set()
+        if self.evals_per_epoch > 1 and self.val_loader is not None:
+            for _k in range(1, self.evals_per_epoch):
+                _val_pts.add((n_batches * _k) // self.evals_per_epoch)
         for i, batch in enumerate(self.train_loader):
             if self._reached_max_steps():
                 break
@@ -1252,6 +1258,16 @@ class ForceTrainer:
                          epoch, self.global_step, i, n_batches, phase, float(out["total_loss"]),
                          float(out["energy_loss"]), float(out["force_loss"]), s,
                          float(out["force_rmse"]), lr)
+            if i in _val_pts:
+                _va = self._val_pass()
+                if self.main_process:
+                    log.info("epoch %d step %d MID-VAL loss=%.4f Frmse=%.4f Ermse=%.4f",
+                             epoch, self.global_step, _va["total_loss"], _va["force_rmse"], _va["energy_rmse_avg"])
+                    print(f"[epoch {epoch} step {self.global_step}] MID val loss={_va['total_loss']:.4f} "
+                          f"Frmse={_va['force_rmse']:.4f} Ermse={_va['energy_rmse_avg']:.4f}", flush=True)
+                if self._dist_ready():
+                    dist.barrier()
+                self.model.train()
         avg = self._reduce_epoch_metrics(run, seen)
         avg["time"] = time.time() - t0
         avg["steps"] = int(seen)

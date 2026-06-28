@@ -705,6 +705,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "so the warm-started backbone is not destabilized. See USER_MANUAL section 12.6.")
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--log-interval", type=int, default=10)
+    ap.add_argument("--evals-per-epoch", type=int, default=1,
+                    help="Validation passes per epoch (1=epoch-end only; 2=mid-epoch + end). "
+                         "Mid-epoch passes run on all ranks and barrier, so DDP stays in sync.")
     return ap
 
 
@@ -1080,6 +1083,7 @@ def main(argv=None):
         require_train_makefx_compile=bool(args.train_makefx_compile and args.product_backend == "cueq"),
         makefx_max_slots=args.makefx_max_slots,
         train_sampler=sampler, checkpoint_path=args.checkpoint, log_interval=args.log_interval,
+        evals_per_epoch=args.evals_per_epoch,
         extra_hparams=extra_hparams,
         distributed=ddp_info["enabled"],
         rank=ddp_info["rank"],
