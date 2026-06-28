@@ -7,7 +7,7 @@ set -euo pipefail
 # the epoch-100-run checkpoint into the new run tag.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
+REPO="${MACE_ICTC_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
 DATA="${DATA_DIR:-/tmp/mace_ictc_public_md17/revised_ethanol}"
 OLD_OUT="${OLD_OUT:-/tmp/mace_ictc_train_apple100_maceinit_average_e0_20260617_002357}"

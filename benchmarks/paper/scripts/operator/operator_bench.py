@@ -39,8 +39,8 @@ from cartnn import o3 as co3
 from mace_ictc.models.ictd_irreps import EdgeWeightedPathPreservingTensorProduct
 from mace_ictc.models.pure_cartesian_ictd_fix import _tp_allowed_paths_from_target_lmax
 
-ICTD_URL = "local /home/ylzhang/lrx/MACE-ICTC (== github MACE-ICTC); local git 414aa25"
-ICTD_COMMIT = "414aa25"
+ICTC_URL = "local /home/ylzhang/lrx/MACE-ICTC (== github MACE-ICTC); local git 414aa25"
+ICTC_COMMIT = "414aa25"
 CARTNN_URL = "https://github.com/xvzemin/cartnn"
 CARTNN_COMMIT = "4d0dc381ffe76d62ccddb5cf8ab5030b270a5869"
 E3NN_URL = "https://github.com/e3nn/e3nn"
@@ -53,7 +53,7 @@ CSV_COLUMNS = [
     "peak_mem_gb", "status", "error", "notes",
 ]
 
-SEMEQ_ICTD = ("operator-level comparable workload: ICTC conv tensor product in the 2l+1 "
+SEMEQ_ICTC = ("operator-level comparable workload: ICTC conv tensor product in the 2l+1 "
               "irreducible-Cartesian (ICTC) basis; same (l1,l2,l3) natural-parity path set "
               "and per-edge weight count as cartnn/e3nn")
 SEMEQ_CARTNN = ("operator-level comparable workload: cartnn ICTP via cartesian_3j in the FULL "
@@ -250,7 +250,7 @@ def main():
               f"mem={row['peak_mem_gb']} {row['error']}", flush=True)
 
     meta = dict(
-        ictd=(ICTD_URL, ICTD_COMMIT, "ictd_edge_weighted_path_tp", SEMEQ_ICTD),
+        ictd=(ICTC_URL, ICTC_COMMIT, "ictd_edge_weighted_path_tp", SEMEQ_ICTC),
         cartnn=(CARTNN_URL, CARTNN_COMMIT, "cartnn_cartesian_tensor_product", SEMEQ_CARTNN),
         e3nn=(E3NN_URL, E3NN_COMMIT, "e3nn_channelwise_tensor_product", SEMEQ_E3NN),
     )

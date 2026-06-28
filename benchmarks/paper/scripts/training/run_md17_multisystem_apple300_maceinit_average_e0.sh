@@ -7,7 +7,7 @@ set -euo pipefail
 # weights, average-E0 convention, and seeds.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
+REPO="${MACE_ICTC_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
 DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictc_public_md17}"
 OUT="${OUT_ROOT:-/tmp/mace_ictc_train_multisystem_apple300_maceinit_average_e0_$(date +%Y%m%d_%H%M%S)}"

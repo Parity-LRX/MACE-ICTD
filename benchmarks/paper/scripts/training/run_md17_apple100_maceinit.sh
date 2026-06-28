@@ -14,7 +14,7 @@ set -euo pipefail
 # trainability match the corresponding random ScaleShiftMACE model.
 
 PY="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
+REPO="${MACE_ICTC_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
 DATA="${DATA_DIR:-/tmp/mace_ictc_public_md17/revised_ethanol}"
 OUT="${OUT_ROOT:-/tmp/mace_ictc_train_apple100_maceinit_$(date +%Y%m%d_%H%M%S)}"

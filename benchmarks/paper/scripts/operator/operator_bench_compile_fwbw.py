@@ -24,8 +24,8 @@ from operator_bench import (
     CSV_COLUMNS,
     E3NN_COMMIT,
     E3NN_URL,
-    ICTD_COMMIT,
-    ICTD_URL,
+    ICTC_COMMIT,
+    ICTC_URL,
     build_eo3,
     build_ictd,
     cuda_sync,
@@ -34,7 +34,7 @@ from operator_bench import (
     eo3_make_inputs,
     free,
 )
-from operator_bench_aoti import FlatICTDTP, ictd_flat_inputs
+from operator_bench_aoti import FlatICTCTP, ictd_flat_inputs
 
 
 torch._dynamo.config.cache_size_limit = 256
@@ -42,8 +42,8 @@ torch._dynamo.config.cache_size_limit = 256
 
 META = {
     "ictd_compile_fwbw": (
-        ICTD_URL,
-        ICTD_COMMIT,
+        ICTC_URL,
+        ICTC_COMMIT,
         "ictd_tp_torchcompile_flat_fwbw",
         "ICTC flat-wrapper torch.compile tensor product, forward+backward",
     ),
@@ -176,7 +176,7 @@ def main():
             torch._dynamo.reset()
             try:
                 tp, paths = build_ictd(hidden_lmax, max_ell, target_lmax, args.channels, dtype, device)
-                flat = FlatICTDTP(tp, hidden_lmax, max_ell).to(device).train()
+                flat = FlatICTCTP(tp, hidden_lmax, max_ell).to(device).train()
                 with torch.no_grad():
                     flat(*ictd_flat_inputs(tp, hidden_lmax, max_ell, args.channels, 64, dtype, device))
                 cuda_sync(device)

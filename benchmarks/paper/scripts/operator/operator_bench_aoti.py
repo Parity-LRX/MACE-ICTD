@@ -19,7 +19,7 @@ from torch.export import Dim
 
 from operator_bench import (
     build_ictd, build_eo3, eo3_make_inputs, eo3_forward, cuda_sync, free,
-    ICTD_URL, ICTD_COMMIT, CARTNN_URL, CARTNN_COMMIT, E3NN_URL, E3NN_COMMIT, CSV_COLUMNS,
+    ICTC_URL, ICTC_COMMIT, CARTNN_URL, CARTNN_COMMIT, E3NN_URL, E3NN_COMMIT, CSV_COLUMNS,
 )
 from e3nn import o3 as e3o3
 from cartnn import o3 as co3
@@ -27,7 +27,7 @@ import torch._dynamo
 torch._dynamo.config.cache_size_limit = 256  # avoid cross-config recompile-limit fallback to eager
 
 
-class FlatICTDTP(torch.nn.Module):
+class FlatICTCTP(torch.nn.Module):
     """flat tensors <-> repo EdgeWeightedPathPreservingTensorProduct dict I/O (export-friendly)."""
     def __init__(self, tp, hidden_lmax: int, max_ell: int):
         super().__init__()
@@ -69,9 +69,9 @@ def time_fwd(call, inp, warmup, measured, device):
 
 
 META = {
-    "ictd_eager": (ICTD_URL, ICTD_COMMIT, "ictd_tp_eager", "ICTC eager (ref)"),
-    "ictd_compile": (ICTD_URL, ICTD_COMMIT, "ictd_tp_torchcompile", "ICTC torch.compile(flat wrapper)"),
-    "ictd_aoti": (ICTD_URL, ICTD_COMMIT, "ictd_tp_aoti", "ICTC AOTInductor (flat wrapper) = deployment fusion level"),
+    "ictd_eager": (ICTC_URL, ICTC_COMMIT, "ictd_tp_eager", "ICTC eager (ref)"),
+    "ictd_compile": (ICTC_URL, ICTC_COMMIT, "ictd_tp_torchcompile", "ICTC torch.compile(flat wrapper)"),
+    "ictd_aoti": (ICTC_URL, ICTC_COMMIT, "ictd_tp_aoti", "ICTC AOTInductor (flat wrapper) = deployment fusion level"),
     "e3nn": (E3NN_URL, E3NN_COMMIT, "e3nn_tp_fused", "e3nn codegen-fused TP (ref)"),
     "cartnn": (CARTNN_URL, CARTNN_COMMIT, "cartnn_tp_fused", "cartnn codegen-fused TP"),
 }
@@ -125,7 +125,7 @@ def main():
             torch._dynamo.reset()  # fresh compile state per (config,dtype): no eager-fallback taint
             try:
                 tp, paths = build_ictd(hl, me, target, C, dtype, device)
-                flat = FlatICTDTP(tp, hl, me).to(device).eval()
+                flat = FlatICTCTP(tp, hl, me).to(device).eval()
                 with torch.no_grad():  # WARM the lazy (device,dtype) cache with real tensors
                     _ = flat(*ictd_flat_inputs(tp, hl, me, C, 64, dtype, device))
                 cuda_sync(device)

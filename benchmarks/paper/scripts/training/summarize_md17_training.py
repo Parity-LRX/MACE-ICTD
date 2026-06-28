@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 
-ICTD_RE = re.compile(
+ICTC_RE = re.compile(
     r"\[epoch\s+(?P<epoch>\d+)\s+step\s+(?P<step>\d+)\s+\S+\]\s+"
     r"train loss=(?P<train_loss>[0-9.eE+-]+).*?\|\s+val loss=(?P<val_loss>[0-9.eE+-]+)\s+"
     r"Frmse=(?P<force_rmse>[0-9.eE+-]+)\s+Ermse=(?P<energy_rmse>[0-9.eE+-]+)"
@@ -53,7 +53,7 @@ def parse_log(path: Path) -> list[dict]:
     text = path.read_text(errors="replace")
     rows: list[dict] = []
     if mode.startswith("ictd_"):
-        for m in ICTD_RE.finditer(text):
+        for m in ICTC_RE.finditer(text):
             rows.append(
                 {
                     "dataset": dataset,

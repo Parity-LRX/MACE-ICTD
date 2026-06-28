@@ -17,7 +17,7 @@ import time
 import torch
 
 from operator_bench import (
-    CSV_COLUMNS, ICTD_URL, ICTD_COMMIT, build_ictd, ictd_make_inputs, ictd_loss,
+    CSV_COLUMNS, ICTC_URL, ICTC_COMMIT, build_ictd, ictd_make_inputs, ictd_loss,
     cuda_sync, free,
 )
 
@@ -95,7 +95,7 @@ def main():
                 tp, paths = build_ictd(hidden_lmax, max_ell, target_lmax, C, dtype, device)
                 npaths = len(paths)
             except Exception as exc:  # noqa
-                emit(backend="ictd_compiled", package_url=ICTD_URL, package_commit=ICTD_COMMIT,
+                emit(backend="ictd_compiled", package_url=ICTC_URL, package_commit=ICTC_COMMIT,
                      op_name="ictd_edge_weighted_path_tp_compiled", semantic_equivalence=SEMEQ,
                      hidden_lmax=hidden_lmax, max_ell=max_ell, correlation=2, channels=C, edges="",
                      dtype=dname, mode="build", status="error", error=f"build:{exc}"[:300])
@@ -124,7 +124,7 @@ def main():
                         total = fwd_ms + (bwd_ms if rg else 0.0)
                         eps = E / (total / 1e3) if total > 0 else 0.0
                         peak = torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else 0.0
-                        emit(backend="ictd_compiled", package_url=ICTD_URL, package_commit=ICTD_COMMIT,
+                        emit(backend="ictd_compiled", package_url=ICTC_URL, package_commit=ICTC_COMMIT,
                              op_name="ictd_edge_weighted_path_tp_compiled", semantic_equivalence=SEMEQ,
                              hidden_lmax=hidden_lmax, max_ell=max_ell, correlation=2, channels=C, edges=E,
                              dtype=dname, mode=mode, warmup=args.warmup + 5, measured=args.measured,
@@ -134,13 +134,13 @@ def main():
                         del inp, leaves; free()
                     except RuntimeError as exc:
                         msg = str(exc); status = "oom" if "out of memory" in msg.lower() else "error"
-                        emit(backend="ictd_compiled", package_url=ICTD_URL, package_commit=ICTD_COMMIT,
+                        emit(backend="ictd_compiled", package_url=ICTC_URL, package_commit=ICTC_COMMIT,
                              op_name="ictd_edge_weighted_path_tp_compiled", semantic_equivalence=SEMEQ,
                              hidden_lmax=hidden_lmax, max_ell=max_ell, correlation=2, channels=C, edges=E,
                              dtype=dname, mode=mode, status=status, error=f"{type(exc).__name__}:{msg}"[:300],
                              notes=base_note); free()
                     except Exception as exc:  # noqa
-                        emit(backend="ictd_compiled", package_url=ICTD_URL, package_commit=ICTD_COMMIT,
+                        emit(backend="ictd_compiled", package_url=ICTC_URL, package_commit=ICTC_COMMIT,
                              op_name="ictd_edge_weighted_path_tp_compiled", semantic_equivalence=SEMEQ,
                              hidden_lmax=hidden_lmax, max_ell=max_ell, correlation=2, channels=C, edges=E,
                              dtype=dname, mode=mode, status="error", error=f"{type(exc).__name__}:{exc}"[:300],

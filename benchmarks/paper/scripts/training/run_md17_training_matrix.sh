@@ -10,7 +10,7 @@ set -euo pipefail
 # Use prepare_md17_public.py to create this layout.
 
 PYTHON_BIN="${PYTHON_BIN:-/home/ylzhang/micromamba/envs/FSCETP/bin/python}"
-MACE_ICTD_REPO="${MACE_ICTD_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
+MACE_ICTC_REPO="${MACE_ICTC_REPO:-/home/ylzhang/lrx/MACE-ICTC}"
 MACE_TORCH_PATH="${MACE_TORCH_PATH:-/tmp/mace_torch_0_3_16}"
 DATA_ROOT="${DATA_ROOT:-/tmp/mace_ictc_public_md17}"
 OUT_ROOT="${OUT_ROOT:-/tmp/mace_ictc_public_md17_train_$(date +%Y%m%d_%H%M%S)}"
@@ -38,11 +38,11 @@ DTYPE="${DTYPE:-float32}"
 DEVICE="${DEVICE:-cuda}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-10.0}"
-ICTD_AMSGRAD="${ICTD_AMSGRAD:-1}"
-ICTD_USE_REDUCED_CG="${ICTD_USE_REDUCED_CG:-0}"
-ICTD_CONV_TP_SCALE_INIT="${ICTD_CONV_TP_SCALE_INIT:-none}"
-ICTD_FREEZE_CONV_TP_WEIGHT="${ICTD_FREEZE_CONV_TP_WEIGHT:-0}"
-ICTD_INTERACTION_INIT="${ICTD_INTERACTION_INIT:-identity}"
+ICTC_AMSGRAD="${ICTC_AMSGRAD:-1}"
+ICTC_USE_REDUCED_CG="${ICTC_USE_REDUCED_CG:-0}"
+ICTC_CONV_TP_SCALE_INIT="${ICTC_CONV_TP_SCALE_INIT:-none}"
+ICTC_FREEZE_CONV_TP_WEIGHT="${ICTC_FREEZE_CONV_TP_WEIGHT:-0}"
+ICTC_INTERACTION_INIT="${ICTC_INTERACTION_INIT:-identity}"
 
 RUN="${RUN:-0}"
 SMOKE="${SMOKE:-0}"
@@ -117,20 +117,20 @@ run_cmd() {
 IFS=',' read -r -a DATASET_ARR <<< "${DATASETS}"
 IFS=',' read -r -a MODE_ARR <<< "${MODES}"
 HIDDEN_IRREPS="$(hidden_irreps "${CHANNELS}" "${HIDDEN_LMAX}")"
-ICTD_OPT_FLAGS=()
-if [[ "${ICTD_AMSGRAD}" == "1" ]]; then
-  ICTD_OPT_FLAGS+=(--amsgrad)
+ICTC_OPT_FLAGS=()
+if [[ "${ICTC_AMSGRAD}" == "1" ]]; then
+  ICTC_OPT_FLAGS+=(--amsgrad)
 fi
 if [[ -n "${MAX_GRAD_NORM}" && "${MAX_GRAD_NORM}" != "0" ]]; then
-  ICTD_OPT_FLAGS+=(--max-grad-norm "${MAX_GRAD_NORM}")
+  ICTC_OPT_FLAGS+=(--max-grad-norm "${MAX_GRAD_NORM}")
 fi
-ICTD_CUEQ_FLAGS=()
-if [[ "${ICTD_USE_REDUCED_CG}" == "1" ]]; then
-  ICTD_CUEQ_FLAGS+=(--use-reduced-cg)
+ICTC_CUEQ_FLAGS=()
+if [[ "${ICTC_USE_REDUCED_CG}" == "1" ]]; then
+  ICTC_CUEQ_FLAGS+=(--use-reduced-cg)
 fi
-ICTD_PARAM_FLAGS=(--conv-tp-scale-init "${ICTD_CONV_TP_SCALE_INIT}" --interaction-init "${ICTD_INTERACTION_INIT}")
-if [[ "${ICTD_FREEZE_CONV_TP_WEIGHT}" == "1" ]]; then
-  ICTD_PARAM_FLAGS+=(--freeze-conv-tp-weight)
+ICTC_PARAM_FLAGS=(--conv-tp-scale-init "${ICTC_CONV_TP_SCALE_INIT}" --interaction-init "${ICTC_INTERACTION_INIT}")
+if [[ "${ICTC_FREEZE_CONV_TP_WEIGHT}" == "1" ]]; then
+  ICTC_PARAM_FLAGS+=(--freeze-conv-tp-weight)
 fi
 
 for dataset in "${DATASET_ARR[@]}"; do
@@ -149,7 +149,7 @@ for dataset in "${DATASET_ARR[@]}"; do
     job="${dataset}_${mode}_seed${SEED}_steps${MAX_STEPS}"
     case "${mode}" in
       ictd_bridge_u_eager)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTC_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \
@@ -161,13 +161,13 @@ for dataset in "${DATASET_ARR[@]}"; do
           --batch-size "${BATCH_SIZE}" --lr "${LR}" --min-lr "${MIN_LR}" --weight-decay "${WEIGHT_DECAY}" \
           --optimizer adamw --lr-scheduler exp --lr-scheduler-gamma 0.9993 --loss mse \
           --energy-weight "${ENERGY_WEIGHT}" --force-weight "${FORCE_WEIGHT}" --stress-weight 0 \
-          "${ICTD_PARAM_FLAGS[@]}" \
-          "${ICTD_OPT_FLAGS[@]}" \
+          "${ICTC_PARAM_FLAGS[@]}" \
+          "${ICTC_OPT_FLAGS[@]}" \
           --device "${DEVICE}" --dtype "${DTYPE}" --num-workers "${NUM_WORKERS}" \
           --checkpoint "${OUT_ROOT}/checkpoints/${job}.pth"
         ;;
       ictd_bridge_u_makefx)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTC_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \
@@ -179,27 +179,27 @@ for dataset in "${DATASET_ARR[@]}"; do
           --batch-size "${BATCH_SIZE}" --lr "${LR}" --min-lr "${MIN_LR}" --weight-decay "${WEIGHT_DECAY}" \
           --optimizer adamw --lr-scheduler exp --lr-scheduler-gamma 0.9993 --loss mse \
           --energy-weight "${ENERGY_WEIGHT}" --force-weight "${FORCE_WEIGHT}" --stress-weight 0 \
-          "${ICTD_PARAM_FLAGS[@]}" \
-          "${ICTD_OPT_FLAGS[@]}" \
+          "${ICTC_PARAM_FLAGS[@]}" \
+          "${ICTC_OPT_FLAGS[@]}" \
           --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max \
           --device "${DEVICE}" --dtype "${DTYPE}" --num-workers "${NUM_WORKERS}" \
           --checkpoint "${OUT_ROOT}/checkpoints/${job}.pth"
         ;;
       ictd_cueq_makefx)
-        run_cmd "${job}" env PYTHONPATH="${MACE_ICTD_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
+        run_cmd "${job}" env PYTHONPATH="${MACE_ICTC_REPO}:${PYTHONPATH:-}" "${PYTHON_BIN}" -m mace_ictc.cli.train \
           --data-dir "${data_dir}" --train-prefix train --val-prefix val \
           --channels "${CHANNELS}" --lmax "${HIDDEN_LMAX}" --max-ell "${MAX_ELL}" \
           --num-interaction "${NUM_INTERACTIONS}" --correlation "${CORRELATION}" \
           --invariant-channels "${CHANNELS}" \
-          --product-backend cueq --angular-basis e3nn "${ICTD_CUEQ_FLAGS[@]}" \
+          --product-backend cueq --angular-basis e3nn "${ICTC_CUEQ_FLAGS[@]}" \
           --function-type bessel --max-radius "${R_MAX}" \
           --atomic-energy-keys "1,6,7,8" --atomic-energy-values "0,0,0,0" \
           --scaling std_scaling --seed "${SEED}" --epochs "${EPOCHS}" --max-steps "${MAX_STEPS}" \
           --batch-size "${BATCH_SIZE}" --lr "${LR}" --min-lr "${MIN_LR}" --weight-decay "${WEIGHT_DECAY}" \
           --optimizer adamw --lr-scheduler exp --lr-scheduler-gamma 0.9993 --loss mse \
           --energy-weight "${ENERGY_WEIGHT}" --force-weight "${FORCE_WEIGHT}" --stress-weight 0 \
-          "${ICTD_PARAM_FLAGS[@]}" \
-          "${ICTD_OPT_FLAGS[@]}" \
+          "${ICTC_PARAM_FLAGS[@]}" \
+          "${ICTC_OPT_FLAGS[@]}" \
           --train-makefx-compile --makefx-buckets 4 --pad-nodes-to-max --pad-edges-to-max \
           --device "${DEVICE}" --dtype "${DTYPE}" --num-workers "${NUM_WORKERS}" \
           --checkpoint "${OUT_ROOT}/checkpoints/${job}.pth"
@@ -269,11 +269,11 @@ cat > "${OUT_ROOT}/matrix_metadata.json" <<EOF
   "r_max": ${R_MAX},
   "lr": ${LR},
   "max_grad_norm": "${MAX_GRAD_NORM}",
-  "ictd_amsgrad": "${ICTD_AMSGRAD}",
-  "ictd_use_reduced_cg": "${ICTD_USE_REDUCED_CG}",
-  "ictd_conv_tp_scale_init": "${ICTD_CONV_TP_SCALE_INIT}",
-  "ictd_freeze_conv_tp_weight": "${ICTD_FREEZE_CONV_TP_WEIGHT}",
-  "ictd_interaction_init": "${ICTD_INTERACTION_INIT}",
+  "ictd_amsgrad": "${ICTC_AMSGRAD}",
+  "ictd_use_reduced_cg": "${ICTC_USE_REDUCED_CG}",
+  "ictd_conv_tp_scale_init": "${ICTC_CONV_TP_SCALE_INIT}",
+  "ictd_freeze_conv_tp_weight": "${ICTC_FREEZE_CONV_TP_WEIGHT}",
+  "ictd_interaction_init": "${ICTC_INTERACTION_INIT}",
   "energy_weight": ${ENERGY_WEIGHT},
   "force_weight": ${FORCE_WEIGHT},
   "dtype": "${DTYPE}"
