@@ -118,6 +118,7 @@ setup(
             "mff-export-core=mace_ictc.cli.export_libtorch_core:main",
             "mff-lammps=mace_ictc.cli.lammps_interface:main",
             "mff-convert-mace=mace_ictc.cli.convert_mace:main",
+            "mff-preprocess=mace_ictc.cli.preprocess:main",
         ],
     },
     ext_modules=ext_modules,

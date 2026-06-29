@@ -28,6 +28,7 @@ mff-export-aoti = "mace_ictc.cli.export_aoti_core:main"
 mff-export-core = "mace_ictc.cli.export_libtorch_core:main"
 mff-lammps = "mace_ictc.cli.lammps_interface:main"
 mff-convert-mace = "mace_ictc.cli.convert_mace:main"
+mff-preprocess = "mace_ictc.cli.preprocess:main"
 
 [tool.setuptools.packages.find]
 include = ["mace_ictc", "mace_ictc.*"]
