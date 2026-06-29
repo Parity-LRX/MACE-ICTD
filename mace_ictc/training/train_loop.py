@@ -1292,6 +1292,15 @@ class ForceTrainer:
     def load_checkpoint(self, path, *, training_state: bool = False, strict: bool = True) -> int:
         ckpt = torch.load(path, map_location=self.device)
         state = ckpt.get("e3trans_state_dict", ckpt)
+        # Converted MACE checkpoints carry the first-layer element self-connection that the
+        # ICTC first interaction structurally omits (compensated via the mace_first_layer_sc0
+        # buffer, added back in the forward). A freshly-built model leaves that buffer as None,
+        # so a plain load_state_dict drops the checkpoint's value as an "unexpected" key and the
+        # forward silently skips the self-connection (large force error). Install it first so the
+        # buffer slot exists and gets loaded -- mirrors the deploy/LAMMPS load path.
+        sc0 = state.get("mace_first_layer_sc0")
+        if sc0 is not None and hasattr(self._raw_model, "install_mace_first_layer_sc0"):
+            self._raw_model.install_mace_first_layer_sc0(sc0)
         missing, unexpected = self._raw_model.load_state_dict(state, strict=strict)
         if missing or unexpected:
             log.warning("checkpoint load_state_dict missing=%s unexpected=%s", missing, unexpected)
